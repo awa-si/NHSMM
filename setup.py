@@ -6,9 +6,11 @@ here = pathlib.Path(__file__).parent.resolve()
 long_description = (here / "README.md").read_text(encoding="utf-8")
 
 setup(
-    name="nhsmm",
+    name="NeuralHSMM",
     version="0.1.0",
     author="AWA",
+    user="awwea",
+    branch="master",
     author_email="andre@awwea.com",
     description="Neural Hidden Semi-Markov Models with contextual duration and emission modeling.",
     long_description=long_description,
@@ -16,13 +18,14 @@ setup(
     url="https://github.com/awwea/NeuralHSMM",
     license="MIT",
 
-    packages=find_packages(exclude=("tests", "examples", "notebooks")),
+    packages=find_packages(exclude=("tests", "examples", "notebooks", "docs")),
     python_requires=">=3.9",
 
     install_requires=[
         "torch>=2.4.0",
         "numpy>=1.26",
         "scipy>=1.12",
+        "scikit-learn>=1.7.2",
         "polars>=1.34.0",
         "tqdm>=4.66",
         "matplotlib>=3.9",

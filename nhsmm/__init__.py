@@ -1,13 +1,10 @@
-from .models import GaussianHSMM, GaussianMixtureHSMM, MultinomialHSMM, NeuralHSMM, PoissonHSMM
+from .models import BaseHSMM, NeuralHSMM
 from .utilities import constraints, ConvergenceHandler, SeedGenerator, utils
 
 
 __all__ = [
-    'GaussianHSMM',
-    'GaussianMixtureHSMM',
-    'MultinomialHSMM', 
+    'BaseHSMM', 
     'NeuralHSMM',
-    'PoissonHSMM',
 
     'constraints',
     'ConvergenceHandler'

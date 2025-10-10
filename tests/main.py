@@ -4,7 +4,7 @@ import torch
 
 from sklearn.metrics import confusion_matrix
 from scipy.optimize import linear_sum_assignment
-from nhsmm.models.NeuralHSMM import NeuralHSMM
+from nhsmm.models import NeuralHSMM
 
 # ---------------------------------------------------------
 # Synthetic OHLCV generator

@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 import torch
 
-from nhsmm.models.BaseHSMM import BaseHSMM, DTYPE
+from nhsmm.models.base import BaseHSMM, DTYPE
 from nhsmm.utilities import utils
 
 # -----------------------------
