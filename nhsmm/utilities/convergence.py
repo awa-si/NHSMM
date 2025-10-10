@@ -1,29 +1,17 @@
 import torch
 import matplotlib.pyplot as plt
 import json
+import numpy as np
 from typing import Callable, List, Optional
+from threading import Lock
 
 
 class ConvergenceHandler:
     """
-    Robust convergence monitor for HMM/HSMM or neural training loops.
+    GPU-compatible convergence monitor for HMM/HSMM or neural training loops.
 
-    Parameters
-    ----------
-    max_iter : int
-        Maximum iterations per initialization.
-    n_init : int
-        Number of model restarts.
-    tol : float
-        Convergence tolerance for log-likelihood delta.
-    post_conv_iter : int
-        Number of iterations to continue after convergence before confirming.
-    verbose : bool
-        Print progress logs.
-    callbacks : list of callables
-        Each called as fn(handler, iter, rank, score, delta, converged).
-    early_stop : bool
-        Stop training once converged (if True).
+    Tracks log-likelihood scores, deltas, and convergence per initialization, fully
+    vectorized and device-aware.
     """
 
     def __init__(
@@ -35,6 +23,7 @@ class ConvergenceHandler:
         verbose: bool = True,
         callbacks: Optional[List[Callable]] = None,
         early_stop: bool = True,
+        device: Optional[torch.device] = None
     ):
         self.max_iter = int(max_iter)
         self.n_init = int(n_init)
@@ -44,90 +33,79 @@ class ConvergenceHandler:
         self.early_stop = early_stop
         self.callbacks = callbacks or []
 
-        # Allocate convergence logs
+        self.device = device or torch.device("cpu")
+
         shape = (self.max_iter + 1, self.n_init)
-        self.score = torch.full(shape, float("nan"), dtype=torch.float64)
+        self.score = torch.full(shape, float("nan"), dtype=torch.float64, device=self.device)
         self.delta = torch.full_like(self.score, float("nan"))
-        self.is_converged = False
+        self.is_converged_per_init = torch.zeros(self.n_init, dtype=torch.bool, device=self.device)
         self.stop_training = False
 
-    def __repr__(self):
-        return (f"{self.__class__.__name__}("
-                f"max_iter={self.max_iter}, n_init={self.n_init}, "
-                f"tol={self.tol}, post_conv_iter={self.post_conv_iter}, "
-                f"early_stop={self.early_stop}, verbose={self.verbose})")
+        self._rolling_deltas = [torch.full((self.post_conv_iter,), float("nan"),
+                                           dtype=torch.float64, device=self.device)
+                                for _ in range(self.n_init)]
+        self._lock = Lock()
 
-    # ----------------------------------------------------------------------
+    def push_pull(self, new_score: torch.Tensor, iteration: int, rank: int) -> bool:
+        self.push(new_score, iteration, rank)
+        return self.check_converged(iteration, rank)
 
-    def push_pull(self, new_score: float, iter: int, rank: int) -> bool:
-        """Push a new score and immediately check convergence."""
-        self.push(new_score, iter, rank)
-        return self.check_converged(iter, rank)
+    def push(self, new_score: torch.Tensor, iteration: int, rank: int):
+        """Store a new score and compute delta (works with GPU tensors)."""
+        score_val = new_score.detach() if torch.is_tensor(new_score) else torch.tensor(float(new_score), device=self.device)
+        self.score[iteration, rank] = score_val
 
-    def push(self, new_score: float, iter: int, rank: int):
-        """Store a new log-likelihood score and compute delta."""
-        score_val = float(new_score.detach().item() if torch.is_tensor(new_score) else new_score)
-        self.score[iter, rank] = score_val
+        if iteration > 0 and not torch.isnan(self.score[iteration - 1, rank]):
+            self.delta[iteration, rank] = score_val - self.score[iteration - 1, rank]
+            buf = self._rolling_deltas[rank]
+            buf[:-1] = buf[1:]
+            buf[-1] = self.delta[iteration, rank]
 
-        if iter > 0 and not torch.isnan(self.score[iter - 1, rank]):
-            self.delta[iter, rank] = score_val - self.score[iter - 1, rank]
+    def check_converged(self, iteration: int, rank: int) -> bool:
+        buf = self._rolling_deltas[rank]
+        valid_deltas = buf[~torch.isnan(buf)]
+        converged = valid_deltas.numel() >= self.post_conv_iter and torch.all(torch.abs(valid_deltas) < self.tol).item()
+        self.is_converged_per_init[rank] = converged
 
-    def check_converged(self, iter: int, rank: int) -> bool:
-        """Check convergence, trigger callbacks, and optionally stop training."""
-        valid_deltas = self.delta[1:iter + 1, rank]
-        valid_deltas = valid_deltas[~torch.isnan(valid_deltas)]
-
-        self.is_converged = False
-        if valid_deltas.numel() >= self.post_conv_iter:
-            recent = valid_deltas[-self.post_conv_iter:]
-            self.is_converged = torch.all(torch.abs(recent) < self.tol).item()
-
-        # Print status
         if self.verbose:
-            score = float(self.score[iter, rank])
-            delta = float(self.delta[iter, rank]) if not torch.isnan(self.delta[iter, rank]) else float("nan")
-            status = "✔️ Converged" if self.is_converged else ""
-            print(f"[Run {rank+1}] Iter {iter:03d} | Score: {score:.6f} | Δ: {delta:.6f} {status}")
+            score = float(self.score[iteration, rank].cpu())
+            delta = float(self.delta[iteration, rank].cpu()) if not torch.isnan(self.delta[iteration, rank]) else float("nan")
+            status = "✔️ Converged" if converged else ""
+            print(f"[Run {rank+1}] Iter {iteration:03d} | Score: {score:.6f} | Δ: {delta:.6f} {status}")
 
-        # Callbacks
-        self._trigger_callbacks(iter, rank)
+        self._trigger_callbacks(iteration, rank, converged)
 
-        # Early stop
-        if self.is_converged and self.early_stop:
+        if converged and self.early_stop:
             self.stop_training = True
 
-        return self.is_converged
+        return converged
 
-    # ----------------------------------------------------------------------
-
-    def _trigger_callbacks(self, iter: int, rank: int):
-        """Invoke all registered callbacks safely."""
-        score = float(self.score[iter, rank])
-        delta_val = self.delta[iter, rank]
-        delta = float(delta_val) if not torch.isnan(delta_val) else float("nan")
-
-        for fn in self.callbacks:
-            try:
-                fn(self, iter, rank, score, delta, self.is_converged)
-            except Exception as e:
-                if self.verbose:
-                    print(f"[Callback Error] {fn.__name__}: {e}")
+    def _trigger_callbacks(self, iteration: int, rank: int, converged: bool):
+        with self._lock:
+            score = self.score[iteration, rank].item()
+            delta_val = self.delta[iteration, rank]
+            delta = delta_val.item() if not torch.isnan(delta_val) else float("nan")
+            for fn in self.callbacks:
+                try:
+                    fn(self, iteration, rank, score, delta, converged)
+                except Exception as e:
+                    if self.verbose:
+                        print(f"[Callback Error] {fn.__name__}: {e}")
 
     def register_callback(self, fn: Callable):
-        """Register a new callback dynamically."""
         self.callbacks.append(fn)
 
     # ----------------------------------------------------------------------
 
     def plot_convergence(self, show: bool = True, savepath: Optional[str] = None):
-        """Visualize log-likelihood convergence across initializations."""
         plt.style.use("ggplot")
         fig, ax = plt.subplots(figsize=(9, 5))
-        iters = torch.arange(self.max_iter + 1)
+        iters = torch.arange(self.max_iter + 1, device=self.device)
 
         for r in range(self.n_init):
             mask = ~torch.isnan(self.score[:, r])
-            ax.plot(iters[mask], self.score[mask, r].cpu(), marker="o", lw=1.5, label=f"Run #{r+1}")
+            if mask.any():
+                ax.plot(iters[mask].cpu(), self.score[mask, r].cpu(), marker="o", lw=1.5, label=f"Run #{r+1}")
 
         ax.set_title("Log-Likelihood Convergence")
         ax.set_xlabel("Iteration")
@@ -139,27 +117,28 @@ class ConvergenceHandler:
             plt.savefig(savepath, bbox_inches="tight", dpi=200)
         if show:
             plt.show()
-        plt.close(fig)
+        else:
+            plt.close(fig)
 
     # ----------------------------------------------------------------------
 
     def export_log(self, path: str):
-        """Export score and delta logs to JSON (handles non-finite values)."""
+        score_data = self.score.cpu().numpy()
+        delta_data = self.delta.cpu().numpy()
         data = {
             "max_iter": self.max_iter,
             "n_init": self.n_init,
             "tol": self.tol,
-            "scores": [[float(x) if torch.isfinite(torch.tensor(x)) else None for x in row]
-                       for row in self.score.cpu().numpy().tolist()],
-            "delta": [[float(x) if torch.isfinite(torch.tensor(x)) else None for x in row]
-                      for row in self.delta.cpu().numpy().tolist()],
+            "scores": [[float(x) if np.isfinite(x) else None for x in row] for row in score_data],
+            "delta": [[float(x) if np.isfinite(x) else None for x in row] for row in delta_data],
         }
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
 
     def reset(self):
-        """Clear convergence history for reuse."""
         self.score.fill_(float("nan"))
         self.delta.fill_(float("nan"))
-        self.is_converged = False
+        self.is_converged_per_init.fill_(False)
         self.stop_training = False
+        for buf in self._rolling_deltas:
+            buf.fill_(float("nan"))

@@ -1,12 +1,13 @@
 from typing import Optional, Dict, List
 import torch
 
+
 class SeedGenerator:
     """
     Reproducible multi-device seed manager for PyTorch.
 
-    Provides per-device `torch.Generator` instances and deterministic 
-    split seeds for reproducible sampling and model initialization 
+    Provides per-device `torch.Generator` instances and deterministic
+    split seeds for reproducible sampling and model initialization
     across devices.
     """
 
@@ -23,23 +24,24 @@ class SeedGenerator:
         self._devices: List[str] = devices or ["cpu"]
         self._generators: Dict[str, torch.Generator] = {}
         self._last_split_seeds: Dict[str, List[int]] = {}
+        self._last_split_gens: Dict[str, List[torch.Generator]] = {}
         self._init_generators()
 
     def _init_generators(self):
         """Initialize or reset per-device generators."""
         for dev in self._devices:
-            gen = torch.Generator(device=dev)
-            gen.manual_seed(self._base_seed)
+            gen = torch.Generator(device=dev).manual_seed(self._base_seed)
             self._generators[dev] = gen
             self._last_split_seeds[dev] = []
+            self._last_split_gens[dev] = []
 
     def add_device(self, device: str):
         """Add a new device generator dynamically if not already present."""
         if device not in self._generators:
-            gen = torch.Generator(device=device)
-            gen.manual_seed(self._base_seed)
+            gen = torch.Generator(device=device).manual_seed(self._base_seed)
             self._generators[device] = gen
             self._last_split_seeds[device] = []
+            self._last_split_gens[device] = []
             if device not in self._devices:
                 self._devices.append(device)
 
@@ -63,10 +65,15 @@ class SeedGenerator:
             raise ValueError(f"No generator found for device '{device}'")
 
         parent_gen = self._generators[device]
-        new_seeds = torch.randint(0, 2**63, (n,), dtype=torch.int64, generator=parent_gen)
-        self._last_split_seeds[device] = new_seeds.tolist()
+        # deterministic split seeds
+        seeds = torch.randint(0, 2**63, (n,), dtype=torch.int64, generator=parent_gen)
+        generators = [torch.Generator(device=device).manual_seed(int(s)) for s in seeds]
 
-        return [torch.Generator(device=device).manual_seed(int(s)) for s in new_seeds]
+        self._last_split_seeds[device] = seeds.tolist()
+        self._last_split_gens[device] = generators
+        return generators
+
+    split_generators = split  # alias for clarity
 
     def reseed(self, seed: Optional[int] = None):
         """
@@ -123,6 +130,20 @@ class SeedGenerator:
             List of last split seeds.
         """
         return self._last_split_seeds.get(device, [])
+
+    def last_generators(self, device: str = "cpu") -> List[torch.Generator]:
+        """
+        Return the most recent split generators for a device.
+
+        Parameters
+        ----------
+        device : str, default='cpu'
+
+        Returns
+        -------
+        List[torch.Generator]
+        """
+        return self._last_split_gens.get(device, [])
 
     def __call__(self) -> int:
         """Return the current base seed (functional usage)."""

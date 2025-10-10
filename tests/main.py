@@ -98,6 +98,7 @@ if __name__ == "__main__":
         seed=0,
         encoder=encoder
     )
+    model.initialize_emissions(X, method="kmeans")
 
     print("\n=== Training NeuralHSMM ===")
     model.fit(
