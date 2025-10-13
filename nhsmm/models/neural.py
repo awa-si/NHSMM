@@ -1,6 +1,5 @@
 # models/neural_trainable.py
 from __future__ import annotations
-from typing import Optional
 from sklearn.cluster import KMeans
 
 import torch
@@ -8,81 +7,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Distribution, Categorical, MultivariateNormal
 
-from nhsmm.models.base import BaseHSMM, DTYPE
-from nhsmm.utilities import utils
-
-
-# -----------------------------
-# Default modules
-# -----------------------------
-class DefaultEmission(nn.Module):
-    """Gaussian emission with optional context modulation."""
-    def __init__(self, n_states, n_features, min_covar=1e-3, context_dim=None):
-        super().__init__()
-        self.n_states, self.n_features, self.min_covar = n_states, n_features, min_covar
-        self.mu = nn.Parameter(torch.zeros(n_states, n_features, dtype=DTYPE))
-        self.log_var = nn.Parameter(torch.zeros(n_states, n_features, dtype=DTYPE))
-        self.context_net = nn.Sequential(
-            nn.Linear(context_dim, n_states * n_features),
-            nn.Tanh(),
-            nn.Linear(n_states * n_features, n_states * n_features)
-        ) if context_dim is not None else None
-
-    def forward(self, context: Optional[torch.Tensor] = None):
-        mu, var = self.mu, F.softplus(self.log_var) + self.min_covar
-        if self.context_net is not None and context is not None:
-            delta = self.context_net(context).reshape(self.n_states, self.n_features)
-            mu = mu + 0.1 * torch.tanh(delta)
-        return mu, var
-
-
-class DefaultDuration(nn.Module):
-    """Per-state learnable duration probabilities."""
-    def __init__(self, n_states, max_duration=20, context_dim=None, temperature=1.0):
-        super().__init__()
-        self.n_states, self.max_duration, self.temperature = n_states, max_duration, temperature
-        self.logits = nn.Parameter(torch.zeros(n_states, max_duration, dtype=DTYPE))
-        self.context_net = nn.Sequential(
-            nn.Linear(context_dim, n_states * max_duration),
-            nn.Tanh(),
-            nn.Linear(n_states * max_duration, n_states * max_duration)
-        ) if context_dim is not None else None
-
-    def forward(self, context: Optional[torch.Tensor] = None):
-        logits = self.logits
-        if self.context_net is not None and context is not None:
-            delta = self.context_net(context).reshape(self.n_states, self.max_duration)
-            logits = logits + 0.1 * torch.tanh(delta)
-        return F.softmax(logits / self.temperature, dim=-1)
-
-
-class DefaultTransition(nn.Module):
-    """Per-state learnable transition probabilities."""
-    def __init__(self, n_states, context_dim=None, temperature=1.0):
-        super().__init__()
-        self.n_states, self.temperature = n_states, temperature
-        self.logits = nn.Parameter(torch.zeros(n_states, n_states, dtype=DTYPE))
-        self.context_net = nn.Sequential(
-            nn.Linear(context_dim, n_states * n_states),
-            nn.Tanh(),
-            nn.Linear(n_states * n_states, n_states * n_states)
-        ) if context_dim is not None else None
-
-    def forward(self, context: Optional[torch.Tensor] = None):
-        logits = self.logits
-        if self.context_net is not None and context is not None:
-            delta = self.context_net(context).reshape(self.n_states, self.n_states)
-            logits = logits + 0.1 * torch.tanh(delta)
-        return F.softmax(logits / self.temperature, dim=-1)
+from nhsmm.models import BaseHSMM
+from nhsmm.defaults import DTYPE
+from nhsmm import utils
 
 
 class NeuralHSMM(BaseHSMM, nn.Module):
     """Trainable NeuralHSMM with EM, Viterbi, context, and gradient support."""
 
-    def __init__(self, n_states, max_duration, n_features, alpha=1.0, seed=None,
-                 encoder: Optional[nn.Module] = None, emission_type="gaussian",
-                 min_covar=1e-3, device: Optional[torch.device] = None,
-                 context_dim: Optional[int] = None, **kwargs):
+    def __init__(self,n_states, max_duration, n_features, alpha=1.0, seed=None, encoder: Optional[nn.Module] = None, emission_type="gaussian", min_covar=1e-3, device: Optional[torch.device] = None, context_dim: Optional[int] = None, **kwargs
+    ):
 
         nn.Module.__init__(self)
         self._params = {'emission_type': emission_type.lower()}
@@ -92,10 +26,10 @@ class NeuralHSMM(BaseHSMM, nn.Module):
         self.encoder = encoder
 
         # Context
+        self.context_embedding = None
         self.context_dim = context_dim
         self._context: Optional[torch.Tensor] = None
         self.ctx_A, self.ctx_D, self.ctx_E = None, None, None
-        self.context_embedding = None
 
         if context_dim is not None and kwargs.get('n_context_states', None) is not None:
             n_ctx = kwargs['n_context_states']
@@ -112,13 +46,8 @@ class NeuralHSMM(BaseHSMM, nn.Module):
                 m.to(dtype=DTYPE, device=self.device)
 
         # BaseHSMM initialization
-        super().__init__(n_states=n_states, max_duration=max_duration, alpha=alpha, seed=seed)
+        super().__init__(n_states=n_states, n_features=n_features, max_duration=max_duration, alpha=alpha, seed=seed)
         self._params['emission_pdf'] = self.sample_emission_pdf()
-
-        # Default modules
-        self.emission_module = DefaultEmission(n_states, n_features, min_covar, context_dim)
-        self.duration_module = DefaultDuration(n_states, max_duration, context_dim)
-        self.transition_module = DefaultTransition(n_states, context_dim)
 
     # ----------------------
     # Core properties
@@ -157,11 +86,6 @@ class NeuralHSMM(BaseHSMM, nn.Module):
 
     def clear_context(self):
         self._context = None
-
-    def _combine_context(self, theta: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        if self._context is not None and theta is not None:
-            return torch.cat([theta, self._context], dim=-1)
-        return theta if theta is not None else self._context
 
     # ----------------------
     # Emission PDF functions

@@ -1,0 +1,182 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import MultivariateNormal, Categorical
+from typing import Optional, Union
+
+DTYPE = torch.float64
+
+
+# -----------------------------
+# Emission
+# -----------------------------
+class DefaultEmission(nn.Module):
+    """Gaussian or Categorical emissions with optional context modulation."""
+
+    def __init__(
+        self,
+        n_states: int,
+        n_features: int,
+        min_covar: float = 1e-3,
+        context_dim: Optional[int] = None,
+        scale: float = 0.1,
+        emission_type: str = "gaussian",
+        aggregate_context: bool = True,
+    ):
+        super().__init__()
+        self.n_states = n_states
+        self.n_features = n_features
+        self.min_covar = min_covar
+        self.scale = scale
+        self.aggregate_context = aggregate_context
+        self.emission_type = emission_type.lower()
+
+        if self.emission_type == "gaussian":
+            self.mu = nn.Parameter(torch.zeros(n_states, n_features, dtype=DTYPE))
+            self.log_var = nn.Parameter(torch.full((n_states, n_features), -2.0, dtype=DTYPE))
+        elif self.emission_type == "categorical":
+            self.logits = nn.Parameter(torch.zeros(n_states, n_features, dtype=DTYPE))
+        else:
+            raise ValueError(f"Unsupported emission_type: {emission_type}")
+
+        if context_dim is not None:
+            self.context_net = nn.Sequential(
+                nn.Linear(context_dim, n_states * n_features),
+                nn.LayerNorm(n_states * n_features),
+                nn.Tanh(),
+                nn.Linear(n_states * n_features, n_states * n_features),
+            )
+        else:
+            self.context_net = None
+
+    def _contextual_shift(self, context: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if self.context_net is None or context is None:
+            return None
+        if context.dim() == 1:
+            context = context.unsqueeze(0)
+        delta = self.context_net(context).view(-1, self.n_states, self.n_features)
+        if self.aggregate_context:
+            delta = delta.mean(dim=0)
+        return self.scale * torch.tanh(delta).clamp(-3.0, 3.0)
+
+    def forward(
+        self,
+        context: Optional[torch.Tensor] = None,
+        return_dist: bool = False
+    ) -> Union[tuple[torch.Tensor, torch.Tensor], list[Union[MultivariateNormal, Categorical]]]:
+        delta = self._contextual_shift(context)
+
+        if self.emission_type == "gaussian":
+            mu = self.mu + (delta if delta is not None else 0)
+            var = F.softplus(self.log_var) + self.min_covar
+            if not return_dist:
+                return mu, var
+            cov = torch.diag_embed(var)
+            return [MultivariateNormal(loc=mu[k], covariance_matrix=cov[k]) for k in range(self.n_states)]
+
+        logits = self.logits + (delta if delta is not None else 0)
+        if not return_dist:
+            return logits
+        return [Categorical(logits=logits[k]) for k in range(self.n_states)]
+
+
+# -----------------------------
+# Duration
+# -----------------------------
+class DefaultDuration(nn.Module):
+    """Per-state duration probabilities with optional context modulation."""
+
+    def __init__(
+        self,
+        n_states: int,
+        max_duration: int = 20,
+        context_dim: Optional[int] = None,
+        temperature: float = 1.0,
+        aggregate_context: bool = True,
+    ):
+        super().__init__()
+        self.n_states = n_states
+        self.max_duration = max_duration
+        self.temperature = temperature
+        self.aggregate_context = aggregate_context
+
+        self.logits = nn.Parameter(torch.zeros(n_states, max_duration, dtype=DTYPE))
+        self.mod_scale = nn.Parameter(torch.tensor(0.1, dtype=DTYPE))
+
+        if context_dim is not None:
+            self.context_net = nn.Sequential(
+                nn.Linear(context_dim, n_states * max_duration),
+                nn.LayerNorm(n_states * max_duration),
+                nn.Tanh(),
+                nn.Linear(n_states * max_duration, n_states * max_duration),
+            )
+        else:
+            self.context_net = None
+
+    def _contextual_logits(self, context: Optional[torch.Tensor] = None) -> torch.Tensor:
+        logits = self.logits
+        if self.context_net is not None and context is not None:
+            if context.dim() == 1:
+                context = context.unsqueeze(0)
+            delta = self.context_net(context).view(-1, self.n_states, self.max_duration)
+            if self.aggregate_context:
+                delta = delta.mean(dim=0)
+            logits = logits + self.mod_scale * torch.tanh(delta).clamp(-3.0, 3.0)
+        return logits
+
+    def forward(self, context: Optional[torch.Tensor] = None, log: bool = False) -> torch.Tensor:
+        logits = self._contextual_logits(context) / self.temperature
+        return F.log_softmax(logits, dim=-1) if log else F.softmax(logits, dim=-1)
+
+    def log_probs(self, context: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return self.forward(context=context, log=True)
+
+
+# -----------------------------
+# Transition
+# -----------------------------
+class DefaultTransition(nn.Module):
+    """Learnable per-state transitions with optional context modulation."""
+
+    def __init__(
+        self,
+        n_states: int,
+        context_dim: Optional[int] = None,
+        temperature: float = 1.0,
+        aggregate_context: bool = True,
+    ):
+        super().__init__()
+        self.n_states = n_states
+        self.temperature = temperature
+        self.aggregate_context = aggregate_context
+
+        self.logits = nn.Parameter(torch.zeros(n_states, n_states, dtype=DTYPE))
+        self.mod_scale = nn.Parameter(torch.tensor(0.1, dtype=DTYPE))
+
+        if context_dim is not None:
+            self.context_net = nn.Sequential(
+                nn.Linear(context_dim, n_states * n_states),
+                nn.LayerNorm(n_states * n_states),
+                nn.Tanh(),
+                nn.Linear(n_states * n_states, n_states * n_states),
+            )
+        else:
+            self.context_net = None
+
+    def _contextual_logits(self, context: Optional[torch.Tensor] = None) -> torch.Tensor:
+        logits = self.logits
+        if self.context_net is not None and context is not None:
+            if context.dim() == 1:
+                context = context.unsqueeze(0)
+            delta = self.context_net(context).view(-1, self.n_states, self.n_states)
+            if self.aggregate_context:
+                delta = delta.mean(dim=0)
+            logits = logits + self.mod_scale * torch.tanh(delta).clamp(-3.0, 3.0)
+        return logits
+
+    def forward(self, context: Optional[torch.Tensor] = None, log: bool = False) -> torch.Tensor:
+        logits = self._contextual_logits(context) / self.temperature
+        return F.log_softmax(logits, dim=-1) if log else F.softmax(logits, dim=-1)
+
+    def log_probs(self, context: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return self.forward(context=context, log=True)
