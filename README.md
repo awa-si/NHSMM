@@ -40,13 +40,16 @@ pip install nhsmm
 
 ```
 nhsmm/
-├── core/
-│   ├── neural_hsmm.py
-│   ├── neural_duration.py
-│   ├── neural_gaussian.py
-│   ├── neural_multinomial.py
+├── models/
+│   ├── base.py
+│   ├── neural.py
+├── ditributions/
+│   ├── NeuralDuration.py
+│   ├── NeuralEmission.py
+│   ├── NeuralGaussian.py
+│   ├── NeuralMultinomial.py
+│   ├── NeuralTransition.py
 │   └── __init__.py
-├── regime_detector.py
 ├── utilities/
 │   ├── utils.py
 │   ├── constraints.py
