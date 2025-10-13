@@ -7,12 +7,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Distribution, Categorical, MultivariateNormal
 
-from nhsmm.models import BaseHSMM
+from nhsmm.models import HSMM
 from nhsmm.defaults import DTYPE
 from nhsmm import utils
 
 
-class NeuralHSMM(BaseHSMM, nn.Module):
+class NeuralHSMM(HSMM, nn.Module):
     """Trainable NeuralHSMM with EM, Viterbi, context, and gradient support."""
 
     def __init__(self,n_states, max_duration, n_features, alpha=1.0, seed=None, encoder: Optional[nn.Module] = None, emission_type="gaussian", min_covar=1e-3, device: Optional[torch.device] = None, context_dim: Optional[int] = None, **kwargs

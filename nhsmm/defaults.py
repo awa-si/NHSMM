@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import MultivariateNormal, Categorical
-from typing import Optional, Union
+from typing import Optional, Union, List, Tuple
 
 DTYPE = torch.float64
 
@@ -22,6 +22,7 @@ class DefaultEmission(nn.Module):
         scale: float = 0.1,
         emission_type: str = "gaussian",
         aggregate_context: bool = True,
+        device: Optional[torch.device] = None,
     ):
         super().__init__()
         self.n_states = n_states
@@ -30,21 +31,24 @@ class DefaultEmission(nn.Module):
         self.scale = scale
         self.aggregate_context = aggregate_context
         self.emission_type = emission_type.lower()
+        self.device = device or torch.device("cpu")
 
+        # Emission parameters
         if self.emission_type == "gaussian":
-            self.mu = nn.Parameter(torch.zeros(n_states, n_features, dtype=DTYPE))
-            self.log_var = nn.Parameter(torch.full((n_states, n_features), -2.0, dtype=DTYPE))
+            self.mu = nn.Parameter(torch.zeros(n_states, n_features, dtype=DTYPE, device=self.device))
+            self.log_var = nn.Parameter(torch.full((n_states, n_features), -2.0, dtype=DTYPE, device=self.device))
         elif self.emission_type == "categorical":
-            self.logits = nn.Parameter(torch.zeros(n_states, n_features, dtype=DTYPE))
+            self.logits = nn.Parameter(torch.zeros(n_states, n_features, dtype=DTYPE, device=self.device))
         else:
             raise ValueError(f"Unsupported emission_type: {emission_type}")
 
+        # Context network
         if context_dim is not None:
             self.context_net = nn.Sequential(
-                nn.Linear(context_dim, n_states * n_features),
-                nn.LayerNorm(n_states * n_features),
+                nn.Linear(context_dim, n_states * n_features, device=self.device, dtype=DTYPE),
+                nn.LayerNorm(n_states * n_features, dtype=DTYPE, device=self.device),
                 nn.Tanh(),
-                nn.Linear(n_states * n_features, n_states * n_features),
+                nn.Linear(n_states * n_features, n_states * n_features, device=self.device, dtype=DTYPE),
             )
         else:
             self.context_net = None
@@ -52,8 +56,7 @@ class DefaultEmission(nn.Module):
     def _contextual_shift(self, context: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if self.context_net is None or context is None:
             return None
-        if context.dim() == 1:
-            context = context.unsqueeze(0)
+        context = context.unsqueeze(0) if context.ndim == 1 else context
         delta = self.context_net(context).view(-1, self.n_states, self.n_features)
         if self.aggregate_context:
             delta = delta.mean(dim=0)
@@ -63,7 +66,7 @@ class DefaultEmission(nn.Module):
         self,
         context: Optional[torch.Tensor] = None,
         return_dist: bool = False
-    ) -> Union[tuple[torch.Tensor, torch.Tensor], list[Union[MultivariateNormal, Categorical]]]:
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], List[Union[MultivariateNormal, Categorical]], torch.Tensor]:
         delta = self._contextual_shift(context)
 
         if self.emission_type == "gaussian":
@@ -93,22 +96,24 @@ class DefaultDuration(nn.Module):
         context_dim: Optional[int] = None,
         temperature: float = 1.0,
         aggregate_context: bool = True,
+        device: Optional[torch.device] = None,
     ):
         super().__init__()
         self.n_states = n_states
         self.max_duration = max_duration
         self.temperature = temperature
         self.aggregate_context = aggregate_context
+        self.device = device or torch.device("cpu")
 
-        self.logits = nn.Parameter(torch.zeros(n_states, max_duration, dtype=DTYPE))
-        self.mod_scale = nn.Parameter(torch.tensor(0.1, dtype=DTYPE))
+        self.logits = nn.Parameter(torch.zeros(n_states, max_duration, dtype=DTYPE, device=self.device))
+        self.mod_scale = nn.Parameter(torch.tensor(0.1, dtype=DTYPE, device=self.device))
 
         if context_dim is not None:
             self.context_net = nn.Sequential(
-                nn.Linear(context_dim, n_states * max_duration),
-                nn.LayerNorm(n_states * max_duration),
+                nn.Linear(context_dim, n_states * max_duration, device=self.device, dtype=DTYPE),
+                nn.LayerNorm(n_states * max_duration, dtype=DTYPE, device=self.device),
                 nn.Tanh(),
-                nn.Linear(n_states * max_duration, n_states * max_duration),
+                nn.Linear(n_states * max_duration, n_states * max_duration, device=self.device, dtype=DTYPE),
             )
         else:
             self.context_net = None
@@ -116,8 +121,7 @@ class DefaultDuration(nn.Module):
     def _contextual_logits(self, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         logits = self.logits
         if self.context_net is not None and context is not None:
-            if context.dim() == 1:
-                context = context.unsqueeze(0)
+            context = context.unsqueeze(0) if context.ndim == 1 else context
             delta = self.context_net(context).view(-1, self.n_states, self.max_duration)
             if self.aggregate_context:
                 delta = delta.mean(dim=0)
@@ -144,21 +148,23 @@ class DefaultTransition(nn.Module):
         context_dim: Optional[int] = None,
         temperature: float = 1.0,
         aggregate_context: bool = True,
+        device: Optional[torch.device] = None,
     ):
         super().__init__()
         self.n_states = n_states
         self.temperature = temperature
         self.aggregate_context = aggregate_context
+        self.device = device or torch.device("cpu")
 
-        self.logits = nn.Parameter(torch.zeros(n_states, n_states, dtype=DTYPE))
-        self.mod_scale = nn.Parameter(torch.tensor(0.1, dtype=DTYPE))
+        self.logits = nn.Parameter(torch.zeros(n_states, n_states, dtype=DTYPE, device=self.device))
+        self.mod_scale = nn.Parameter(torch.tensor(0.1, dtype=DTYPE, device=self.device))
 
         if context_dim is not None:
             self.context_net = nn.Sequential(
-                nn.Linear(context_dim, n_states * n_states),
-                nn.LayerNorm(n_states * n_states),
+                nn.Linear(context_dim, n_states * n_states, device=self.device, dtype=DTYPE),
+                nn.LayerNorm(n_states * n_states, dtype=DTYPE, device=self.device),
                 nn.Tanh(),
-                nn.Linear(n_states * n_states, n_states * n_states),
+                nn.Linear(n_states * n_states, n_states * n_states, device=self.device, dtype=DTYPE),
             )
         else:
             self.context_net = None
@@ -166,8 +172,7 @@ class DefaultTransition(nn.Module):
     def _contextual_logits(self, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         logits = self.logits
         if self.context_net is not None and context is not None:
-            if context.dim() == 1:
-                context = context.unsqueeze(0)
+            context = context.unsqueeze(0) if context.ndim == 1 else context
             delta = self.context_net(context).view(-1, self.n_states, self.n_states)
             if self.aggregate_context:
                 delta = delta.mean(dim=0)

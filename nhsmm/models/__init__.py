@@ -1,8 +1,7 @@
-from .base import BaseHSMM
+from .base import HSMM
 from .neural import NeuralHSMM
 
-
 __all__ = [
-    'BaseHSMM',
+    'HSMM',
     'NeuralHSMM',
 ]

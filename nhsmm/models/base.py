@@ -12,7 +12,7 @@ from nhsmm import utils, constraints, SeedGenerator, ConvergenceHandler
 from nhsmm.defaults import DTYPE, DefaultEmission, DefaultDuration, DefaultTransition
 
 
-class BaseHSMM(nn.Module, ABC):
+class HSMM(nn.Module, ABC):
 
     def __init__(self,
             n_states: int,
