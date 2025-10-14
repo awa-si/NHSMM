@@ -407,7 +407,7 @@ class HSMM(nn.Module, ABC):
     def _contextual_emission_pdf(self, X: torch.Tensor, theta: Optional[torch.Tensor] = None) -> torch.Tensor:
         device, dtype = X.device, X.dtype
         B, T = X.shape[:2]
-        K = self.n_components
+        K = self.n_states
 
         base_logp = torch.nan_to_num(self.map_emission(X), nan=-1e8, neginf=-1e8, posinf=-1e8)
 
