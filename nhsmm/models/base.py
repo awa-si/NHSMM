@@ -20,89 +20,71 @@ class HSMM(ABC):
     """
     Hidden Semi-Markov Model (HSMM) base class.
 
-    This class implements the foundational structure for HSMMs — 
-    a probabilistic sequence model that extends Hidden Markov Models (HMMs)
-    by modeling explicit state durations and contextual dependencies.
+    Supports:
+        - Emissions: state-dependent observation likelihoods.
+        - Transitions: contextual transition probabilities.
+        - Durations: explicit duration modeling per state.
+        - Optional neural context encoding.
 
-    The HSMM supports modular components for:
-        - **Emissions:** State-dependent observation likelihoods (Gaussian or Categorical).
-        - **Transitions:** Contextual transition probabilities between states.
-        - **Durations:** Explicit duration modeling per state.
-        - **Context encoding:** Optional neural context conditioning for adaptive inference.
-
-    Key Methods (to implement or override in subclasses):
-        - `forward(X)`: Perform forward message passing (α-recursion).
-        - `_compute_log_likelihood(X)`: Compute total log-likelihood of sequences.
-        - `score(X, lengths=None, by_sample=True)`: Evaluate model likelihoods.
-        - `sample(T)`: Generate sequences given model parameters.
-        - `ic(X, criterion, lengths=None)`: Compute information criteria (AIC/BIC).
-
-    Attributes:
-        n_components (int): Number of hidden states.
-        n_features (int): Dimensionality of observation space.
-        dof (int): Model degrees of freedom, used in information criteria.
-        emission_module (nn.Module): State emission probability model.
-        transition_module (nn.Module): State transition probability model.
-        duration_module (nn.Module): Duration distribution per state.
-        encoder (Optional[nn.Module]): Optional neural encoder for context features.
-
-    Notes:
-        - Implementations should ensure numerical stability in log-space computations.
-        - Duration distributions must be normalized per state.
-        - Supports variable-length batches and GPU computation.
+    Key methods to implement/override:
+        - forward(X)
+        - _compute_log_likelihood(X)
+        - score(X, lengths=None, by_sample=True)
+        - sample(T)
+        - ic(X, criterion, lengths=None)
     """
 
-    def __init__(self,
-            n_states: int,
-            n_features: int,
-            max_duration: int,
-            alpha: float = 1.0,
-            seed: Optional[int] = None,
-            context_dim: Optional[int] = None,
-            min_covar = 1e-3,
-        ):
+    def __init__(
+        self,
+        n_states: int,
+        n_features: int,
+        max_duration: int,
+        alpha: float = 1.0,
+        seed: Optional[int] = None,
+        context_dim: Optional[int] = None,
+        min_covar: float = 1e-3,
+        transition_constraint: Any = None,
+    ):
         super().__init__()
         self.n_states = n_states
-        self.alpha = float(alpha)
-        self.min_covar = min_covar
         self.n_features = n_features
         self.max_duration = max_duration
+        self.alpha = float(alpha)
+        self.min_covar = min_covar
+
+        self._params: Dict[str, Any] = {}
         self._seed_gen = SeedGenerator(seed)
         self._context: Optional[torch.Tensor] = None
 
-        # container for emitted distribution and other non-buffer parameters
-        self._params: Dict[str, Any] = {}
-
-        # optional external encoder (neural) for contextualization
         self.encoder: Optional[nn.Module] = None
-
         self.emission_module = DefaultEmission(n_states, n_features, min_covar, context_dim)
         self.duration_module = DefaultDuration(n_states, max_duration, context_dim)
         self.transition_module = DefaultTransition(n_states, context_dim)
 
-        # initialize & register pi/A/D logits as buffers (log-space)
+        self.transition_constraint = transition_constraint or constraints.Transitions.SEMI
+
         self._init_buffers()
         self._params['emission_pdf'] = self.sample_emission_pdf(None)
 
     def _init_buffers(self):
         device = next(self.buffers(), torch.tensor(0., dtype=DTYPE)).device
 
-        # -------------------------------
-        # Safe sampling and logits helper
-        # -------------------------------
-        def sample_logits(shape, transitions=None):
-            if transitions is None:
+        def sample_logits(shape):
+            if len(shape) == 1:
                 probs = constraints.sample_probs(self.alpha, shape)
+            elif len(shape) == 2:
+                if shape[1] == getattr(self, 'max_duration', None):
+                    probs = constraints.sample_probs(self.alpha, shape)
+                else:
+                    probs = constraints.sample_A(self.alpha, shape[0], self.transition_constraint)
             else:
-                probs = constraints.sample_A(self.alpha, shape[0], transitions)
+                raise ValueError(f"Unsupported shape {shape} for logits sampling.")
             logits = torch.log(probs.clamp_min(1e-12)).to(device=device, dtype=DTYPE)
-            return logits, probs.shape  # return shape for batch alignment
+            return logits, probs.shape
 
-        # -------------------------------
-        # Base HSMM parameters
-        # -------------------------------
+        # Base parameters
         pi_logits, pi_shape = sample_logits((self.n_states,))
-        A_logits, A_shape = sample_logits((self.n_states, self.n_states), constraints.Transitions.SEMI)
+        A_logits, A_shape = sample_logits((self.n_states, self.n_states))
         D_logits, D_shape = sample_logits((self.n_states, self.max_duration))
 
         self.register_buffer("_pi_logits", pi_logits)
@@ -113,31 +95,25 @@ class HSMM(ABC):
         self._A_batch_shape = A_shape
         self._D_batch_shape = D_shape
 
-        # -------------------------------
-        # Optional super-state hierarchy
-        # -------------------------------
+        # Optional super-states
         n_super_states = getattr(self, "n_super_states", 0)
         if n_super_states > 1:
             super_pi_logits, super_pi_shape = sample_logits((n_super_states,))
-            super_A_logits, super_A_shape = sample_logits((n_super_states, n_super_states), constraints.Transitions.SEMI)
+            super_A_logits, super_A_shape = sample_logits((n_super_states, n_super_states))
             self.register_buffer("_super_pi_logits", super_pi_logits)
             self.register_buffer("_super_A_logits", super_A_logits)
 
             self._super_pi_batch_shape = super_pi_shape
             self._super_A_batch_shape = super_A_shape
 
-        # -------------------------------
-        # Initialization snapshot for debugging
-        # -------------------------------
-        summary = [
-            pi_logits.mean(), 
-            A_logits.mean(), 
-            D_logits.mean()
-        ]
+        # Initialization snapshot
+        summary = [pi_logits.mean(), A_logits.mean(), D_logits.mean()]
         if n_super_states > 1:
             summary += [super_pi_logits.mean(), super_A_logits.mean()]
 
         self.register_buffer("_init_prior_snapshot", torch.stack(summary).detach())
+
+    # ---------------- Properties ----------------
 
     @property
     def seed(self) -> Optional[int]:
@@ -152,12 +128,14 @@ class HSMM(ABC):
         logits = logits.to(device=self._pi_logits.device, dtype=DTYPE)
         if logits.shape != (self.n_states,):
             raise ValueError(f"pi logits must have shape ({self.n_states},) but got {tuple(logits.shape)}")
-
         norm_val = logits.logsumexp(0)
-        if not torch.allclose(norm_val, torch.tensor(0.0, dtype=DTYPE, device=logits.device), atol=1e-8):
+        if not torch.allclose(norm_val, torch.tensor(0.0, dtype=DTYPE, device=logits.device), atol=1e-6):
             raise ValueError(f"pi logits must normalize (logsumexp==0); got {norm_val.item():.3e}")
-
         self._pi_logits.copy_(logits)
+
+    @property
+    def pi_probs(self) -> torch.Tensor:
+        return self._pi_logits.softmax(0)
 
     @property
     def A(self) -> torch.Tensor:
@@ -168,15 +146,16 @@ class HSMM(ABC):
         logits = logits.to(device=self._A_logits.device, dtype=DTYPE)
         if logits.shape != (self.n_states, self.n_states):
             raise ValueError(f"A logits must have shape ({self.n_states},{self.n_states})")
-
         row_norm = logits.logsumexp(1)
-        if not torch.allclose(row_norm, torch.zeros_like(row_norm), atol=1e-8):
+        if not torch.allclose(row_norm, torch.zeros_like(row_norm), atol=1e-6):
             raise ValueError(f"Rows of A logits must normalize (logsumexp==0); got {row_norm}")
-
-        if not constraints.is_valid_A(logits, constraints.Transitions.SEMI):
-            raise ValueError("A logits do not satisfy SEMI transition constraints")
-
+        if not constraints.is_valid_A(logits, self.transition_constraint):
+            raise ValueError("A logits do not satisfy transition constraints")
         self._A_logits.copy_(logits)
+
+    @property
+    def A_probs(self) -> torch.Tensor:
+        return self._A_logits.softmax(-1)
 
     @property
     def D(self) -> torch.Tensor:
@@ -187,22 +166,35 @@ class HSMM(ABC):
         logits = logits.to(device=self._D_logits.device, dtype=DTYPE)
         if logits.shape != (self.n_states, self.max_duration):
             raise ValueError(f"D logits must have shape ({self.n_states},{self.max_duration})")
-
         row_norm = logits.logsumexp(1)
-        if not torch.allclose(row_norm, torch.zeros_like(row_norm), atol=1e-8):
+        if not torch.allclose(row_norm, torch.zeros_like(row_norm), atol=1e-6):
             raise ValueError(f"Rows of D logits must normalize (logsumexp==0); got {row_norm}")
-
         self._D_logits.copy_(logits)
 
     @property
+    def D_probs(self) -> torch.Tensor:
+        return self._D_logits.softmax(-1)
+
+    # Optional super-state access
+    @property
+    def super_pi(self):
+        if hasattr(self, "_super_pi_logits"):
+            return self._super_pi_logits
+        return None
+
+    @property
+    def super_A(self):
+        if hasattr(self, "_super_A_logits"):
+            return self._super_A_logits
+        return None
+
+    @property
     def pdf(self) -> Any:
-        """Emission distribution (torch.distributions.Distribution). Managed by subclass via hooks."""
         return self._params.get('emission_pdf')
 
     @property
     @abstractmethod
     def dof(self) -> int:
-        """Degrees of freedom (required for IC computations)."""
         raise NotImplementedError
 
     @abstractmethod

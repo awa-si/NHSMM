@@ -1,20 +1,21 @@
-
 # NHSMM — Neural Hidden Semi-Markov Models
 
-**NHSMM** is a modular PyTorch-based library for hierarchical regime detection and temporal modeling using **Neural Hidden Semi-Markov Models (HSMMs)**.
+[![PyPI](https://img.shields.io/pypi/v/nhsmm.svg)](https://pypi.org/project/nhsmm/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 
-It extends classic HSMMs with learnable emission, duration, and transition components — enabling adaptive, context-aware sequence modeling for financial regimes, sensor data, and other temporal domains.
+**NHSMM** is a modular PyTorch library for hierarchical regime detection and temporal modeling using **Neural Hidden Semi-Markov Models (HSMM's)**.  
+
+It extends classical HSMM's with learnable **emission**, **duration**, and **transition** components — enabling **context-aware sequence modeling** for financial regimes, sensor signals, and other temporal domains.
 
 ---
 
 ## 🚀 Key Features
 
-- **Neural Gaussian & Multinomial Emissions** — differentiable probabilistic outputs
-- **Covariate-Dependent Duration Models** — via neural parameterization
-- **Dense HSMM / HSMM-HMM Hybrid Inference**
-- **Multi-Timescale Regime Modeling** — supports 1W / 1H / 15M / 1M fusion
-- **Torch-based, GPU-ready Implementation**
-- **Configurable self-loop, trend, and overlay regime maps**
+- **Neural Gaussian & Multinomial Emissions** — fully differentiable probabilistic outputs  
+- **Covariate-Dependent Duration Models** — via neural parameterization  
+- **Dense HSMM / HSMM-HMM Hybrid Inference**  
+- **Multi-Timescale Regime Modeling** — supports 1W / 1H / 15M / 1M fusion  
+- **Torch-based, GPU-ready Implementation**  
+- **Configurable self-loop, trend, and overlay regime maps**  
 
 ---
 
@@ -24,14 +25,14 @@ It extends classic HSMMs with learnable emission, duration, and transition compo
 
 ```bash
 git clone https://github.com/awwea/NeuralHSMM.git
-cd nhsmm
+cd NeuralHSMM
 pip install -e .
 ```
 
 ### From PyPI (when published)
 
 ```bash
-pip install nhsmm
+pip install nhsmm (TODO)
 ```
 
 ---
@@ -44,7 +45,7 @@ nhsmm/
 │   ├── base.py
 │   ├── neural.py
 │   └── __init__.py
-├── ditributions/
+├── distributions/
 │   ├── NeuralDuration.py
 │   ├── NeuralEmission.py
 │   ├── NeuralGaussian.py
@@ -68,8 +69,8 @@ import torch
 from nhsmm.models import NeuralHSMM
 from nhsmm.distributions import NeuralGaussian, NeuralDuration, NeuralTransition
 
-# Example input sequence
-X = torch.randn(256, 32)  # (time, features)
+# Example input sequence: (time, features)
+X = torch.randn(256, 32)
 
 # Initialize HSMM
 model = NeuralHSMM(
@@ -89,22 +90,16 @@ print("Most likely state sequence:", states.shape)
 
 ---
 
-## 📊 Regime Detection Pipeline
-
-`RegimeDetector` orchestrates hierarchical modeling:
-
-1. **Macro HSMM** – Coarse trends (`bull`, `bear`, `range`, `uncertain`)
-2. **Micro HSMM** – Fine-grained overlays (`pump`, `dump`, `accumulation`, etc.)
-3. **Duration conditioning** – Covariate-based persistence modeling
-4. **Online reset hooks** – Bayesian Online Change Point Detection (BOCPD-style)
-
----
-
 ## ⚙️ Development
 
 ```bash
+# Install in development mode
 pip install -e ".[dev]"
+
+# Run tests
 pytest -v
+
+# Code formatting & linting
 black nhsmm
 ruff check nhsmm
 ```
