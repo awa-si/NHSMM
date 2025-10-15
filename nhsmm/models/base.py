@@ -494,42 +494,52 @@ class HSMM(ABC):
 
         return combined
 
-    def _contextual_emission_pdf(self, X: torch.Tensor, lengths: Optional[torch.Tensor] = None, theta: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _contextual_emission_pdf(
+        self,
+        X: torch.Tensor,
+        theta: Optional[torch.Tensor] = None,
+        lengths: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
-        Length-aware log-probabilities with optional context. Uses self._context if theta is None.
+        Compute per-state log-probabilities for emissions with optional context adjustment.
+        Returns a tensor of shape (B, T, n_states), fully length-aware and masked.
         """
         device, dtype = X.device, X.dtype
         B, T = X.shape[:2]
         K = self.n_states
 
-        base_logp = torch.nan_to_num(self.map_emission(X, theta), nan=-1e8, neginf=-1e8, posinf=-1e8)
+        # Base emission log-probs
+        base_logp = torch.nan_to_num(self.map_emission(X, theta), nan=-1e8, posinf=-1e8, neginf=-1e8)
 
-        mask = torch.arange(T, device=device).unsqueeze(0) < lengths.unsqueeze(1) if lengths is not None else torch.ones((B, T), dtype=torch.bool, device=device)
+        # Sequence mask
+        if lengths is not None:
+            mask = torch.arange(T, device=device).unsqueeze(0) < lengths.unsqueeze(1)
+        else:
+            mask = torch.ones((B, T), dtype=torch.bool, device=device)
 
-        if theta is None and hasattr(self, "_context"):
-            theta = self._context
+        logp = base_logp.clone()
 
+        # Optional context adjustment
         if theta is not None:
             theta_comb = self._combine_context(X=None, theta=theta, lengths=lengths)
-            theta_flat = theta_comb[mask]
+            theta_flat = theta_comb[mask]  # only valid positions
 
             if hasattr(self, "emission_context_adapter") and callable(self.emission_context_adapter):
                 context_shift = self.emission_context_adapter(theta_flat)
-            elif hasattr(self.emission_module, "contextual_log_prob"):
+            elif hasattr(self, "emission_module") and hasattr(self.emission_module, "contextual_log_prob"):
                 context_shift = self.emission_module.contextual_log_prob(X[mask], theta_flat)
             else:
                 if not hasattr(self, "_context_affine"):
                     self._context_affine = nn.Linear(theta_flat.shape[-1], K, device=device, dtype=dtype)
                 context_shift = self._context_affine(theta_flat)
 
-            logp = base_logp.clone()
             logp[mask] += context_shift
-        else:
-            logp = base_logp
 
-        logp = torch.nan_to_num(logp, nan=-1e8, neginf=-1e8, posinf=-1e8)
+        # Mask invalid positions
         logp[~mask] = -1e8
+        logp = torch.nan_to_num(logp, nan=-1e8, posinf=-1e8, neginf=-1e8)
 
+        # Normalize per-state log-probs
         return F.log_softmax(logp, dim=-1)
 
     def _contextual_duration_pdf(self, theta: Optional[torch.Tensor]) -> torch.Tensor:
@@ -596,54 +606,6 @@ class HSMM(ABC):
 
         return log_A - torch.logsumexp(log_A, dim=2, keepdim=True)
 
-    def map_emission(self, x: torch.Tensor, theta: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Compute per-state emission log-probabilities for a sequence or batch, optionally using context.
-        Automatically falls back to self._context if theta is None.
-        
-        Args:
-            x (torch.Tensor): Input sequence tensor of shape
-                - (T, F) for a single sequence
-                - (B, T, F) for a batch
-            theta (Optional[torch.Tensor]): Optional context tensor for conditional emission PDFs.
-        
-        Returns:
-            torch.Tensor: Log-probabilities of shape
-                - (T, n_states) for a single sequence
-                - (B, T, n_states) for a batch
-        """
-        device = next(self.parameters(), torch.tensor(0.0)).device
-        x = x.to(device=device, dtype=DTYPE)
-
-        if theta is None and hasattr(self, "_context"):
-            theta = self._context
-
-        # Compute emission log-probabilities
-        logp_or_dist = self._contextual_emission_pdf(x, theta)
-
-        if isinstance(logp_or_dist, torch.distributions.Distribution):
-            # Expand x if needed to match distribution batch shape
-            if logp_or_dist.event_shape:
-                x_exp = x.unsqueeze(-len(logp_or_dist.event_shape)-1)
-            else:
-                x_exp = x.unsqueeze(-1)
-            log_probs = logp_or_dist.log_prob(x_exp)
-            # Collapse event dims if needed
-            if log_probs.ndim > x.ndim:
-                log_probs = log_probs.flatten(start_dim=x.ndim-1).sum(dim=-1)
-        elif torch.is_tensor(logp_or_dist):
-            log_probs = logp_or_dist
-            # Ensure last dim is states
-            if log_probs.ndim < x.ndim:
-                log_probs = log_probs.unsqueeze(-1)
-        else:
-            raise TypeError(f"map_emission returned unsupported type {type(logp_or_dist)}")
-
-        # Safety: dtype/device
-        log_probs = log_probs.to(dtype=DTYPE, device=device)
-
-        return log_probs
-
     def check_constraints(self, value: torch.Tensor, clamp: bool = False) -> torch.Tensor:
         """
         Validate observations against the emission PDF support and event shape.
@@ -693,12 +655,43 @@ class HSMM(ABC):
 
         return value
 
-    def to_observations(
-        self,
-        X: torch.Tensor,
-        lengths: Optional[List[int]] = None,
-        theta: Optional[torch.Tensor] = None
-    ) -> utils.Observations:
+    def map_emission(self, x: torch.Tensor, theta: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Compute per-state emission log-probabilities for a sequence or batch, optionally using context.
+        Falls back to self._context if theta is None.
+
+        Args:
+            x (torch.Tensor): Input sequence tensor of shape (T,F) or (B,T,F).
+            theta (Optional[torch.Tensor]): Optional context tensor for conditional emission PDFs.
+
+        Returns:
+            torch.Tensor: Log-probabilities of shape (T, n_states) or (B, T, n_states).
+        """
+        device = next(self.parameters(), torch.tensor(0.0)).device
+        x = x.to(device=device, dtype=DTYPE)
+
+        if theta is None and hasattr(self, "_context"):
+            theta = self._context
+
+        logp_or_dist = self._contextual_emission_pdf(x, theta)
+
+        # Convert Distribution to tensor if necessary
+        if isinstance(logp_or_dist, torch.distributions.Distribution):
+            event_ndim = len(logp_or_dist.event_shape)
+            x_exp = x.unsqueeze(-event_ndim-1) if event_ndim > 0 else x.unsqueeze(-1)
+            log_probs = logp_or_dist.log_prob(x_exp)
+            if log_probs.ndim > x.ndim:
+                log_probs = log_probs.flatten(start_dim=x.ndim-1).sum(dim=-1)
+        elif torch.is_tensor(logp_or_dist):
+            log_probs = logp_or_dist
+            if log_probs.ndim < x.ndim:
+                log_probs = log_probs.unsqueeze(-1)
+        else:
+            raise TypeError(f"Unsupported type returned from _contextual_emission_pdf: {type(logp_or_dist)}")
+
+        return log_probs.to(dtype=DTYPE, device=device)
+
+    def to_observations(self, X: torch.Tensor, lengths: Optional[List[int]] = None, theta: Optional[torch.Tensor] = None) -> utils.Observations:
         """
         Convert input tensor X into a utils.Observations object suitable for HSMM.
         Automatically uses self._context if theta is None.
@@ -720,7 +713,6 @@ class HSMM(ABC):
             if theta.ndim == 2 and X_valid.ndim == 3:
                 theta = theta.unsqueeze(1).expand(-1, X_valid.shape[1], -1)
 
-        # Determine sequence lengths
         total_len = X_valid.shape[0] if X_valid.ndim == 2 else X_valid.shape[1]
         if lengths is not None:
             if sum(lengths) != total_len:
@@ -741,7 +733,6 @@ class HSMM(ABC):
         else:
             raise ValueError(f"Unsupported input shape {X_valid.shape}")
 
-        # Compute per-sequence log probabilities safely
         log_probs_list = []
         for idx, seq in enumerate(sequences):
             seq_theta = None
@@ -752,17 +743,11 @@ class HSMM(ABC):
                     seq_theta = theta
 
             log_probs = self.map_emission(seq, seq_theta)
-
-            # Ensure torch.Tensor and proper shape
             if not torch.is_tensor(log_probs):
                 log_probs = torch.as_tensor(log_probs, dtype=DTYPE, device=device)
             log_probs_list.append(log_probs)
 
-        return utils.Observations(
-            sequence=sequences,
-            log_probs=log_probs_list,
-            lengths=seq_lengths
-        )
+        return utils.Observations(sequence=sequences, log_probs=log_probs_list, lengths=seq_lengths)
 
     def sample_model_params(self, X: Optional[torch.Tensor] = None, theta: Optional[torch.Tensor] = None, inplace: bool = True) -> Dict[str, Any]:
         """
