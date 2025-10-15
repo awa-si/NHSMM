@@ -7,7 +7,7 @@ from typing import Optional, Literal
 import numpy as np
 
 from nhsmm.defaults import DTYPE
-from nhsmm.models import HSMM
+from nhsmm.models.base import HSMM
 
 
 class GaussianHSMM(HSMM):
@@ -26,8 +26,8 @@ class GaussianHSMM(HSMM):
         n_features: int,
         max_duration: int,
         k_means: bool = False,
-        alpha: float = 1.0,
         min_covar: float = 1e-3,
+        alpha: float = 1.0,
         seed: Optional[int] = None,
     ):
         self.n_features = n_features
@@ -39,9 +39,9 @@ class GaussianHSMM(HSMM):
             n_states=n_states,
             n_features=n_features,
             max_duration=max_duration,
+            min_covar=min_covar,
             alpha=alpha,
             seed=seed,
-            min_covar=min_covar,
         )
 
         # Register emission buffers (mean and covariance per state)

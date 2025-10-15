@@ -687,6 +687,7 @@ class HSMM(nn.Module, ABC):
 
         return params
 
+    # HSMM precessing
     def fit(
         self,
         X: torch.Tensor,
