@@ -66,7 +66,7 @@ nhsmm/
 ```python
 import torch
 from nhsmm.models import NeuralHSMM
-from nhsmm.distributions import NeuralGaussian, NeuralDuration
+from nhsmm.distributions import NeuralGaussian, NeuralDuration, NeuralTransition
 
 # Example input sequence
 X = torch.randn(256, 32)  # (time, features)
