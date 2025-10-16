@@ -48,7 +48,6 @@ nhsmm/
 │   ├── neural.py
 │   └── __init__.py
 ├── distributions/
-│   ├── neural.py
 │   └── __init__.py
 ├── utilities/
 │   ├── utils.py
@@ -65,7 +64,6 @@ nhsmm/
 ```python
 import torch
 from nhsmm.models import NeuralHSMM
-from nhsmm.distributions import NeuralGaussian, NeuralDuration, NeuralTransition
 
 # Example input sequence: (time, features)
 X = torch.randn(256, 32)
@@ -73,9 +71,6 @@ X = torch.randn(256, 32)
 # Initialize HSMM
 model = NeuralHSMM(
     n_states=4,
-    emission=NeuralGaussian(input_dim=32, hidden_dim=64),
-    duration=NeuralDuration(input_dim=32, hidden_dim=32),
-    transition=NeuralTransition(input_dim=32, hidden_dim=32),
 )
 
 # Forward pass
