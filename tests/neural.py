@@ -1,7 +1,7 @@
-import numpy as np
 import torch.nn as nn
 import torch
 
+import numpy as np
 from sklearn.metrics import confusion_matrix
 from scipy.optimize import linear_sum_assignment
 

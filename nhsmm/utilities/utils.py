@@ -1,7 +1,8 @@
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
+
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple, Union
 
 
 @dataclass(frozen=False)
@@ -59,9 +60,6 @@ class Observations:
     def dtype(self) -> torch.dtype:
         return self.sequence[0].dtype
 
-    # ----------------------------------------------------------------------
-    # Core operations
-    # ----------------------------------------------------------------------
     def to(self, device: Union[str, torch.device]) -> "Observations":
         seqs = [s.to(device) for s in self.sequence]
         logs = [l.to(device) for l in self.log_probs] if self.log_probs else None
@@ -106,9 +104,6 @@ class Observations:
         normed = [(s - mean) / std for s in self.sequence]
         return Observations(normed, self.log_probs, self.lengths)
 
-    # ----------------------------------------------------------------------
-    # Utility
-    # ----------------------------------------------------------------------
     def summary(self) -> str:
         return f"{self.n_sequences} seqs | total {self.total_length} steps | dim {self.feature_dim} | device {self.device}"
 
@@ -141,9 +136,6 @@ class ContextualVariables:
         if len({x.dtype for x in self.X}) > 1:
             raise ValueError("All context tensors must share the same dtype.")
 
-    # ----------------------------------------------------------------------
-    # Properties
-    # ----------------------------------------------------------------------
     @property
     def shape(self) -> Tuple[torch.Size, ...]:
         return tuple(x.shape for x in self.X)
@@ -156,9 +148,6 @@ class ContextualVariables:
     def dtype(self) -> torch.dtype:
         return self.X[0].dtype
 
-    # ----------------------------------------------------------------------
-    # Core operations
-    # ----------------------------------------------------------------------
     def to(self, device: Union[str, torch.device]) -> "ContextualVariables":
         X = [x.to(device) for x in self.X]
         return ContextualVariables(self.n_context, X, self.time_dependent, self.names)
@@ -175,9 +164,6 @@ class ContextualVariables:
     def __getitem__(self, idx: int) -> torch.Tensor:
         return self.X[idx]
 
-    # ----------------------------------------------------------------------
-    # Time-dependent padding & batching
-    # ----------------------------------------------------------------------
     def pad_sequences(
         self, pad_value: float = 0.0, return_mask: bool = False
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -209,9 +195,6 @@ class ContextualVariables:
 
         return (batch, mask) if return_mask else batch
 
-    # ----------------------------------------------------------------------
-    # Utility
-    # ----------------------------------------------------------------------
     def summary(self) -> str:
         dep = "time-dependent" if self.time_dependent else "static"
         shape_str = ", ".join(str(s) for s in self.shape)

@@ -38,10 +38,11 @@ class HSMM(ABC):
         alpha: float = 1.0,
         seed: Optional[int] = None,
         context_dim: Optional[int] = None,
-        min_covar: float = 1e-3,
         transition_constraint: Any = None,
+        min_covar: float = 1e-3,
     ):
         super().__init__()
+
         self.n_states = n_states
         self.n_features = n_features
         self.max_duration = max_duration
@@ -233,42 +234,47 @@ class HSMM(ABC):
         Combine observation features with contextual variables into a consistent batch tensor.
 
         Args:
-            X: Observations instance (optional)
-            theta: ContextualVariables instance (optional)
-            reduce: If True, collapse time dimension into mean features
+            X: Observations (optional)
+            theta: ContextualVariables (optional)
+            reduce: If True, collapse time dimension via mean features
 
         Returns:
-            Combined tensor [B, T, F+H] or [B, 1, F+H] if reduced
+            Tensor [B, T, F+H] or [B, 1, F+H] if reduced, None if no input
         """
         if X is None and theta is None:
             return None
 
-        # Convert to padded batch tensors
+        # Pad sequences and extract masks
         X_batch, mask_X = (X.pad_sequences(return_mask=True) if X else (None, None))
-        theta_batch, mask_theta = (theta.pad_sequences(return_mask=True) if theta and theta.time_dependent else (theta.cat(dim=-1).unsqueeze(1) if theta else (None, None)))
+        if theta:
+            if getattr(theta, "time_dependent", False):
+                theta_batch, mask_theta = theta.pad_sequences(return_mask=True)
+            else:
+                theta_tensor = theta.cat(dim=-1).unsqueeze(1)
+                theta_batch, mask_theta = theta_tensor, None
+        else:
+            theta_batch, mask_theta = None, None
 
-        # Align batch dimensions
+        # Determine batch and time dimensions
         B = X_batch.shape[0] if X_batch is not None else theta_batch.shape[0]
-        T = max(X_batch.shape[1] if X_batch is not None else 0, theta_batch.shape[1] if theta_batch is not None else 0)
+        T = max(X_batch.shape[1] if X_batch is not None else 0,
+                theta_batch.shape[1] if theta_batch is not None else 0)
 
+        # Pad sequences to same length
         if X_batch is not None and X_batch.shape[1] != T:
-            X_batch = F.pad(X_batch, (0,0,0,T - X_batch.shape[1]))
+            X_batch = F.pad(X_batch, (0, 0, 0, T - X_batch.shape[1]))
         if theta_batch is not None and theta_batch.shape[1] != T:
-            theta_batch = F.pad(theta_batch, (0,0,0,T - theta_batch.shape[1]))
+            theta_batch = F.pad(theta_batch, (0, 0, 0, T - theta_batch.shape[1]))
 
         # Concatenate along feature dimension
-        if X_batch is not None and theta_batch is not None:
-            combined = torch.cat([X_batch, theta_batch], dim=-1)
-        elif X_batch is not None:
-            combined = X_batch
-        else:
-            combined = theta_batch
+        combined = torch.cat([t for t in [X_batch, theta_batch] if t is not None], dim=-1)
 
-        # Reduce over time dimension if requested
+        # Optional reduction along time dimension
         if reduce:
-            combined = combined.masked_fill(~(mask_X if mask_X is not None else torch.ones(B, T, dtype=torch.bool, device=combined.device)).unsqueeze(-1), 0.0)
-            lengths = mask_X.sum(1).unsqueeze(-1) if mask_X is not None else T
-            combined = combined.sum(1, keepdim=True) / lengths.clamp(min=1)
+            mask = mask_X if mask_X is not None else torch.ones(B, T, dtype=torch.bool, device=combined.device)
+            combined = combined.masked_fill(~mask.unsqueeze(-1), 0.0)
+            lengths = mask.sum(1).unsqueeze(-1).clamp(min=1)
+            combined = combined.sum(1, keepdim=True) / lengths
 
         return torch.nan_to_num(combined, nan=0.0, posinf=1e8, neginf=-1e8)
 
@@ -305,12 +311,14 @@ class HSMM(ABC):
         """
         Compute context-modulated duration log-probabilities.
 
-        Returns: [B, K, duration_logits]
+        Returns: [B, K, max_duration]
         """
-        base_duration = self._duration_logits.unsqueeze(0)  # [1, K, duration_logits]
+        base_duration = self._duration_logits.unsqueeze(0)  # [1, K, max_duration]
         theta_batch = self._combine_context(X=None, theta=theta)
         B = theta_batch.shape[0] if theta_batch is not None else 1
-        log_duration = self.duration_module._apply_context(base_duration.expand(B, *base_duration.shape[1:]), theta_batch)
+        log_duration = self.duration_module._apply_context(
+            base_duration.expand(B, *base_duration.shape[1:]), theta_batch
+        )
         log_duration = torch.nan_to_num(log_duration, nan=-1e8, posinf=-1e8, neginf=-1e8)
         return log_duration - torch.logsumexp(log_duration, dim=2, keepdim=True)
 
@@ -326,16 +334,17 @@ class HSMM(ABC):
         base_transition = self._transition_logits.unsqueeze(0)  # [1, K, K]
         theta_batch = self._combine_context(X=None, theta=theta)
         B = theta_batch.shape[0] if theta_batch is not None else 1
-        log_transition = self.transition_module._apply_context(base_transition.expand(B, *base_transition.shape[1:]), theta_batch)
+        log_transition = self.transition_module._apply_context(
+            base_transition.expand(B, *base_transition.shape[1:]), theta_batch
+        )
 
-        # Apply optional transition mask
+        # Optional transition constraints
         if hasattr(self, "transition_constraint"):
             mask = constraints.mask_invalid_transitions(self.n_states, self.transition_constraint).to(log_transition.device)
             log_transition = log_transition.masked_fill(~mask.unsqueeze(0), -1e8)
 
         log_transition = torch.nan_to_num(log_transition, nan=-1e8, posinf=-1e8, neginf=-1e8)
         return log_transition - torch.logsumexp(log_transition, dim=2, keepdim=True)
-
 
     def _estimate_model_params(self, X: utils.Observations, theta: Optional[utils.ContextualVariables] = None) -> Dict[str, Any]:
         """
