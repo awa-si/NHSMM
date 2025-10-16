@@ -48,11 +48,7 @@ nhsmm/
 │   ├── neural.py
 │   └── __init__.py
 ├── distributions/
-│   ├── NeuralDuration.py
-│   ├── NeuralEmission.py
-│   ├── NeuralGaussian.py
-│   ├── NeuralMultinomial.py
-│   ├── NeuralTransition.py
+│   ├── neural.py
 │   └── __init__.py
 ├── utilities/
 │   ├── utils.py
