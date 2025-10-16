@@ -7,8 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Distribution, Categorical, MultivariateNormal
 
+from nhsmm.models.hsmm import HSMM
 from nhsmm.defaults import DTYPE
-from nhsmm.models import HSMM
 from nhsmm import utils
 
 

@@ -44,7 +44,7 @@ pip install nhsmm (TODO)
 nhsmm/
 ├── defaults.py
 ├── models/
-│   ├── base.py
+│   ├── hsmm.py
 │   ├── neural.py
 │   └── __init__.py
 ├── distributions/

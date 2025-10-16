@@ -4,6 +4,7 @@ import torch
 
 from sklearn.metrics import confusion_matrix
 from scipy.optimize import linear_sum_assignment
+
 from nhsmm.models import NeuralHSMM
 
 # ---------------------------------------------------------
@@ -66,7 +67,7 @@ class CNN_LSTM_Encoder(nn.Module):
 # ---------------------------------------------------------
 def print_duration_summary(model):
     with torch.no_grad():
-        D = torch.exp(model.D).cpu().numpy()
+        D = torch.exp(model.duration_logits).cpu().numpy()
     print("\nLearned duration modes (per state):")
     for i, row in enumerate(D):
         mode = int(np.argmax(row)) + 1

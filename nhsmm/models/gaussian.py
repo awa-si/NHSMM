@@ -1,5 +1,6 @@
 # models/gaussian.py
 import torch
+import torch.nn as nn
 from torch.distributions import MultivariateNormal
 
 from sklearn.cluster import KMeans
@@ -7,10 +8,10 @@ from typing import Optional, Literal
 import numpy as np
 
 from nhsmm.defaults import DTYPE
-from nhsmm.models.base import HSMM
+from nhsmm.models.hsmm import HSMM
 
 
-class GaussianHSMM(HSMM):
+class GaussianHSMM(HSMM, nn.Module):
     """
     Pure Gaussian Hidden Semi-Markov Model (HSMM) with multivariate normal emissions.
     Enhancements:

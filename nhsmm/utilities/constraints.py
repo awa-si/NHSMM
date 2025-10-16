@@ -1,9 +1,9 @@
 from typing import Tuple, Optional, Union
-import torch
 from dataclasses import dataclass
+import torch
 
 
-DTYPE = torch.float64  # default tensor dtype
+DTYPE = torch.float64
 
 
 # ============================================================
@@ -56,7 +56,7 @@ def sample_probs(
     return torch.distributions.Dirichlet(alphas).sample()
 
 
-def sample_A(
+def sample_transition(
     prior: float,
     n_states: int,
     A_type: Union[str, Transitions],
@@ -109,7 +109,7 @@ def compute_information_criteria(
 # ============================================================
 # Transition validation
 # ============================================================
-def is_valid_A(
+def is_valid_transition(
     probs: torch.Tensor,
     A_type: Union[str, Transitions],
     atol: float = 1e-6
