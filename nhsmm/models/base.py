@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Distribution, Categorical
 
-from nhsmm.defaults import Emission, Duration, Transition, DTYPE
+from nhsmm.defaults import Emission, Duration, Transition, DTYPE, HSMMError
 from nhsmm import utils, constraints, SeedGenerator, ConvergenceHandler
 
 
@@ -108,8 +108,6 @@ class HSMM(ABC):
             summary += [super_pi_logits.mean(), super_A_logits.mean()]
 
         self.register_buffer("_init_prior_snapshot", torch.stack(summary).detach())
-
-    # ---------------- Properties ----------------
 
     @property
     def seed(self) -> Optional[int]:
@@ -224,6 +222,123 @@ class HSMM(ABC):
             "Subclasses must implement _estimate_emission_pdf. "
             "It should return a Distribution supporting `.log_prob` and handle optional context theta."
         )
+
+
+    def _combine_context(
+        self,
+        X: Optional[Observations] = None,
+        theta: Optional[ContextualVariables] = None,
+        reduce: bool = False
+    ) -> Optional[torch.Tensor]:
+        """
+        Combine observation features with contextual variables into a consistent batch tensor.
+
+        Args:
+            X: Observations instance (optional)
+            theta: ContextualVariables instance (optional)
+            reduce: If True, collapse time dimension into mean features
+
+        Returns:
+            Combined tensor [B, T, F+H] or [B, 1, F+H] if reduced
+        """
+        if X is None and theta is None:
+            return None
+
+        # Convert to padded batch tensors
+        X_batch, mask_X = (X.pad_sequences(return_mask=True) if X else (None, None))
+        theta_batch, mask_theta = (theta.pad_sequences(return_mask=True) if theta and theta.time_dependent else
+                                   (theta.cat(dim=-1).unsqueeze(1) if theta else (None, None)))
+
+        # Align batch dimensions
+        B = X_batch.shape[0] if X_batch is not None else theta_batch.shape[0]
+        T = max(X_batch.shape[1] if X_batch is not None else 0,
+                theta_batch.shape[1] if theta_batch is not None else 0)
+
+        if X_batch is not None and X_batch.shape[1] != T:
+            X_batch = F.pad(X_batch, (0,0,0,T - X_batch.shape[1]))
+        if theta_batch is not None and theta_batch.shape[1] != T:
+            theta_batch = F.pad(theta_batch, (0,0,0,T - theta_batch.shape[1]))
+
+        # Concatenate along feature dimension
+        if X_batch is not None and theta_batch is not None:
+            combined = torch.cat([X_batch, theta_batch], dim=-1)
+        elif X_batch is not None:
+            combined = X_batch
+        else:
+            combined = theta_batch
+
+        # Reduce over time dimension if requested
+        if reduce:
+            combined = combined.masked_fill(~(mask_X if mask_X is not None else torch.ones(B, T, dtype=torch.bool, device=combined.device)).unsqueeze(-1), 0.0)
+            lengths = mask_X.sum(1).unsqueeze(-1) if mask_X is not None else T
+            combined = combined.sum(1, keepdim=True) / lengths.clamp(min=1)
+
+        return torch.nan_to_num(combined, nan=0.0, posinf=1e8, neginf=-1e8)
+
+    def _contextual_emission_pdf(
+        self,
+        X: Observations,
+        theta: Optional[ContextualVariables] = None
+    ) -> torch.Tensor:
+        """
+        Compute context-modulated emission log-probabilities for batched sequences.
+
+        Returns: [B, T, K]
+        """
+        X_batch, mask = X.pad_sequences(return_mask=True)
+        theta_batch = self._combine_context(X=None, theta=theta)
+        base_logp = self.emission_module.log_prob(X_batch, theta_batch)
+        base_logp = torch.clamp(torch.nan_to_num(base_logp, nan=-1e8, posinf=-1e8, neginf=-1e8), -1e6, 1e6)
+
+        # Apply context delta if available
+        if theta is not None:
+            delta = self.emission_module._apply_context(base_logp, theta_batch)
+            logp = base_logp + delta
+        else:
+            logp = base_logp
+
+        # Mask padding positions
+        logp = logp.masked_fill(~mask.unsqueeze(-1), -1e8)
+        return F.log_softmax(logp, dim=-1)
+
+    def _contextual_duration_pdf(
+        self,
+        theta: Optional[ContextualVariables] = None
+    ) -> torch.Tensor:
+        """
+        Compute context-modulated duration log-probabilities.
+
+        Returns: [B, K, D]
+        """
+        base_D = self._D_logits.unsqueeze(0)  # [1, K, D]
+        theta_batch = self._combine_context(X=None, theta=theta)
+        B = theta_batch.shape[0] if theta_batch is not None else 1
+        log_D = self.duration_module._apply_context(base_D.expand(B, *base_D.shape[1:]), theta_batch)
+        log_D = torch.nan_to_num(log_D, nan=-1e8, posinf=-1e8, neginf=-1e8)
+        return log_D - torch.logsumexp(log_D, dim=2, keepdim=True)
+
+    def _contextual_transition_matrix(
+        self,
+        theta: Optional[ContextualVariables] = None
+    ) -> torch.Tensor:
+        """
+        Compute context-modulated transition log-probabilities.
+
+        Returns: [B, K, K]
+        """
+        base_A = self._A_logits.unsqueeze(0)  # [1, K, K]
+        theta_batch = self._combine_context(X=None, theta=theta)
+        B = theta_batch.shape[0] if theta_batch is not None else 1
+        log_A = self.transition_module._apply_context(base_A.expand(B, *base_A.shape[1:]), theta_batch)
+
+        # Apply optional transition mask
+        if hasattr(self, "transition_constraint"):
+            mask = constraints.mask_invalid_transitions(self.n_states, self.transition_constraint).to(log_A.device)
+            log_A = log_A.masked_fill(~mask.unsqueeze(0), -1e8)
+
+        log_A = torch.nan_to_num(log_A, nan=-1e8, posinf=-1e8, neginf=-1e8)
+        return log_A - torch.logsumexp(log_A, dim=2, keepdim=True)
+
 
     def _estimate_model_params(self, X: utils.Observations, theta: Optional[utils.ContextualVariables] = None) -> Dict[str, Any]:
         """
@@ -434,165 +549,6 @@ class HSMM(ABC):
             self._context = vec.detach()
 
         return vec
-
-    def _combine_context(
-        self,
-        X: Optional[torch.Tensor] = None,
-        theta: Optional[torch.Tensor] = None,
-        lengths: Optional[torch.Tensor] = None,
-        reduce: bool = False
-    ) -> Optional[torch.Tensor]:
-        """
-        Combine input features X with context theta, supporting variable lengths.
-        If theta is None, uses self._context if available.
-        """
-        if theta is None and hasattr(self, "_context") and self._context is not None:
-            theta = self._context
-
-        if X is None and theta is None:
-            return None
-
-        if X is not None and not torch.is_tensor(X):
-            X = torch.as_tensor(X, dtype=DTYPE, device=self.device)
-        if theta is not None and not torch.is_tensor(theta):
-            theta = torch.as_tensor(theta, dtype=DTYPE, device=self.device)
-
-        B, T = (X.shape[:2] if X is not None else (theta.shape[0], theta.shape[1] if theta.ndim == 3 else 1))
-
-        if theta is not None:
-            if theta.ndim == 1:
-                theta = theta.view(1, 1, -1).expand(B, T, -1)
-            elif theta.ndim == 2:
-                if theta.shape[0] == B:
-                    theta = theta.unsqueeze(1).expand(-1, T, -1)
-                else:
-                    theta = theta.unsqueeze(0).expand(B, T, -1)
-            elif theta.ndim != 3:
-                raise ValueError(f"Unexpected theta shape {theta.shape}")
-
-        combined = X if theta is None else theta if X is None else torch.cat([X, theta], dim=-1)
-
-        if reduce and combined.ndim == 3:
-            if lengths is not None:
-                mask = torch.arange(T, device=combined.device).unsqueeze(0) < lengths.unsqueeze(1)
-                masked = combined * mask.unsqueeze(-1)
-                combined = masked.sum(dim=1, keepdim=True) / mask.sum(dim=1, keepdim=True).clamp(min=1)
-            else:
-                combined = combined.mean(dim=1, keepdim=True)
-
-        return combined
-
-    def _contextual_emission_pdf(
-        self,
-        X: torch.Tensor,
-        theta: Optional[torch.Tensor] = None,
-        lengths: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        Compute per-state log-probabilities for emissions with optional context adjustment.
-        Returns a tensor of shape (B, T, n_states), fully length-aware and masked.
-        """
-        device, dtype = X.device, X.dtype
-        B, T = X.shape[:2]
-        K = self.n_states
-
-        # Base emission log-probs
-        base_logp = torch.nan_to_num(self.map_emission(X, theta), nan=-1e8, posinf=-1e8, neginf=-1e8)
-
-        # Sequence mask
-        if lengths is not None:
-            mask = torch.arange(T, device=device).unsqueeze(0) < lengths.unsqueeze(1)
-        else:
-            mask = torch.ones((B, T), dtype=torch.bool, device=device)
-
-        logp = base_logp.clone()
-
-        # Optional context adjustment
-        if theta is not None:
-            theta_comb = self._combine_context(X=None, theta=theta, lengths=lengths)
-            theta_flat = theta_comb[mask]  # only valid positions
-
-            if hasattr(self, "emission_context_adapter") and callable(self.emission_context_adapter):
-                context_shift = self.emission_context_adapter(theta_flat)
-            elif hasattr(self, "emission_module") and hasattr(self.emission_module, "contextual_log_prob"):
-                context_shift = self.emission_module.contextual_log_prob(X[mask], theta_flat)
-            else:
-                if not hasattr(self, "_context_affine"):
-                    self._context_affine = nn.Linear(theta_flat.shape[-1], K, device=device, dtype=dtype)
-                context_shift = self._context_affine(theta_flat)
-
-            logp[mask] += context_shift
-
-        # Mask invalid positions
-        logp[~mask] = -1e8
-        logp = torch.nan_to_num(logp, nan=-1e8, posinf=-1e8, neginf=-1e8)
-
-        # Normalize per-state log-probs
-        return F.log_softmax(logp, dim=-1)
-
-    def _contextual_duration_pdf(self, theta: Optional[torch.Tensor]) -> torch.Tensor:
-        if theta is None and hasattr(self, "_context"):
-            theta = self._context
-
-        base_D = self._D_logits
-        device, dtype = base_D.device, base_D.dtype
-
-        if theta is None:
-            return base_D.unsqueeze(0)
-
-        if theta.dim() == 1:
-            theta = theta.unsqueeze(0)
-        elif theta.dim() == 3:
-            theta = theta[:, -1, :]
-        theta = theta.to(device=device, dtype=dtype)
-
-        if not hasattr(self, "_duration_adapter"):
-            H = theta.shape[-1]
-            self._duration_adapter = nn.Sequential(
-                nn.Linear(H, H),
-                nn.ReLU(),
-                nn.Linear(H, self.n_states * self.max_duration)
-            ).to(device=device, dtype=dtype)
-
-        delta = self._duration_adapter(theta).view(-1, self.n_states, self.max_duration)
-        log_D = base_D.unsqueeze(0) + delta
-        log_D = torch.nan_to_num(log_D, nan=-1e8, posinf=-1e8, neginf=-1e8)
-
-        return log_D - torch.logsumexp(log_D, dim=2, keepdim=True)
-
-    def _contextual_transition_matrix(self, theta: Optional[torch.Tensor]) -> torch.Tensor:
-        if theta is None and hasattr(self, "_context"):
-            theta = self._context
-
-        base_A = self._A_logits
-        device, dtype = base_A.device, base_A.dtype
-
-        if theta is None:
-            return base_A.unsqueeze(0)
-
-        if theta.dim() == 1:
-            theta = theta.unsqueeze(0)
-        elif theta.dim() == 3:
-            theta = theta[:, -1, :]
-        theta = theta.to(device=device, dtype=dtype)
-
-        if not hasattr(self, "_transition_adapter"):
-            H = theta.shape[-1]
-            self._transition_adapter = nn.Sequential(
-                nn.Linear(H, H),
-                nn.ReLU(),
-                nn.Linear(H, self.n_states * self.n_states)
-            ).to(device=device, dtype=dtype)
-
-        delta = self._transition_adapter(theta).view(-1, self.n_states, self.n_states)
-        log_A = base_A.unsqueeze(0) + delta
-        log_A = torch.nan_to_num(log_A, nan=-1e8, posinf=-1e8, neginf=-1e8)
-
-        if hasattr(constraints, "mask_invalid_transitions"):
-            mask = constraints.mask_invalid_transitions(self.n_states, constraints.Transitions.SEMI).to(device)
-            log_A = log_A.masked_fill(~mask.unsqueeze(0), -torch.inf)
-
-        return log_A - torch.logsumexp(log_A, dim=2, keepdim=True)
 
     def check_constraints(self, value: torch.Tensor, clamp: bool = False) -> torch.Tensor:
         """

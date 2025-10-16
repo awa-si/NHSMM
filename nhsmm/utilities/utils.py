@@ -1,17 +1,17 @@
-from typing import Tuple, List, Optional, Union
 from dataclasses import dataclass, field
+from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
 
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
-import torch
-
-
 @dataclass(frozen=False)
 class Observations:
-    """Container for one or more observation sequences with optional log-probabilities."""
+    """
+    Container for one or more observation sequences.
+
+    Supports variable-length sequences, optional log-probabilities, device-aware operations,
+    padding, batching, concatenation, normalization, and detachment.
+    """
 
     sequence: List[torch.Tensor]
     log_probs: Optional[List[torch.Tensor]] = None
@@ -55,26 +55,38 @@ class Observations:
     def device(self) -> torch.device:
         return self.sequence[0].device
 
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.sequence[0].dtype
+
     # ----------------------------------------------------------------------
     # Core operations
     # ----------------------------------------------------------------------
     def to(self, device: Union[str, torch.device]) -> "Observations":
-        """Move all tensors to specified device."""
         seqs = [s.to(device) for s in self.sequence]
         logs = [l.to(device) for l in self.log_probs] if self.log_probs else None
+        return Observations(seqs, logs, self.lengths)
+
+    def detach(self) -> "Observations":
+        seqs = [s.detach() for s in self.sequence]
+        logs = [l.detach() for l in self.log_probs] if self.log_probs else None
         return Observations(seqs, logs, self.lengths)
 
     def pad_sequences(
         self, pad_value: float = 0.0, return_mask: bool = False
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Pad variable-length sequences into a dense tensor [B, T, D]."""
-        max_len = max(self.lengths)
-        feat_dim = self.feature_dim
-        dtype = self.sequence[0].dtype
+        """
+        Pad variable-length sequences into a dense tensor [B, T, D].
+        Returns an optional mask [B, T].
+        """
+        B = self.n_sequences
+        T = max(self.lengths)
+        D = self.feature_dim
         device = self.device
+        dtype = self.dtype
 
-        batch = torch.full((self.n_sequences, max_len, feat_dim), pad_value, dtype=dtype, device=device)
-        mask = torch.zeros((self.n_sequences, max_len), dtype=torch.bool, device=device)
+        batch = torch.full((B, T, D), pad_value, dtype=dtype, device=device)
+        mask = torch.zeros((B, T), dtype=torch.bool, device=device)
 
         for i, seq in enumerate(self.sequence):
             L = seq.shape[0]
@@ -84,14 +96,8 @@ class Observations:
         return (batch, mask) if return_mask else batch
 
     def as_batch(self) -> torch.Tensor:
-        """Concatenate all sequences along time dimension."""
+        """Concatenate all sequences along the time dimension."""
         return torch.cat(self.sequence, dim=0)
-
-    def detach(self) -> "Observations":
-        """Return a detached copy (no autograd tracking)."""
-        seqs = [s.detach() for s in self.sequence]
-        logs = [l.detach() for l in self.log_probs] if self.log_probs else None
-        return Observations(seqs, logs, self.lengths)
 
     def normalize(self, eps: float = 1e-6) -> "Observations":
         """Apply global z-score normalization across all observations."""
@@ -101,29 +107,24 @@ class Observations:
         return Observations(normed, self.log_probs, self.lengths)
 
     # ----------------------------------------------------------------------
-    # Utilities
+    # Utility
     # ----------------------------------------------------------------------
     def summary(self) -> str:
-        """Compact summary of observation statistics."""
-        total = self.total_length
-        feats = self.feature_dim
-        dev = str(self.device)
-        return f"{self.n_sequences} seqs | total {total} steps | dim {feats} | device {dev}"
+        return f"{self.n_sequences} seqs | total {self.total_length} steps | dim {self.feature_dim} | device {self.device}"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=False)
 class ContextualVariables:
     """
-    Immutable container for contextual (exogenous) variables used in hierarchical
-    or neural HSMM/HMM models.
+    Container for contextual variables (exogenous features) for HSMM/HMM models.
 
-    Supports both static and time-dependent context features, with device-aware
-    concatenation and optional normalization.
+    Supports time-dependent or static contexts, padding, batching, concatenation,
+    normalization, detachment, and device-aware operations.
     """
 
     n_context: int
-    X: Tuple[torch.Tensor, ...]
-    time_dependent: bool = field(default=False)
+    X: List[torch.Tensor]
+    time_dependent: bool = False
     names: Optional[List[str]] = None
 
     def __post_init__(self):
@@ -145,66 +146,73 @@ class ContextualVariables:
     # ----------------------------------------------------------------------
     @property
     def shape(self) -> Tuple[torch.Size, ...]:
-        """Shapes of each context tensor."""
         return tuple(x.shape for x in self.X)
 
     @property
     def device(self) -> torch.device:
-        """Device of the stored tensors."""
         return self.X[0].device
 
     @property
     def dtype(self) -> torch.dtype:
-        """Data type of the stored tensors."""
         return self.X[0].dtype
 
     # ----------------------------------------------------------------------
-    # Core methods
+    # Core operations
     # ----------------------------------------------------------------------
-    def cat(self, dim: int = -1, normalize: bool = False, eps: float = 1e-6) -> torch.Tensor:
-        """
-        Concatenate all context tensors along a given dimension, optionally normalized.
-
-        Args:
-            dim: Dimension to concatenate on.
-            normalize: Apply layer normalization.
-            eps: Small epsilon to prevent numerical instability.
-
-        Returns:
-            Concatenated tensor of contextual features.
-        """
-        if len(self.X) == 1:
-            out = self.X[0]
-        else:
-            out = torch.cat(self.X, dim=dim)
-        return F.layer_norm(out, out.shape[-1:], eps=eps) if normalize else out
-
     def to(self, device: Union[str, torch.device]) -> "ContextualVariables":
-        """Return a device-moved copy."""
-        X = tuple(x.to(device) for x in self.X)
-        return ContextualVariables(
-            n_context=self.n_context, X=X,
-            time_dependent=self.time_dependent, names=self.names
-        )
+        X = [x.to(device) for x in self.X]
+        return ContextualVariables(self.n_context, X, self.time_dependent, self.names)
 
     def detach(self) -> "ContextualVariables":
-        """Return a detached copy (no autograd tracking)."""
-        X = tuple(x.detach() for x in self.X)
-        return ContextualVariables(
-            n_context=self.n_context, X=X,
-            time_dependent=self.time_dependent, names=self.names
-        )
+        X = [x.detach() for x in self.X]
+        return ContextualVariables(self.n_context, X, self.time_dependent, self.names)
+
+    def cat(self, dim: int = -1, normalize: bool = False, eps: float = 1e-6) -> torch.Tensor:
+        """Concatenate context tensors along a given dimension with optional layer normalization."""
+        out = self.X[0] if len(self.X) == 1 else torch.cat(self.X, dim=dim)
+        return F.layer_norm(out, out.shape[-1:], eps=eps) if normalize else out
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        """Index into the context tuple."""
         return self.X[idx]
+
+    # ----------------------------------------------------------------------
+    # Time-dependent padding & batching
+    # ----------------------------------------------------------------------
+    def pad_sequences(
+        self, pad_value: float = 0.0, return_mask: bool = False
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Pad time-dependent context tensors along time dimension into a batch tensor [B, T, F].
+        Returns optional mask [B, T].
+        """
+        if not self.time_dependent:
+            raise ValueError("pad_sequences only applies to time-dependent context tensors.")
+
+        # Determine batch size and max length
+        batch_size = 1 if self.X[0].ndim == 2 else self.X[0].shape[0]
+        max_len = max(x.shape[1] if x.ndim == 3 else x.shape[0] for x in self.X)
+
+        padded_list = []
+        for x in self.X:
+            if x.ndim == 2:  # [T, F] -> [1, T, F]
+                x = x.unsqueeze(0)
+            B, T, F = x.shape
+            pad_tensor = torch.full((B, max_len, F), pad_value, dtype=x.dtype, device=x.device)
+            pad_tensor[:, :T, :] = x
+            padded_list.append(pad_tensor)
+
+        batch = torch.cat(padded_list, dim=-1)
+        mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=self.device)
+        for x in self.X:
+            L = x.shape[1] if x.ndim == 3 else x.shape[0]
+            mask[:, :L] = True
+
+        return (batch, mask) if return_mask else batch
 
     # ----------------------------------------------------------------------
     # Utility
     # ----------------------------------------------------------------------
     def summary(self) -> str:
-        """Compact string summary."""
         dep = "time-dependent" if self.time_dependent else "static"
         shape_str = ", ".join(str(s) for s in self.shape)
         return f"{self.n_context} {dep} contexts [{shape_str}] on {self.device}"
-
