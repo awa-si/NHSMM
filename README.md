@@ -10,12 +10,13 @@ It extends classical HSMM's with learnable **emission**, **duration**, and **tra
 
 ## 🚀 Key Features
 
-- **Neural Gaussian & Multinomial Emissions** — fully differentiable probabilistic outputs  
-- **Covariate-Dependent Duration Models** — via neural parameterization  
-- **Dense HSMM / HSMM-HMM Hybrid Inference**  
-- **Multi-Timescale Regime Modeling** — supports 1W / 1H / 15M / 1M fusion  
-- **Torch-based, GPU-ready Implementation**  
-- **Configurable self-loop, trend, and overlay regime maps**  
+- **Neural Emission Models** — Gaussian, Multinomial, or Bernoulli outputs, fully differentiable  
+- **Neural Duration Models** — context-dependent discrete duration distributions  
+- **Neural Transition Models** — learnable, covariate-aware transition probabilities  
+- **Subclassable Distributions** — Duration, Transition, and Emission inherit from standard PyTorch `Distribution` objects for composability  
+- **HSMM-HMM Hybrid Inference**
+- **GPU-ready Implementation** — leverage PyTorch automatic differentiation  
+- **Flexible Contextual Inputs** — external covariates modulate emissions, durations, and transitions  
 
 ---
 
@@ -41,6 +42,7 @@ pip install nhsmm (TODO)
 
 ```
 nhsmm/
+├── defaults.py
 ├── models/
 │   ├── base.py
 │   ├── neural.py
