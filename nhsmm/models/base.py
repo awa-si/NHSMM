@@ -8,12 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Distribution, Categorical
 
-from nhsmm.defaults import (
-    DefaultEmission, DefaultDuration, DefaultTransition, DTYPE
-)
-from nhsmm import (
-    utils, constraints, SeedGenerator, ConvergenceHandler
-)
+from nhsmm.defaults import Emission, Duration, Transition, DTYPE
+from nhsmm import utils, constraints, SeedGenerator, ConvergenceHandler
 
 
 class HSMM(ABC):
@@ -57,9 +53,9 @@ class HSMM(ABC):
         self._context: Optional[torch.Tensor] = None
 
         self.encoder: Optional[nn.Module] = None
-        self.emission_module = DefaultEmission(n_states, n_features, min_covar, context_dim)
-        self.duration_module = DefaultDuration(n_states, max_duration, context_dim)
-        self.transition_module = DefaultTransition(n_states, context_dim)
+        self.emission_module = Emission(n_states, n_features, min_covar, context_dim)
+        self.duration_module = Duration(n_states, max_duration, context_dim)
+        self.transition_module = Transition(n_states, context_dim)
 
         self.transition_constraint = transition_constraint or constraints.Transitions.SEMI
 
