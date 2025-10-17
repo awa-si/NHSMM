@@ -885,41 +885,41 @@ class HSMM(ABC):
         batch_size: int = 256,
     ) -> list[torch.Tensor]:
         """
-        Decode HSMM sequences using either MAP or Viterbi algorithm with optional context.
+        Decode sequences for both neural and classical HSMM using MAP or Viterbi algorithm.
 
         Args:
             X: Input tensor (B, T, F) or list of sequences.
-            lengths: Optional sequence lengths.
-            algorithm: "map" for MAP decoding, "viterbi" for Viterbi path.
-            context: Optional context tensor (B, H) or (H,) or (1, H).
-            batch_size: Chunk size for emission log-prob computation.
+            lengths: Optional list of sequence lengths.
+            algorithm: Decoding mode, "map" or "viterbi".
+            context: Optional context tensor (B, H), (1, H), or (H,).
+            batch_size: Batch size for emission log-prob computation.
 
         Returns:
-            List of predicted state sequences (one per sequence).
+            List[Tensor]: Predicted discrete state indices for each sequence.
         """
-        X_valid = self.to_observations(X, lengths)
-        device = next(self.parameters(), torch.tensor(0.0)).device
         algorithm = algorithm.lower()
+        device = next(self.parameters(), torch.tensor(0.0)).device
+        X_valid = self.to_observations(X, lengths)
 
-        # Reduce context if necessary
-        if context is not None and context.dim() > 1:
-            context = context.mean(dim=0, keepdim=True)
+        # Normalize context
+        if context is not None:
+            if context.dim() == 1:
+                context = context.unsqueeze(0)
+            elif context.dim() > 2:
+                context = context.mean(dim=0, keepdim=True)
+            context = context.to(device=device, dtype=DTYPE)
 
-        # Flatten all sequences for vectorized computation
-        seq_tensor = torch.cat(X_valid.sequence, dim=0).to(dtype=DTYPE, device=device)
+        # Prepare observation tensor
+        seq_tensor = torch.cat(X_valid.sequence, dim=0).to(device=device, dtype=DTYPE)
         seq_offsets = [0] + list(torch.cumsum(torch.tensor(X_valid.lengths, device=device), dim=0).tolist())
         B = len(X_valid.lengths)
-        K = getattr(self, "n_states", None)
-
-        # Compute emission log-probs in batches
-        pdf = self._params.get("emission_pdf", None)
-        if pdf is None:
-            raise RuntimeError("Emission PDF not initialized.")
-
         total_T = seq_tensor.shape[0]
         log_probs_chunks = []
 
-        if hasattr(pdf, "log_prob"):
+        # --- EMISSION LOG-PROBABILITIES ---
+        pdf = getattr(self, "_params", {}).get("emission_pdf", None)
+        if pdf is not None and hasattr(pdf, "log_prob"):
+            # Classical emission
             for start in range(0, total_T, batch_size):
                 end = min(start + batch_size, total_T)
                 chunk = seq_tensor[start:end].unsqueeze(1)
@@ -929,7 +929,9 @@ class HSMM(ABC):
                 log_probs_chunks.append(lp)
             all_log_probs = torch.cat(log_probs_chunks, dim=0)
         else:
-            # Fallback: compute logits or Normal distribution
+            # Neural emission
+            if not hasattr(self, "emission_module"):
+                raise RuntimeError("No emission model found for NeuralHSMM.")
             mu_var_or_logits = self.emission_module(context)
             if isinstance(mu_var_or_logits, tuple):
                 mu, var = mu_var_or_logits
@@ -945,28 +947,43 @@ class HSMM(ABC):
                 logits = mu_var_or_logits
                 all_log_probs = F.log_softmax(logits, dim=-1)[seq_tensor.long(), :]
 
-        # Split log-probs per sequence
+        # Split per sequence
         X_valid.log_probs = [all_log_probs[seq_offsets[i]:seq_offsets[i + 1]] for i in range(B)]
-        K = K or all_log_probs.shape[-1]
+        K = getattr(self, "n_states", all_log_probs.shape[-1])
 
-        # Transition and duration log-probs
-        transition_logits = getattr(self.transition_module, "log_probs", lambda context=None: torch.log_softmax(self.transition_module(context), dim=-1))(context=context)
-        if hasattr(self.duration_module, "log_probs"):
-            log_duration = self.duration_module.log_probs(context=context)
-        elif hasattr(self.duration_module, "logits"):
-            log_duration = F.log_softmax(self.duration_module.logits, dim=-1)
+        # --- TRANSITION LOGITS ---
+        if hasattr(self, "transition_module"):
+            if hasattr(self.transition_module, "log_probs"):
+                transition_logits = self.transition_module.log_probs(context=context)
+            else:
+                transition_logits = torch.log_softmax(self.transition_module(context), dim=-1)
         else:
-            log_duration = None
+            transition_logits = getattr(self._params, "log_transition", None)
+            if transition_logits is None:
+                raise RuntimeError("Transition parameters missing for HSMM.")
+            transition_logits = transition_logits.to(device=device)
 
-        # Pad sequences for uniform length
+        # --- DURATION LOG-PROBS ---
+        if hasattr(self, "duration_module"):
+            if hasattr(self.duration_module, "log_probs"):
+                log_duration = self.duration_module.log_probs(context=context)
+            elif hasattr(self.duration_module, "logits"):
+                log_duration = F.log_softmax(self.duration_module.logits, dim=-1)
+            else:
+                log_duration = None
+        else:
+            log_duration = getattr(self._params, "log_duration", None)
+            if log_duration is not None:
+                log_duration = log_duration.to(device=device)
+
+        # --- PAD OBSERVATIONS ---
         max_T = max(X_valid.lengths)
         log_B = torch.full((B, max_T, K), -torch.inf, device=device)
-        for i, seq_log_probs in enumerate(X_valid.log_probs):
-            log_B[i, :seq_log_probs.shape[0]] = seq_log_probs
-
+        for i, seq_lp in enumerate(X_valid.log_probs):
+            log_B[i, :seq_lp.shape[0]] = seq_lp
         mask = torch.arange(max_T, device=device).unsqueeze(0) < torch.tensor(X_valid.lengths, device=device).unsqueeze(1)
 
-        # --- Decoding ---
+        # --- DECODING ---
         if algorithm == "map":
             alpha = torch.full((B, max_T, K), -torch.inf, device=device)
             alpha[:, 0] = log_B[:, 0]
@@ -983,7 +1000,6 @@ class HSMM(ABC):
             delta = torch.full((B, max_T, K), -torch.inf, device=device)
             psi = torch.zeros((B, max_T, K), dtype=torch.long, device=device)
             delta[:, 0] = log_B[:, 0]
-
             for t in range(1, max_T):
                 scores = delta[:, t - 1].unsqueeze(2) + transition_logits
                 if log_duration is not None:
@@ -992,17 +1008,14 @@ class HSMM(ABC):
                 psi[:, t] = torch.argmax(scores, dim=1)
                 delta[:, t] = torch.max(scores, dim=1).values + log_B[:, t]
                 delta[:, t] = torch.where(mask[:, t].unsqueeze(-1), delta[:, t], delta[:, t - 1])
-
             decoded = torch.zeros((B, max_T), dtype=torch.long, device=device)
             decoded[:, -1] = torch.argmax(delta[:, -1], dim=-1)
             for t in range(max_T - 2, -1, -1):
                 decoded[:, t] = torch.gather(psi[:, t + 1], 1, decoded[:, t + 1].unsqueeze(1)).squeeze(1)
                 decoded[:, t] = torch.where(mask[:, t], decoded[:, t], decoded[:, t + 1])
-
         else:
             raise ValueError(f"Unknown decoding algorithm '{algorithm}'.")
 
-        # Return list of sequences trimmed to original lengths
         return [decoded[i, :L].detach().cpu() for i, L in enumerate(X_valid.lengths)]
 
     def score(

@@ -318,9 +318,6 @@ class GaussianHSMM(HSMM, nn.Module):
             print("[GaussianHSMM._contextual_emission_pdf] Warning: emission_pdf not a MultivariateNormal.")
         return None
 
-    # -------------------------
-    # --- Initialization helper (new)
-    # -------------------------
     def initialize_emissions(
         self,
         X: torch.Tensor,
@@ -418,9 +415,6 @@ class GaussianHSMM(HSMM, nn.Module):
         # --- finalize emission PDF ---
         self._params["emission_pdf"] = MultivariateNormal(self._emission_means, self._emission_covs)
 
-    # -------------------------
-    # --- Convenience decode
-    # -------------------------
     def decode(
         self,
         X: torch.Tensor,

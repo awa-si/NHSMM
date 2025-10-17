@@ -3,8 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical, Normal, Bernoulli, Independent
-
-from typing import Optional, Union, Dict, Any
+from typing import Optional, Dict, Any
 
 # ============================================================
 # Constants & Errors
@@ -13,7 +12,7 @@ EPS = 1e-12
 MAX_LOGITS = 50.0
 DTYPE = torch.float64
 
-class HSMMError(Exception):
+class HSMMError(ValueError):
     pass
 
 # ============================================================
@@ -86,7 +85,7 @@ class Contextual(nn.Module):
             raise HSMMError(f"Context last dimension must be {self.context_dim}, got {context.shape[-1]}")
         return context
 
-    def _contextual_modulation(self, base: torch.Tensor, context: Optional[torch.Tensor], scale: float = 0.1):
+    def _contextual_modulation(self, base: torch.Tensor, context: Optional[torch.Tensor], scale: float = 0.1) -> torch.Tensor:
         if self.context_net is None or context is None:
             return torch.zeros_like(base)
         context = self._validate_context(context)
@@ -95,9 +94,10 @@ class Contextual(nn.Module):
             delta = delta.unsqueeze(1)
         if self.aggregate_context:
             delta = delta.mean(dim=0, keepdim=True)
-        return scale * torch.tanh(delta.expand_as(base))
+        # Broadcasting without expand_as
+        return scale * torch.tanh(delta + torch.zeros_like(base))
 
-    def _apply_context(self, base: torch.Tensor, context: Optional[torch.Tensor], scale: float = 0.1):
+    def _apply_context(self, base: torch.Tensor, context: Optional[torch.Tensor], scale: float = 0.1) -> torch.Tensor:
         modulated = base + self._contextual_modulation(base, context, scale)
         return torch.where(torch.isfinite(modulated), modulated, base)
 
@@ -160,9 +160,13 @@ class Emission(Contextual):
             if return_dist:
                 return Independent(Normal(mu, var.sqrt()), 1)
             return mu, var
+
         logits = self._apply_context(self.logits, context, self.scale)
         if return_dist:
-            return Categorical(logits=logits) if self.emission_type == "categorical" else Independent(Bernoulli(logits=logits), 1)
+            if self.emission_type == "categorical":
+                return Categorical(logits=logits)
+            else:
+                return Independent(Bernoulli(logits=logits), 1)
         return logits
 
     def log_prob(self, x: torch.Tensor, context: Optional[torch.Tensor] = None):
@@ -172,9 +176,13 @@ class Emission(Contextual):
             x = x.unsqueeze(1)
         return dist.log_prob(x)
 
-    def sample(self, n_samples=1, context=None, state_indices=None):
+    def sample(self, n_samples: int = 1, context: Optional[torch.Tensor] = None, state_indices: Optional[torch.Tensor] = None):
         dist = self.forward(context=context, return_dist=True)
-        samples = dist.sample((n_samples,)).transpose(0, 1)  # (B, n_samples, F)
+        samples = dist.sample((n_samples,))  # (n_samples, n_states, F)
+        if self.emission_type == "gaussian":
+            samples = samples.transpose(0, 1)  # (n_states, n_samples, F)
+        else:
+            samples = samples.transpose(0, 1)  # (n_states, n_samples)
         if state_indices is not None:
             samples = samples[state_indices, ...]
         return samples
@@ -194,7 +202,7 @@ class Emission(Contextual):
 # Duration Module
 # ============================================================
 class Duration(Contextual):
-    """Contextual duration distribution."""
+    """Contextual duration distribution for HSMM states."""
     def __init__(
         self,
         n_states: int,
@@ -212,38 +220,44 @@ class Duration(Contextual):
         self.max_duration = max_duration
         self.temperature = max(temperature, 1e-6)
         self.scale = 0.1
+        self.device = self.device
+        self.dtype = self.dtype
         self.logits = nn.Parameter(torch.randn(n_states, max_duration, device=self.device, dtype=self.dtype) * 0.1)
 
-    def forward(self, context=None, log=False, return_dist=False):
+    def forward(self, context: Optional[torch.Tensor] = None, log: bool = False, return_dist: bool = False):
         logits = self._apply_context(self.logits, context, self.scale) / self.temperature
         logits = torch.clamp(logits, -MAX_LOGITS, MAX_LOGITS)
         if return_dist:
             return Categorical(logits=logits)
         return F.log_softmax(logits, dim=-1) if log else F.softmax(logits, dim=-1)
 
-    def log_probs(self, context=None):
-        return self.forward(context=context, log=True, return_dist=False)
+    def expected_duration(self, context: Optional[torch.Tensor] = None) -> torch.Tensor:
+        probs = self.forward(context=context, log=False, return_dist=False)
+        durations = torch.arange(1, self.max_duration + 1, device=self.device, dtype=self.dtype)
+        return (probs * durations).sum(dim=-1)
 
-    def probs(self, context=None):
-        return self.forward(context=context, log=False, return_dist=False)
-
-    def sample(self, n_samples=1, context=None, state_indices=None):
+    def sample(self, n_samples: int = 1, context: Optional[torch.Tensor] = None, state_indices: Optional[torch.Tensor] = None):
         dist = self.forward(context=context, return_dist=True)
-        samples = dist.sample((n_samples,)).T
+        samples = dist.sample((n_samples,)).T  # (n_states, n_samples)
         if state_indices is not None:
             samples = samples[state_indices, ...]
         return samples
 
     def get_config(self):
         cfg = super().get_config()
-        cfg.update(dict(n_states=self.n_states, max_duration=self.max_duration, temperature=self.temperature))
+        cfg.update(dict(
+            n_states=self.n_states,
+            max_duration=self.max_duration,
+            temperature=self.temperature,
+            scale=self.scale,
+        ))
         return cfg
 
 # ============================================================
 # Transition Module
 # ============================================================
 class Transition(Contextual):
-    """Contextual transition distribution."""
+    """Contextual transition distribution with batched context support."""
     def __init__(
         self,
         n_states: int,
@@ -261,22 +275,19 @@ class Transition(Contextual):
         self.scale = 0.1
         self.logits = nn.Parameter(torch.randn(n_states, n_states, device=self.device, dtype=self.dtype) * 0.1)
 
-    def forward(self, context=None, log=False, return_dist=False):
+    def forward(self, context: Optional[torch.Tensor] = None, log: bool = False, return_dist: bool = False):
         logits = self._apply_context(self.logits, context, self.scale) / self.temperature
         logits = torch.clamp(logits, -MAX_LOGITS, MAX_LOGITS)
         if return_dist:
             return Categorical(logits=logits)
         return F.log_softmax(logits, dim=-1) if log else F.softmax(logits, dim=-1)
 
-    def log_probs(self, context=None):
-        return self.forward(context=context, log=True, return_dist=False)
-
-    def probs(self, context=None):
+    def expected_transitions(self, context: Optional[torch.Tensor] = None):
         return self.forward(context=context, log=False, return_dist=False)
 
-    def sample(self, n_samples=1, context=None, state_indices=None):
+    def sample(self, n_samples: int = 1, context: Optional[torch.Tensor] = None, state_indices: Optional[torch.Tensor] = None):
         dist = self.forward(context=context, return_dist=True)
-        samples = dist.sample((n_samples,)).T
+        samples = dist.sample((n_samples,)).transpose(0,1)  # (n_states, n_samples)
         if state_indices is not None:
             samples = samples[state_indices, ...]
         return samples
