@@ -1,4 +1,4 @@
-# defaults.py
+# nhsmm/defaults.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,6 +20,7 @@ class HSMMError(ValueError):
 # ============================================================
 class Contextual(nn.Module):
     """Base class for context-modulated parameters."""
+
     def __init__(
         self,
         context_dim: Optional[int],
@@ -90,11 +91,11 @@ class Contextual(nn.Module):
             return torch.zeros_like(base)
         context = self._validate_context(context)
         delta = self.context_net(context)
+        # reshape delta to broadcast over base
         while delta.ndim < base.ndim:
             delta = delta.unsqueeze(1)
         if self.aggregate_context:
             delta = delta.mean(dim=0, keepdim=True)
-        # Broadcasting without expand_as
         return scale * torch.tanh(delta + torch.zeros_like(base))
 
     def _apply_context(self, base: torch.Tensor, context: Optional[torch.Tensor], scale: float = 0.1) -> torch.Tensor:
@@ -122,6 +123,7 @@ class Contextual(nn.Module):
 # ============================================================
 class Emission(Contextual):
     """Contextual emission distribution."""
+
     def __init__(
         self,
         n_states: int,
@@ -156,7 +158,7 @@ class Emission(Contextual):
     def forward(self, context: Optional[torch.Tensor] = None, return_dist: bool = False):
         if self.emission_type == "gaussian":
             mu = self._apply_context(self.mu, context, self.scale)
-            var = F.softplus(self.log_var) + self.min_covar + EPS
+            var = torch.clamp(F.softplus(self.log_var), min=self.min_covar) + EPS
             if return_dist:
                 return Independent(Normal(mu, var.sqrt()), 1)
             return mu, var
@@ -179,10 +181,7 @@ class Emission(Contextual):
     def sample(self, n_samples: int = 1, context: Optional[torch.Tensor] = None, state_indices: Optional[torch.Tensor] = None):
         dist = self.forward(context=context, return_dist=True)
         samples = dist.sample((n_samples,))  # (n_samples, n_states, F)
-        if self.emission_type == "gaussian":
-            samples = samples.transpose(0, 1)  # (n_states, n_samples, F)
-        else:
-            samples = samples.transpose(0, 1)  # (n_states, n_samples)
+        samples = samples.transpose(0, 1)  # (n_states, n_samples, F)
         if state_indices is not None:
             samples = samples[state_indices, ...]
         return samples
@@ -203,6 +202,7 @@ class Emission(Contextual):
 # ============================================================
 class Duration(Contextual):
     """Contextual duration distribution for HSMM states."""
+
     def __init__(
         self,
         n_states: int,
@@ -212,7 +212,7 @@ class Duration(Contextual):
         aggregate_context: bool = True,
         hidden_dim: Optional[int] = None,
         device: Optional[torch.device] = None,
-        dtype: torch.dtype = DTYPE
+        dtype: torch.dtype = DTYPE,
     ):
         target_dim = n_states * max_duration
         super().__init__(context_dim, target_dim, aggregate_context, hidden_dim, "tanh", device, dtype)
@@ -220,8 +220,6 @@ class Duration(Contextual):
         self.max_duration = max_duration
         self.temperature = max(temperature, 1e-6)
         self.scale = 0.1
-        self.device = self.device
-        self.dtype = self.dtype
         self.logits = nn.Parameter(torch.randn(n_states, max_duration, device=self.device, dtype=self.dtype) * 0.1)
 
     def forward(self, context: Optional[torch.Tensor] = None, log: bool = False, return_dist: bool = False):
@@ -258,6 +256,7 @@ class Duration(Contextual):
 # ============================================================
 class Transition(Contextual):
     """Contextual transition distribution with batched context support."""
+
     def __init__(
         self,
         n_states: int,
@@ -266,7 +265,7 @@ class Transition(Contextual):
         aggregate_context: bool = True,
         hidden_dim: Optional[int] = None,
         device: Optional[torch.device] = None,
-        dtype: torch.dtype = DTYPE
+        dtype: torch.dtype = DTYPE,
     ):
         target_dim = n_states * n_states
         super().__init__(context_dim, target_dim, aggregate_context, hidden_dim, "tanh", device, dtype)

@@ -10,9 +10,19 @@ class ConvergenceHandler:
     """
     GPU-compatible convergence monitor for EM or neural training loops.
 
-    Tracks per-initialization log-likelihood, deltas, and convergence state
+    Tracks per-initialization log-likelihoods, deltas, and convergence status
     in a thread-safe, vectorized manner. Supports callback hooks, live plotting,
     and JSON export for post-analysis.
+
+    Args:
+        max_iter (int): Maximum number of iterations to track.
+        n_init (int): Number of random initializations or runs.
+        tol (float): Absolute tolerance for convergence detection.
+        post_conv_iter (int): Number of consecutive small deltas to confirm convergence.
+        verbose (bool): Whether to print progress each iteration.
+        callbacks (list[Callable], optional): User-defined callback hooks.
+        early_stop (bool): If True, training halts once any init converges.
+        device (torch.device, optional): Device to store tensors on.
     """
 
     def __init__(
@@ -24,7 +34,7 @@ class ConvergenceHandler:
         verbose: bool = True,
         callbacks: Optional[List[Callable]] = None,
         early_stop: bool = True,
-        device: Optional[torch.device] = None
+        device: Optional[torch.device] = None,
     ):
         self.max_iter = int(max_iter)
         self.n_init = int(n_init)
@@ -50,14 +60,25 @@ class ConvergenceHandler:
     # Core API
     # ----------------------------------------------------------------------
     def push_pull(self, new_score: torch.Tensor, iteration: int, rank: int) -> bool:
-        """Push a new score and immediately check convergence."""
+        """
+        Push a new score and immediately check for convergence.
+
+        Args:
+            new_score (torch.Tensor | float): New log-likelihood value.
+            iteration (int): Current iteration index.
+            rank (int): Index of the current initialization.
+
+        Returns:
+            bool: True if this initialization has converged.
+        """
         self.push(new_score, iteration, rank)
         return self.check_converged(iteration, rank)
 
     def push(self, new_score: torch.Tensor, iteration: int, rank: int):
         """Store a new score and update rolling deltas (GPU-safe)."""
         score_val = (
-            new_score.detach() if torch.is_tensor(new_score)
+            new_score.detach()
+            if torch.is_tensor(new_score)
             else torch.tensor(float(new_score), dtype=torch.float64, device=self.device)
         )
         self.score[iteration, rank] = score_val
@@ -73,21 +94,28 @@ class ConvergenceHandler:
         """Evaluate convergence for one initialization based on recent deltas."""
         buf = self._rolling_deltas[rank]
         valid_deltas = buf[~torch.isnan(buf)]
+
         converged = (
             valid_deltas.numel() >= self.post_conv_iter
             and torch.all(torch.abs(valid_deltas) < self.tol).item()
         )
+
         self.is_converged_per_init[rank] = converged
+        self._trigger_callbacks(iteration, rank, converged)
 
         if self.verbose:
             score = float(self.score[iteration, rank].cpu())
-            delta = float(self.delta[iteration, rank].cpu()) if not torch.isnan(self.delta[iteration, rank]) else float("nan")
+            delta = (
+                float(self.delta[iteration, rank].cpu())
+                if not torch.isnan(self.delta[iteration, rank])
+                else float("nan")
+            )
             status = "✔️ Converged" if converged else ""
             print(f"[Init {rank+1:02d}] Iter {iteration:03d} | Score: {score:.6f} | Δ: {delta:.3e} {status}")
 
-        self._trigger_callbacks(iteration, rank, converged)
         if converged and self.early_stop:
             self.stop_training = True
+
         return converged
 
     # ----------------------------------------------------------------------
@@ -99,7 +127,7 @@ class ConvergenceHandler:
             self.callbacks.append(fn)
 
     def _trigger_callbacks(self, iteration: int, rank: int, converged: bool):
-        """Invoke all registered callbacks with thread-safety."""
+        """Invoke all registered callbacks with thread safety."""
         with self._lock:
             score = self.score[iteration, rank].item()
             delta_val = self.delta[iteration, rank]
@@ -114,8 +142,22 @@ class ConvergenceHandler:
     # ----------------------------------------------------------------------
     # Visualization & Logging
     # ----------------------------------------------------------------------
-    def plot_convergence(self, show: bool = True, savepath: Optional[str] = None, title: str = "Convergence Curve"):
-        """Plot per-initialization convergence curves."""
+    def plot_convergence(
+        self,
+        show: bool = True,
+        savepath: Optional[str] = None,
+        title: str = "Convergence Curve",
+        log_scale: bool = False,
+    ):
+        """
+        Plot per-initialization convergence curves.
+
+        Args:
+            show (bool): Display the plot interactively.
+            savepath (str, optional): Path to save figure.
+            title (str): Plot title.
+            log_scale (bool): Use log scale on the y-axis.
+        """
         plt.style.use("ggplot")
         fig, ax = plt.subplots(figsize=(9, 5))
         iters = torch.arange(self.max_iter + 1, device=self.device)
@@ -128,6 +170,8 @@ class ConvergenceHandler:
         ax.set_title(title)
         ax.set_xlabel("Iteration")
         ax.set_ylabel("Log-Likelihood")
+        if log_scale:
+            ax.set_yscale("log")
         ax.legend(loc="best", fontsize="small")
         fig.tight_layout()
 
@@ -139,7 +183,7 @@ class ConvergenceHandler:
             plt.close(fig)
 
     def export_log(self, path: str):
-        """Export convergence logs to JSON."""
+        """Export convergence logs to a JSON file."""
         data = {
             "max_iter": self.max_iter,
             "n_init": self.n_init,
@@ -153,6 +197,7 @@ class ConvergenceHandler:
 
     @staticmethod
     def _tensor_to_list(t: torch.Tensor) -> List[List[Optional[float]]]:
+        """Convert tensor to JSON-serializable nested list."""
         arr = t.cpu().numpy()
         return [[float(x) if np.isfinite(x) else None for x in row] for row in arr]
 

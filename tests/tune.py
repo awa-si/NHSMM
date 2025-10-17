@@ -1,7 +1,10 @@
 # tests/tune_neural.py
-import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 import optuna
+import numpy as np
 from sklearn.metrics import confusion_matrix
 from scipy.optimize import linear_sum_assignment
 
@@ -20,6 +23,80 @@ def best_permutation_accuracy(true, pred, n_classes):
     acc = (mapped_pred == true).mean()
     return acc, mapped_pred
 
+
+# ---------------------------------------------------------
+# CNN+LSTM encoder
+# ---------------------------------------------------------
+class CNN_LSTM_Encoder(nn.Module):
+    """
+    Hybrid CNN–LSTM encoder for sequence feature extraction.
+
+    Designed for compact contextual embeddings from time-series or sequential data.
+    The CNN layer captures short-range temporal patterns; the LSTM models longer dependencies.
+
+    Args:
+        n_features (int): Number of input features per time step.
+        hidden_dim (int): LSTM hidden size.
+        cnn_channels (int): Number of convolutional output channels.
+        kernel_size (int): Convolution kernel size.
+        dropout (float): Dropout probability applied after CNN and LSTM.
+        bidirectional (bool): Use bidirectional LSTM for richer context.
+        normalize (bool): Apply LayerNorm to stabilize training.
+    """
+
+    def __init__(
+        self,
+        n_features: int,
+        hidden_dim: int = 32,
+        cnn_channels: int = 16,
+        kernel_size: int = 3,
+        dropout: float = 0.1,
+        bidirectional: bool = True,
+        normalize: bool = True,
+    ):
+        super().__init__()
+
+        padding = kernel_size // 2  # keep temporal length constant
+        self.conv1 = nn.Conv1d(
+            in_channels=n_features,
+            out_channels=cnn_channels,
+            kernel_size=kernel_size,
+            padding=padding,
+        )
+        self.norm = nn.LayerNorm(cnn_channels) if normalize else nn.Identity()
+        self.dropout = nn.Dropout(dropout)
+        self.lstm = nn.LSTM(
+            input_size=cnn_channels,
+            hidden_size=hidden_dim,
+            batch_first=True,
+            bidirectional=bidirectional,
+        )
+
+        lstm_out_dim = hidden_dim * (2 if bidirectional else 1)
+        self.out_dim = lstm_out_dim  # external reference for downstream modules
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, T, F)
+        Returns:
+            torch.Tensor: Encoded feature vector of shape (B, H)
+        """
+        # CNN block
+        x = x.transpose(1, 2)  # (B, F, T)
+        x = self.conv1(x)
+        x = F.relu(x)
+        x = x.transpose(1, 2)  # (B, T, C)
+        x = self.norm(x)
+        x = self.dropout(x)
+
+        # LSTM block
+        out, _ = self.lstm(x)
+        out = self.dropout(out)
+
+        # Aggregate: last time step (or mean pooling as fallback)
+        last_output = out[:, -1, :]
+        return last_output
 
 # -------------------------
 # Synthetic Gaussian sequence (with optional context)
@@ -96,6 +173,8 @@ def objective(trial):
     if C is not None:
         C = C.to(device)
 
+    encoder = CNN_LSTM_Encoder(n_features, hidden_dim=16)
+
     # instantiate NeuralHSMM
     model = NeuralHSMM(
         n_states=n_states,
@@ -104,7 +183,7 @@ def objective(trial):
         alpha=alpha,
         seed=0,
         emission_type="gaussian",
-        encoder=None,            # you can pass an encoder nn.Module here if available
+        encoder=encoder,            # you can pass an encoder nn.Module here if available
         device=device,
         context_dim=context_dim if context_dim > 0 else None,
         min_covar=1e-6,
