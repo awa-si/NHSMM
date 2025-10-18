@@ -5,9 +5,6 @@ import torch.nn.functional as F
 from torch.distributions import Categorical, Normal, Bernoulli, Independent
 from typing import Optional, Dict, Any
 
-# ============================================================
-# Constants & Errors
-# ============================================================
 EPS = 1e-12
 MAX_LOGITS = 50.0
 DTYPE = torch.float64
@@ -15,9 +12,6 @@ DTYPE = torch.float64
 class HSMMError(ValueError):
     pass
 
-# ============================================================
-# Contextual Base
-# ============================================================
 class Contextual(nn.Module):
     """Base class for context-modulated parameters."""
 
@@ -32,6 +26,7 @@ class Contextual(nn.Module):
         dtype: torch.dtype = DTYPE,
     ):
         super().__init__()
+
         if context_dim is not None and context_dim <= 0:
             raise HSMMError(f"context_dim must be positive, got {context_dim}")
         if target_dim <= 0:
@@ -118,9 +113,6 @@ class Contextual(nn.Module):
             self.context_net.to(device, **kwargs)
         return self
 
-# ============================================================
-# Emission Module
-# ============================================================
 class Emission(Contextual):
     """Contextual emission distribution."""
 
@@ -197,9 +189,6 @@ class Emission(Contextual):
         ))
         return cfg
 
-# ============================================================
-# Duration Module
-# ============================================================
 class Duration(Contextual):
     """Contextual duration distribution for HSMM states."""
 
@@ -251,9 +240,6 @@ class Duration(Contextual):
         ))
         return cfg
 
-# ============================================================
-# Transition Module
-# ============================================================
 class Transition(Contextual):
     """Contextual transition distribution with batched context support."""
 
