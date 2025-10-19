@@ -55,14 +55,11 @@ def best_permutation_accuracy(true: np.ndarray, pred: np.ndarray, n_classes: int
 # ---------------------------------------------------------
 # Duration distribution summary
 # ---------------------------------------------------------
-def print_duration_summary(model: GaussianHSMM):
-    """Print learned duration mode and mean for each state."""
+def print_duration_summary(model):
     with torch.no_grad():
-        D = torch.exp(model.D).cpu().numpy()
-
+        D = torch.exp(model.duration_logits).cpu().numpy()
     print("\nLearned duration modes (per state):")
     for i, row in enumerate(D):
-        row = row / row.sum()  # ensure normalization
         mode = int(np.argmax(row)) + 1
         mean_dur = float((np.arange(1, len(row) + 1) * row).sum())
         print(f" state {i}: mode={mode}, mean={mean_dur:.2f}")
@@ -102,7 +99,7 @@ if __name__ == "__main__":
         X_torch,
         max_iter=50,
         n_init=3,
-        sample_B_from_X=True,
+        sample_D_from_X=True,
         verbose=True,
         tol=1e-4
     )

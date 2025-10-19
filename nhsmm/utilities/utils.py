@@ -7,18 +7,6 @@ from typing import List, Optional, Tuple, Union
 
 @dataclass(frozen=False)
 class Observations:
-    """
-    Container for one or more observation sequences with optional log-probabilities.
-
-    Supports:
-    - Variable-length sequences
-    - Device-aware operations
-    - Padding and batching
-    - Concatenation
-    - Normalization
-    - Batch-wise operations on log_probs
-    """
-
     sequence: List[torch.Tensor]
     log_probs: Optional[List[torch.Tensor]] = None
     lengths: Optional[List[int]] = None
@@ -40,9 +28,6 @@ class Observations:
             if not all(isinstance(lp, torch.Tensor) for lp in self.log_probs):
                 raise TypeError("All elements in `log_probs` must be torch.Tensor.")
 
-    # ----------------------------------------------------------------------
-    # Properties
-    # ----------------------------------------------------------------------
     @property
     def n_sequences(self) -> int:
         return len(self.sequence)
@@ -74,9 +59,6 @@ class Observations:
     def std(self) -> torch.Tensor:
         return self.as_batch().std(0)
 
-    # ----------------------------------------------------------------------
-    # Conversion / Utility Methods
-    # ----------------------------------------------------------------------
     def to(self, device: Union[str, torch.device], dtype: Optional[torch.dtype] = None) -> "Observations":
         seqs = [s.to(device=device, dtype=dtype or s.dtype) for s in self.sequence]
         logs = [l.to(device=device, dtype=dtype or l.dtype) for l in self.log_probs] if self.log_probs else None
@@ -92,66 +74,16 @@ class Observations:
         logs = [l.clone() for l in self.log_probs] if self.log_probs else None
         return Observations(seqs, logs, self.lengths)
 
-    # ----------------------------------------------------------------------
-    # Indexing / Batching
-    # ----------------------------------------------------------------------
     def __getitem__(self, idx: Union[int, slice]) -> "Observations":
         seqs = self.sequence[idx] if isinstance(idx, slice) else [self.sequence[idx]]
         logs = self.log_probs[idx] if self.log_probs else None
         lens = self.lengths[idx] if isinstance(idx, slice) else [self.lengths[idx]]
         return Observations(seqs, logs, lens)
 
-    def pad_sequences(
-        self, pad_value: float = 0.0, return_mask: bool = False
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Pad variable-length sequences into a dense tensor [B, T, D].
-        Returns an optional mask [B, T].
-        """
-        B, T, D = self.n_sequences, max(self.lengths), self.feature_dim
-        device, dtype = self.device, self.dtype
-
-        batch = torch.full((B, T, D), pad_value, dtype=dtype, device=device)
-        mask = torch.zeros((B, T), dtype=torch.bool, device=device)
-
-        for i, seq in enumerate(self.sequence):
-            L = seq.shape[0]
-            batch[i, :L] = seq
-            mask[i, :L] = True
-
-        return (batch, mask) if return_mask else batch
-
     def as_batch(self) -> torch.Tensor:
-        """Concatenate all sequences along the time dimension."""
         return torch.cat(self.sequence, dim=0)
 
-    # ----------------------------------------------------------------------
-    # Batch log-prob utilities
-    # ----------------------------------------------------------------------
-    def pad_log_probs(self, pad_value: float = -float('inf')) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Pad log_probs into [B, T, K] tensor with optional mask [B, T].
-        Useful for forward/backward passes in HSMMs.
-        """
-        if self.log_probs is None:
-            raise ValueError("No `log_probs` available to pad.")
-
-        B, T = self.n_sequences, max(self.lengths)
-        K = self.log_probs[0].shape[1]
-        device, dtype = self.device, self.dtype
-
-        batch = torch.full((B, T, K), pad_value, dtype=dtype, device=device)
-        mask = torch.zeros((B, T), dtype=torch.bool, device=device)
-
-        for i, lp in enumerate(self.log_probs):
-            L = lp.shape[0]
-            batch[i, :L] = lp
-            mask[i, :L] = True
-
-        return batch, mask
-
     def normalize(self, eps: float = 1e-6) -> "Observations":
-        """Apply global z-score normalization across all observations."""
         all_obs = self.as_batch()
         mean, std = all_obs.mean(0, keepdim=True), all_obs.std(0, keepdim=True).clamp_min(eps)
         normed = [(s - mean) / std for s in self.sequence]
@@ -160,14 +92,51 @@ class Observations:
     def summary(self) -> str:
         return f"{self.n_sequences} seqs | total {self.total_length} steps | dim {self.feature_dim} | device {self.device}"
 
+    # ----------------------------------------------------------------------
+    # Unified padding / batching
+    # ----------------------------------------------------------------------
+    def to_batch(
+        self,
+        pad_value: float = 0.0,
+        log_pad_value: float = -float("inf"),
+        return_mask: bool = False,
+        include_log_probs: bool = True,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
+        B, T, D = self.n_sequences, max(self.lengths), self.feature_dim
+        device, dtype = self.device, self.dtype
+
+        seq_batch = torch.full((B, T, D), pad_value, dtype=dtype, device=device)
+        mask = torch.zeros((B, T), dtype=torch.bool, device=device)
+
+        for i, seq in enumerate(self.sequence):
+            L = seq.shape[0]
+            seq_batch[i, :L] = seq
+            mask[i, :L] = True
+
+        log_batch = None
+        if include_log_probs and self.log_probs is not None:
+            K = self.log_probs[0].shape[1]
+            log_batch = torch.full((B, T, K), log_pad_value, dtype=dtype, device=device)
+            for i, lp in enumerate(self.log_probs):
+                L = lp.shape[0]
+                log_batch[i, :L] = lp
+
+        if return_mask:
+            return seq_batch, mask, log_batch
+        return seq_batch if log_batch is None else (seq_batch, log_batch)
+
 
 @dataclass(frozen=False)
 class ContextualVariables:
     """
-    Container for contextual variables (exogenous features) for HSMM/HMM models.
+    Container for static or time-dependent contextual variables (exogenous features).
 
-    Supports static or time-dependent contexts, padding, batching, concatenation,
-    normalization, detachment, and device-aware operations.
+    Supports:
+    - Batch-aware operations for both static and time-dependent contexts
+    - Device/dtype-aware operations
+    - Padding, batching, and mask creation
+    - Concatenation and normalization
+    - Detachment and cloning
     """
 
     n_context: int
@@ -181,13 +150,15 @@ class ContextualVariables:
         if len(self.X) != self.n_context:
             raise ValueError(f"Expected {self.n_context} context tensors, got {len(self.X)}.")
         if self.time_dependent and any(x.ndim < 2 for x in self.X):
-            raise ValueError("Time-dependent context tensors must have shape [T, F] or [B, T, F].")
+            raise ValueError("Time-dependent tensors must have shape [T, F] or [B, T, F].")
         if self.names and len(self.names) != self.n_context:
             raise ValueError("`names` length must match `n_context`.")
-        if len({x.device for x in self.X}) > 1:
-            raise ValueError("All context tensors must reside on the same device.")
-        if len({x.dtype for x in self.X}) > 1:
-            raise ValueError("All context tensors must share the same dtype.")
+        devices = {x.device for x in self.X}
+        if len(devices) > 1:
+            raise ValueError("All tensors must be on the same device.")
+        dtypes = {x.dtype for x in self.X}
+        if len(dtypes) > 1:
+            raise ValueError("All tensors must have the same dtype.")
 
     # ----------------------------------------------------------------------
     # Properties
@@ -204,95 +175,83 @@ class ContextualVariables:
     def dtype(self) -> torch.dtype:
         return self.X[0].dtype
 
+    @property
+    def feature_dim(self) -> int:
+        dims = {x.shape[-1] for x in self.X if x.ndim >= 2}
+        if len(dims) > 1:
+            raise ValueError("Inconsistent feature dimensions across contexts.")
+        return dims.pop() if dims else 1
+
     # ----------------------------------------------------------------------
-    # Device / detachment
+    # Device / detachment / cloning
     # ----------------------------------------------------------------------
-    def to(self, device: Union[str, torch.device]) -> "ContextualVariables":
-        X = [x.to(device) for x in self.X]
+    def to(self, device: Union[str, torch.device], dtype: Optional[torch.dtype] = None) -> "ContextualVariables":
+        X = [x.to(device=device, dtype=dtype or x.dtype) for x in self.X]
         return ContextualVariables(self.n_context, X, self.time_dependent, self.names)
 
     def detach(self) -> "ContextualVariables":
         X = [x.detach() for x in self.X]
         return ContextualVariables(self.n_context, X, self.time_dependent, self.names)
 
+    def clone(self) -> "ContextualVariables":
+        X = [x.clone() for x in self.X]
+        return ContextualVariables(self.n_context, X, self.time_dependent, self.names)
+
     # ----------------------------------------------------------------------
     # Concatenation / normalization
     # ----------------------------------------------------------------------
     def cat(self, dim: int = -1, normalize: bool = False, eps: float = 1e-6) -> torch.Tensor:
-        """Concatenate context tensors along a given dimension with optional layer normalization."""
         out = self.X[0] if len(self.X) == 1 else torch.cat(self.X, dim=dim)
         return F.layer_norm(out, out.shape[-1:], eps=eps) if normalize else out
+
+    def normalize(self, eps: float = 1e-6) -> "ContextualVariables":
+        all_features = self.cat(dim=-1)
+        mean, std = all_features.mean(0, keepdim=True), all_features.std(0, keepdim=True).clamp_min(eps)
+        normed = [(x - mean) / std for x in self.X]
+        return ContextualVariables(self.n_context, normed, self.time_dependent, self.names)
 
     def __getitem__(self, idx: int) -> torch.Tensor:
         return self.X[idx]
 
     # ----------------------------------------------------------------------
-    # Padding utilities
+    # Padding / batching
     # ----------------------------------------------------------------------
-    def pad_sequences(
-        self, pad_value: float = 0.0, return_mask: bool = False
+    def pad_batch(
+        self,
+        pad_value: float = 0.0,
+        return_mask: bool = False
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Pad time-dependent context tensors along time dimension into a batch tensor [B, T, F].
-        Returns optional mask [B, T].
+        Pad contexts into a batch tensor [B, T, F_total].
+        Supports both static [B, F] and time-dependent [B, T, F] tensors.
+        Returns mask [B, T] for time-dependent tensors.
         """
-        if not self.time_dependent:
-            raise ValueError("pad_sequences only applies to time-dependent context tensors.")
+        if self.time_dependent:
+            batch_size = 1 if self.X[0].ndim == 2 else self.X[0].shape[0]
+            max_len = max(x.shape[1] if x.ndim == 3 else x.shape[0] for x in self.X)
+            padded_list = []
+            mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=self.device)
 
-        batch_size = 1 if self.X[0].ndim == 2 else self.X[0].shape[0]
-        max_len = max(x.shape[1] if x.ndim == 3 else x.shape[0] for x in self.X)
-        padded_list = []
-        mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=self.device)
+            for x in self.X:
+                if x.ndim == 2:
+                    x = x.unsqueeze(0)  # [T, F] -> [1, T, F]
+                B, T, F = x.shape
+                pad_tensor = torch.full((B, max_len, F), pad_value, dtype=x.dtype, device=x.device)
+                pad_tensor[:, :T, :] = x
+                padded_list.append(pad_tensor)
+                mask[:, :T] |= True
 
-        for x in self.X:
-            if x.ndim == 2:  # [T, F] -> [1, T, F]
-                x = x.unsqueeze(0)
-            B, T, F = x.shape
-            pad_tensor = torch.full((B, max_len, F), pad_value, dtype=x.dtype, device=x.device)
-            pad_tensor[:, :T, :] = x
-            padded_list.append(pad_tensor)
-            mask[:, :T] = True
-
-        batch_tensor = torch.cat(padded_list, dim=-1)
-        return (batch_tensor, mask) if return_mask else batch_tensor
-
-    def pad_time_series(
-        self, pad_value: float = -torch.inf, return_mask: bool = True
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Pad time-dependent context tensors for log-domain computations.
-
-        Args:
-            pad_value: Value for padding (default: -inf).
-            return_mask: Whether to return a boolean mask [B, T] indicating valid steps.
-
-        Returns:
-            Padded tensor [B, T, F_total] and optional mask [B, T].
-        """
-        if not self.time_dependent:
-            raise ValueError("pad_time_series only applies to time-dependent context tensors.")
-
-        batch_size = 1 if self.X[0].ndim == 2 else self.X[0].shape[0]
-        max_len = max(x.shape[1] if x.ndim == 3 else x.shape[0] for x in self.X)
-        padded_list = []
-        mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=self.device)
-
-        for x in self.X:
-            if x.ndim == 2:
-                x = x.unsqueeze(0)
-            B, T, F = x.shape
-            pad_tensor = torch.full((B, max_len, F), pad_value, dtype=x.dtype, device=x.device)
-            pad_tensor[:, :T, :] = x
-            padded_list.append(pad_tensor)
-            mask[:, :T] = True
-
-        batch_tensor = torch.cat(padded_list, dim=-1)
-        return (batch_tensor, mask) if return_mask else batch_tensor
+            batch_tensor = torch.cat(padded_list, dim=-1)
+            return (batch_tensor, mask) if return_mask else batch_tensor
+        else:
+            # static: stack along batch dim
+            batch_tensor = torch.stack(self.X, dim=0)  # [B, F]
+            return batch_tensor
 
     # ----------------------------------------------------------------------
     # Summary
     # ----------------------------------------------------------------------
     def summary(self) -> str:
         dep = "time-dependent" if self.time_dependent else "static"
-        shape_str = ", ".join(str(s) for s in self.shape)
-        return f"{self.n_context} {dep} contexts [{shape_str}] on {self.device}"
+        shapes = ", ".join(str(s) for s in self.shape)
+        return f"{self.n_context} {dep} contexts [{shapes}] on {self.device}"

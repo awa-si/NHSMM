@@ -159,6 +159,13 @@ def objective(trial):
     )
 
     model = NeuralHSMM(config)
+    model.attach_encoder(
+        encoder=encoder,
+        batch_first=True,  # True if input shape is (B, T, F)
+        pool="mean",
+        n_heads=4
+    )
+    model.to(device)
     model.to(device)
 
     # --- Initialize emissions ---
