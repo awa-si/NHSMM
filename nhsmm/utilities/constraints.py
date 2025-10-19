@@ -1,27 +1,21 @@
+# constraints.py
 from typing import Tuple, Optional, Union
 from dataclasses import dataclass
 import torch
 
-
 DTYPE = torch.float64
 
-
-# ============================================================
-# Dataclasses replacing enums
-# ============================================================
 @dataclass(frozen=True)
 class Transitions:
     SEMI: str = "semi"
     ERGODIC: str = "ergodic"
     LEFT_TO_RIGHT: str = "left-to-right"
 
-
 @dataclass(frozen=True)
 class InformCriteria:
     AIC: str = "AIC"
     BIC: str = "BIC"
     HQC: str = "HQC"
-
 
 @dataclass(frozen=True)
 class CovarianceType:
@@ -31,9 +25,6 @@ class CovarianceType:
     SPHERICAL: str = "spherical"
 
 
-# ============================================================
-# Helper
-# ============================================================
 def _resolve_type(val, dataclass_type) -> str:
     """Convert dataclass instance or string to internal string."""
     if isinstance(val, dataclass_type):
@@ -43,10 +34,6 @@ def _resolve_type(val, dataclass_type) -> str:
         return val
     raise ValueError(f"Expected {dataclass_type} or str, got {type(val)}")
 
-
-# ============================================================
-# Sampling
-# ============================================================
 def sample_probs(
     prior: float, target_size: Union[Tuple[int, ...], torch.Size],
     dtype=DTYPE, device=None
@@ -85,9 +72,6 @@ def sample_transition(
     return probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
-# ============================================================
-# Information criteria
-# ============================================================
 def compute_information_criteria(
     n_samples: int,
     log_likelihood: torch.Tensor,
@@ -106,9 +90,6 @@ def compute_information_criteria(
     return -2.0 * log_likelihood + penalties[c]
 
 
-# ============================================================
-# Transition validation
-# ============================================================
 def is_valid_transition(
     probs: torch.Tensor,
     A_type: Union[str, Transitions],
@@ -130,17 +111,11 @@ def is_valid_transition(
         raise NotImplementedError(f"Unsupported Transition type: {t}")
 
 
-# ============================================================
-# Log-normalization
-# ============================================================
 def log_normalize(matrix: torch.Tensor, dim: Union[int, Tuple[int, ...]] = -1) -> torch.Tensor:
     """Return log-normalized tensor (log_probs summing to 1 along dim)."""
     return matrix - torch.logsumexp(matrix, dim=dim, keepdim=True)
 
 
-# ============================================================
-# Lambda validation
-# ============================================================
 def validate_lambdas(lambdas: torch.Tensor, n_states: int, n_features: int) -> torch.Tensor:
     if lambdas.shape != (n_states, n_features):
         raise ValueError(f"Expected shape {(n_states, n_features)}, got {tuple(lambdas.shape)}")
@@ -151,9 +126,6 @@ def validate_lambdas(lambdas: torch.Tensor, n_states: int, n_features: int) -> t
     return lambdas
 
 
-# ============================================================
-# Covariance validation
-# ============================================================
 def _assert_spd(matrix: torch.Tensor, label: str = "Matrix"):
     if not torch.allclose(matrix, matrix.T, atol=1e-6):
         raise ValueError(f"{label} not symmetric")
@@ -205,9 +177,6 @@ def validate_covars(
     raise NotImplementedError(f"Unsupported covariance type: {c}")
 
 
-# ============================================================
-# Covariance initialization / expansion
-# ============================================================
 def init_covars(base_cov: torch.Tensor, cov_type: Union[str, CovarianceType], n_states: int) -> torch.Tensor:
     c = _resolve_type(cov_type, CovarianceType)
     if c == CovarianceType().SPHERICAL:

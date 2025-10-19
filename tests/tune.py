@@ -1,4 +1,3 @@
-# tests/tune_neural.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,7 +7,7 @@ import numpy as np
 from sklearn.metrics import confusion_matrix
 from scipy.optimize import linear_sum_assignment
 
-from nhsmm.models.neural import NeuralHSMM
+from nhsmm.models.neural import NeuralHSMM, NHSMMConfig
 from nhsmm.defaults import DTYPE
 
 # -------------------------
@@ -58,7 +57,7 @@ class CNN_LSTM_Encoder(nn.Module):
         x = self.dropout(x)
         out, _ = self.lstm(x)
         out = self.dropout(out)
-        return out[:, -1, :]  # last timestep aggregation
+        return out[:, -1, :]
 
 # -------------------------
 # Synthetic Gaussian sequence
@@ -145,8 +144,8 @@ def objective(trial):
         bidirectional=bidirectional,
     )
 
-    # --- Instantiate NeuralHSMM ---
-    model = NeuralHSMM(
+    # --- Configure NeuralHSMM via NHSMMConfig ---
+    config = NHSMMConfig(
         n_states=n_states,
         n_features=n_features,
         max_duration=max_duration,
@@ -156,8 +155,10 @@ def objective(trial):
         encoder=encoder,
         device=device,
         context_dim=context_dim if context_dim > 0 else None,
-        min_covar=1e-6,
+        min_covar=1e-6
     )
+
+    model = NeuralHSMM(config)
     model.to(device)
 
     # --- Initialize emissions ---
@@ -176,29 +177,22 @@ def objective(trial):
         n_init=n_init,
         tol=1e-4,
         verbose=False,
+        sample_D_from_X=True,
     )
-    if C is not None:
-        fit_kwargs["context"] = C
-
-    try:
-        model.fit(**fit_kwargs)
-    except TypeError:
-        try:
-            model.fit(X, max_iter=20, n_init=n_init, tol=1e-4, verbose=False)
-        except Exception as e:
-            print("Fit failed:", e)
-            return 0.0
-    except Exception as e:
-        print("Fit failed:", e)
-        return 0.0
+    model.fit(**fit_kwargs)
 
     # --- Decode ---
     try:
-        pred = model.decode(X, context=C, duration_weight=duration_weight, algorithm="viterbi") if C is not None else model.decode(X, duration_weight=duration_weight, algorithm="viterbi")
+        pred = model.decode(
+            X,
+            context=C,
+            duration_weight=duration_weight,
+            algorithm="viterbi"
+        ) if C is not None else model.decode(X, duration_weight=duration_weight, algorithm="viterbi")
     except TypeError:
         pred = model.decode(X, duration_weight=duration_weight, algorithm="viterbi")
 
-    # --- Compute best-permutation accuracy ---
+    # --- Compute accuracy ---
     try:
         acc, _ = best_permutation_accuracy(true_states, np.asarray(pred), n_classes=n_states)
     except Exception as e:

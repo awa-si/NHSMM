@@ -1,39 +1,49 @@
-import torch.nn as nn
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 import numpy as np
 from sklearn.metrics import confusion_matrix
 from scipy.optimize import linear_sum_assignment
 
-from nhsmm.models import NeuralHSMM
+from nhsmm.models.neural import NeuralHSMM, NHSMMConfig
+from nhsmm.defaults import DTYPE
 
-# ---------------------------------------------------------
-# Synthetic OHLCV generator
-# ---------------------------------------------------------
-def generate_ohlcv(n_segments=8, seg_len_low=10, seg_len_high=40, n_features=5, rng_seed=42):
-    rng = np.random.default_rng(rng_seed)
-    states, obs = [], []
+# -------------------------
+# Synthetic Gaussian sequence
+# -------------------------
+def generate_gaussian_sequence(
+    n_states=3,
+    n_features=1,
+    seg_len_range=(5, 20),
+    n_segments_per_state=3,
+    seed=0,
+    noise_scale=0.05,
+    context_dim: int | None = None,
+):
+    rng = np.random.default_rng(seed)
+    states_list, X_list, C_list = [], [], []
+    base_means = rng.uniform(-1.0, 1.0, size=(n_states, n_features))
+    for s in range(n_states):
+        for _ in range(n_segments_per_state):
+            L = int(rng.integers(seg_len_range[0], seg_len_range[1] + 1))
+            noise = rng.normal(scale=noise_scale, size=(L, n_features))
+            segment_obs = base_means[s] + noise
+            X_list.append(segment_obs)
+            states_list.extend([s] * L)
+            if context_dim is not None and context_dim > 0:
+                ctxt = rng.normal(scale=0.5, size=(L, context_dim))
+                C_list.append(ctxt)
+    X = np.vstack(X_list)
+    states = np.array(states_list)
+    if context_dim is not None and context_dim > 0:
+        C = np.vstack(C_list)
+        return states, torch.tensor(X, dtype=DTYPE), torch.tensor(C, dtype=DTYPE)
+    return states, torch.tensor(X, dtype=DTYPE), None
 
-    means = [
-        np.array([140.0, 145.0, 135.0, 140.0, 2e6]),
-        np.array([60.0, 65.0, 55.0, 60.0, 2e5]),
-        np.array([95.0, 98.0, 92.0, 95.0, 8e5])
-    ]
-    cov = np.diag([2.0, 2.0, 2.0, 2.0, 5e4])
-
-    for _ in range(n_segments):
-        s = int(rng.integers(0, len(means)))
-        L = int(rng.integers(seg_len_low, seg_len_high + 1))
-        seg = rng.multivariate_normal(means[s], cov, size=L)
-        obs.append(seg)
-        states.extend([s] * L)
-
-    return np.array(states), np.vstack(obs)
-
-
-# ---------------------------------------------------------
-# Label alignment via Hungarian assignment
-# ---------------------------------------------------------
+# -------------------------
+# Best permutation accuracy
+# -------------------------
 def best_permutation_accuracy(true, pred, n_classes):
     C = confusion_matrix(true, pred, labels=list(range(n_classes)))
     row_ind, col_ind = linear_sum_assignment(-C)
@@ -42,29 +52,37 @@ def best_permutation_accuracy(true, pred, n_classes):
     acc = (mapped_pred == true).mean()
     return acc, mapped_pred
 
-
-# ---------------------------------------------------------
-# CNN+LSTM encoder
-# ---------------------------------------------------------
+# -------------------------
+# CNN+LSTM Encoder
+# -------------------------
 class CNN_LSTM_Encoder(nn.Module):
-    def __init__(self, n_features, hidden_dim=16):
+    def __init__(self, n_features, hidden_dim=16, cnn_channels=8, kernel_size=3, dropout=0.1, bidirectional=True):
         super().__init__()
-        self.conv1 = nn.Conv1d(in_channels=n_features, out_channels=8, kernel_size=3, padding=1)
-        self.relu = nn.ReLU()
-        self.lstm = nn.LSTM(input_size=8, hidden_size=hidden_dim, batch_first=True)
+        padding = kernel_size // 2
+        self.conv1 = nn.Conv1d(n_features, cnn_channels, kernel_size, padding=padding)
+        self.norm = nn.LayerNorm(cnn_channels)
+        self.dropout = nn.Dropout(dropout)
+        self.lstm = nn.LSTM(
+            input_size=cnn_channels,
+            hidden_size=hidden_dim,
+            batch_first=True,
+            bidirectional=bidirectional
+        )
+        self.out_dim = hidden_dim * (2 if bidirectional else 1)
 
     def forward(self, x):
-        # x: (B,T,F)
-        x = x.transpose(1, 2)       # (B,F,T) for Conv1d
-        x = self.relu(self.conv1(x))
-        x = x.transpose(1, 2)       # (B,T,H)
+        x = x.transpose(1, 2)
+        x = F.relu(self.conv1(x))
+        x = x.transpose(1, 2)
+        x = self.norm(x)
+        x = self.dropout(x)
         out, _ = self.lstm(x)
-        return out[:, -1, :]        # last time step embedding
+        out = self.dropout(out)
+        return out[:, -1, :]
 
-
-# ---------------------------------------------------------
-# Duration distribution summary
-# ---------------------------------------------------------
+# -------------------------
+# Duration summary
+# -------------------------
 def print_duration_summary(model):
     with torch.no_grad():
         D = torch.exp(model.duration_logits).cpu().numpy()
@@ -74,51 +92,75 @@ def print_duration_summary(model):
         mean_dur = float((np.arange(1, len(row) + 1) * row).sum())
         print(f" state {i}: mode={mode}, mean={mean_dur:.2f}")
 
-
-# ---------------------------------------------------------
-# Main execution
-# ---------------------------------------------------------
+# -------------------------
+# Main
+# -------------------------
 if __name__ == "__main__":
     torch.manual_seed(0)
     np.random.seed(0)
 
-    true_states, X = generate_ohlcv(n_segments=10, seg_len_low=8, seg_len_high=30)
-    X_torch = torch.tensor(X, dtype=torch.float32)
-
     n_states = 3
-    n_features = X.shape[1]
+    n_features = 5
     max_duration = 60
+    context_dim = 2
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    encoder = CNN_LSTM_Encoder(n_features, hidden_dim=16)
-
-    model = NeuralHSMM(
+    # Generate synthetic data
+    true_states, X, C = generate_gaussian_sequence(
         n_states=n_states,
         n_features=n_features,
+        seg_len_range=(8, 30),
+        n_segments_per_state=3,
+        seed=0,
+        noise_scale=0.05,
+        context_dim=context_dim
+    )
+
+    X_torch = X.to(device)
+    C_torch = C.to(device) if C is not None else None
+
+    encoder = CNN_LSTM_Encoder(n_features, hidden_dim=16).to(device)
+
+    config = NHSMMConfig(
+        n_states=n_states,
+        n_features=n_features,
+        emission_type="gaussian",
         max_duration=max_duration,
+        min_covar=1e-6,
+        device=device,
         alpha=1.0,
         seed=0,
-        encoder=encoder
+        encoder=encoder,
+        context_dim=context_dim if context_dim > 0 else None
     )
+
+    model = NeuralHSMM(config)
+    model.to(device)
+
     model.initialize_emissions(X, method="kmeans")
 
     print("\n=== Training NeuralHSMM ===")
-    model.fit(
-        X_torch,
+    fit_kwargs = dict(
+        X=X_torch,
         max_iter=50,
         n_init=3,
-        sample_B_from_X=True,
+        sample_D_from_X=True,
         verbose=True,
         tol=1e-4
     )
+    model.fit(**fit_kwargs)
 
     print("\n=== Decoding ===")
-    v_path = model.predict(X_torch, algorithm="viterbi")[0].numpy()
+    # decode returns a numpy array directly
+    v_path = model.decode(X_torch, context=C_torch, algorithm="viterbi", duration_weight=0.0)
 
+    # evaluate best-permutation accuracy
     acc, mapped_pred = best_permutation_accuracy(true_states, v_path, n_classes=n_states)
     print(f"Best-permutation accuracy: {acc:.4f}")
     print("Confusion matrix (mapped_pred vs true):")
     print(confusion_matrix(true_states, mapped_pred))
 
+    # print learned durations
     print_duration_summary(model)
 
     torch.save(model.state_dict(), "neuralhsmm_debug_state.pt")

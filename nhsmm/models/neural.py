@@ -6,13 +6,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Distribution, Normal, Independent, Categorical, Poisson, LogNormal, MultivariateNormal
 
-from typing import Optional, Union, Tuple
+from typing import Literal, Optional, Union, Tuple
 from sklearn.cluster import KMeans
+from dataclasses import dataclass
+import numpy as np
 
 from nhsmm.defaults import DTYPE, EPS, Duration, Emission, Transition
 from nhsmm.models.hsmm import HSMM
 from nhsmm.utilities import utils
 
+@dataclass
+class NHSMMConfig:
+    n_states: int
+    n_features: int
+    max_duration: int
+    alpha: float = 1.0
+    seed: Optional[int] = None
+    emission_type: str = "gaussian"
+    encoder: Optional[nn.Module] = None
+    device: Optional[torch.device] = None
+    context_dim: Optional[int] = None
+    min_covar: float = 1e-3
+    emission_scale: float = 0.1
+    transition_scale: float = 0.1
+    duration_scale: float = 0.1
+    emission_temp: float = 1.0
+    transition_temp: float = 1.0
+    duration_temp: float = 1.0
+    n_context_states: Optional[int] = None
 
 class NeuralEmission(Emission):
     """Neural/contextual emission distribution for HSMM states."""
@@ -155,10 +176,10 @@ class NeuralDuration(Duration):
         encoder: Optional[nn.Module] = None,
         context_mode: str = "none",
         max_duration: int = 20,
-        scale: float = 0.1,
         device: Optional[torch.device] = None,
+        scale: float = 0.1,
     ):
-        super().__init__(n_states=n_states, max_duration=max_duration, device=device, dtype=DTYPE)
+        super().__init__(n_states=n_states, max_duration=max_duration, device=device)
         self.device = device or torch.device("cpu")
         self.mode = mode.lower()
         self.encoder = encoder
@@ -238,10 +259,10 @@ class NeuralTransition(Transition):
         logits: Optional[torch.Tensor] = None,
         encoder: Optional[nn.Module] = None,
         context_mode: str = "none",
-        scale: float = 0.1,
         device: Optional[torch.device] = None,
+        scale: float = 0.1,
     ):
-        super().__init__(n_states=n_states, device=device, dtype=DTYPE)
+        super().__init__(n_states=n_states, device=device)
         self.device = device or torch.device("cpu")
         self.encoder = encoder
         self.context_mode = context_mode.lower()
@@ -320,79 +341,72 @@ class NeuralHSMM(HSMM, nn.Module):
     """ NeuralHSMM with EM, Viterbi, context, and gradient support.
     """
 
-    def __init__(
-        self,
-        n_states: int,
-        max_duration: int,
-        n_features: int,
-        alpha: float = 1.0,
-        seed: Optional[int] = None,
-        emission_type: str = "gaussian",
-        encoder: Optional[nn.Module] = None,
-        device: Optional[torch.device] = None,
-        context_dim: Optional[int] = None,
-        min_covar: float = 1e-3,
+    def __init__(self, config: NHSMMConfig):
         
-        emission_scale: float = 0.1,
-        transition_scale: float = 0.1,
-        duration_scale: float = 0.1,
-        emission_temp: float = 1.0,
-        transition_temp: float = 1.0,
-        duration_temp: float = 1.0,
-
-        n_context_states: Optional[int] = None,
-        **kwargs
-    ):
+        self.config = config
         nn.Module.__init__(self)
 
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.encoder = encoder.to(self.device, DTYPE) if encoder else None
-        self._params: Dict[str, Any] = {"emission_type": emission_type.lower()}
-        self.n_features = n_features
-        self.min_covar = min_covar
+        self.device = config.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.encoder = config.encoder.to(self.device, dtype=torch.float64) if config.encoder else None
+        self.n_features = config.n_features
+        self.min_covar = config.min_covar
 
-        self.scales = dict(transition=transition_scale, duration=duration_scale, emission=emission_scale)
-        self.temperatures = dict(emission=emission_temp, transition=transition_temp, duration=duration_temp)
-
+        # Neural modules
         self.emission_module = NeuralEmission.initialize(
-            emission_type=emission_type.lower(),
-            n_states=n_states,
-            n_features=n_features,
+            emission_type=config.emission_type,
+            n_states=config.n_states,
+            n_features=config.n_features,
             encoder=self.encoder,
             device=self.device,
         )
         self.duration_module = NeuralDuration(
-            n_states=n_states,
-            max_duration=max_duration,
+            n_states=config.n_states,
+            max_duration=config.max_duration,
             encoder=self.encoder,
-            context_mode="temporal" if context_dim else "none",
-            scale=duration_scale,
+            context_mode="temporal" if config.context_dim else "none",
+            scale=config.duration_scale,
             device=self.device,
         )
         self.transition_module = NeuralTransition(
-            n_states=n_states,
+            n_states=config.n_states,
             encoder=self.encoder,
-            context_mode="temporal" if context_dim else "none",
-            scale=transition_scale,
+            context_mode="temporal" if config.context_dim else "none",
+            scale=config.transition_scale,
             device=self.device,
         )
 
-        self.context_dim = context_dim
-        self._context: Optional[torch.Tensor] = None
-        self.context_embedding = nn.Embedding(n_context_states, context_dim) if n_context_states else None
-        self.ctx_transition = nn.Linear(context_dim, n_states*n_states, device=self.device, dtype=DTYPE) if context_dim else None
-        self.ctx_duration = nn.Linear(context_dim, n_states*max_duration, device=self.device, dtype=DTYPE) if context_dim else None
-        self.ctx_emission = nn.Linear(context_dim, n_states*n_features, device=self.device, dtype=DTYPE) if context_dim else None
+        # Context embeddings
+        if config.n_context_states and config.context_dim:
+            self.context_embedding = nn.Embedding(config.n_context_states, config.context_dim)
+            nn.init.normal_(self.context_embedding.weight, 0.0, 1e-3)
+            self.ctx_transition = nn.Linear(config.context_dim, config.n_states**2, device=self.device, dtype=torch.float64)
+            self.ctx_duration = nn.Linear(config.context_dim, config.n_states*config.max_duration, device=self.device, dtype=torch.float64)
+            self.ctx_emission = nn.Linear(config.context_dim, config.n_states*config.n_features, device=self.device, dtype=torch.float64)
+            for m in (self.ctx_transition, self.ctx_duration, self.ctx_emission):
+                nn.init.normal_(m.weight, 0.0, 1e-3)
+                nn.init.normal_(m.bias, 0.0, 1e-3)
+        else:
+            self.context_embedding = None
+            self.ctx_transition = None
+            self.ctx_duration = None
+            self.ctx_emission = None
 
-        for m in (self.ctx_transition, self.ctx_duration, self.ctx_emission):
-            if m: nn.init.normal_(m.weight, 0.0, 1e-3); nn.init.normal_(m.bias, 0.0, 1e-3)
-        if self.context_embedding: nn.init.normal_(self.context_embedding.weight, 0.0, 1e-3)
-
-        super().__init__(n_states=n_states, n_features=n_features, max_duration=max_duration, alpha=alpha, seed=seed)
-        self._params["emission_pdf"] = self.sample_emission_pdf(
-            temperature=emission_temp,
-            scale=emission_scale,
+        super().__init__(
+            n_states=config.n_states,
+            n_features=config.n_features,
+            max_duration=config.max_duration,
+            context_dim=config.context_dim,
+            min_covar=config.min_covar,
+            alpha=config.alpha,
+            device=self.device,
+            seed=config.seed,
         )
+        self._params: dict = {"emission_type": config.emission_type}
+        self._params["emission_pdf"] = self.sample_emission_pdf(
+            temperature=config.emission_temp,
+            scale=config.emission_scale,
+        )
+        self._context = None
 
     @property
     def emission_type(self) -> str:
@@ -419,31 +433,35 @@ class NeuralHSMM(HSMM, nn.Module):
         temperature: float = 1.0,
         scale: float = None,
     ):
-        """Create an emission Distribution conditioned on optional X and theta.
-
-        Returns Categorical or MultivariateNormal (batched over states).
+        """Create a batched emission distribution conditioned on optional X and theta.
+        
+        Returns:
+            - Categorical (n_states distributions) or
+            - MultivariateNormal (n_states distributions)
         """
         nS, nF = self.n_states, self.n_features
-        scale = scale or self.scales.get('emission')
+        scale = scale or self.config.emission_scale
 
-        X_flat = None
-        if X is not None:
-            X_flat = X.reshape(-1, nF).to(dtype=DTYPE, device=self.device)
+        # Flatten X if provided
+        X_flat = X.reshape(-1, nF).to(dtype=DTYPE, device=self.device) if X is not None else None
 
+        # Compute context delta
         delta_mean = None
         if theta is not None and self.ctx_emission is not None:
             t = theta.to(dtype=DTYPE, device=self.device)
             if t.ndim == 1:
                 t = t.unsqueeze(0)
             delta = self.ctx_emission(t)
-            # ensure shape [B, nS*nF] -> average over batch
             if delta.ndim > 2:
                 delta = delta.view(delta.shape[0], -1)
-            delta_mean = delta.mean(dim=0).view(nS, nF)
+            delta_mean = delta.mean(dim=0)
+            if delta_mean.numel() != nS * nF:
+                raise ValueError(f"ctx_emission output ({delta_mean.shape}) cannot be reshaped to ({nS}, {nF})")
+            delta_mean = delta_mean.view(nS, nF)
 
+        # --- Categorical emission ---
         if self.emission_type == "categorical":
             if X_flat is not None:
-                # build per-state initial probs from data (replicate)
                 probs = X_flat.mean(dim=0, keepdim=True).repeat(nS, 1)
             else:
                 probs = torch.full((nS, nF), 1.0 / nF, dtype=DTYPE, device=self.device)
@@ -451,10 +469,11 @@ class NeuralHSMM(HSMM, nn.Module):
             if delta_mean is not None:
                 probs = probs + scale * torch.tanh(delta_mean)
 
-            logits = (probs / temperature)
-            logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
-            return Categorical(logits=logits.to(device=self.device, dtype=DTYPE))
+            probs = (probs / temperature).to(dtype=DTYPE, device=self.device)
+            logits = probs - torch.logsumexp(probs, dim=-1, keepdim=True)
+            return Categorical(logits=logits)
 
+        # --- Gaussian emission ---
         elif self.emission_type == "gaussian":
             if X_flat is not None:
                 mean = X_flat.mean(dim=0, keepdim=True).repeat(nS, 1)
@@ -479,59 +498,79 @@ class NeuralHSMM(HSMM, nn.Module):
         theta: Optional[torch.Tensor] = None,
         scale: float = None
     ):
-        """Estimate an emission distribution from weighted data (posterior responsibilities)."""
+        """
+        Estimate emission distributions from weighted data (posterior responsibilities),
+        optionally modulated by context/encoder outputs (theta).
+        
+        Returns:
+            - MultivariateNormal (for Gaussian)
+            - Categorical (for categorical)
+        """
         K, F = self.n_states, self.n_features
-        scale = scale or self.scales.get('emission')
+        scale = scale or self.config.emission_scale
 
+        # Ensure device/dtype consistency
         X = X.to(dtype=DTYPE, device=self.device)
         posterior = posterior.to(dtype=DTYPE, device=self.device)
 
-        # compute context delta if present
+        # --- Compute delta from context if available ---
         delta = torch.zeros((K, F), dtype=DTYPE, device=self.device)
         if theta is not None:
             t = theta.to(dtype=DTYPE, device=self.device)
             if self.ctx_emission is not None:
                 d = self.ctx_emission(t)
+                # Collapse batch if needed
                 if d.ndim > 2:
                     d = d.mean(dim=0)
-                d = d.view(-1, K, F) if d.ndim == 2 and d.shape[1] == K * F else d.view(K, F)
-                delta = scale * torch.tanh(d.mean(dim=0) if d.ndim == 3 else d)
-            else:
-                if t.ndim == 2:
-                    delta = t[:, : K * F].mean(dim=0).view(K, F)
+                # Reshape to (K, F) safely
+                if d.ndim == 2 and d.shape[1] == K * F:
+                    d = d.view(-1, K, F)
+                    delta = scale * torch.tanh(d.mean(dim=0))
+                elif d.shape == (K, F):
+                    delta = scale * torch.tanh(d)
                 else:
-                    delta = t[: K * F].view(K, F)
-            delta = delta.to(dtype=DTYPE, device=self.device)
+                    raise ValueError(f"Unexpected ctx_emission output shape {d.shape}")
+            else:
+                # fallback: extract first K*F features from theta
+                if t.ndim == 2 and t.shape[1] >= K * F:
+                    delta = scale * t[:, :K*F].mean(dim=0).view(K, F)
+                elif t.ndim == 1 and t.numel() >= K * F:
+                    delta = scale * t[:K*F].view(K, F)
+                else:
+                    delta = torch.zeros((K, F), dtype=DTYPE, device=self.device)
 
+        # --- Categorical emission ---
         if self.emission_type == "categorical":
-            probs = posterior.T @ X  # (K,F)
-            probs = probs / probs.sum(dim=1, keepdim=True).clamp_min(EPS)
-            probs = (probs + delta).clamp_min(EPS)
-            probs = probs / probs.sum(dim=1, keepdim=True)
-            return Categorical(probs=probs.to(device=self.device, dtype=DTYPE))
+            if X.ndim == 1 or (X.ndim == 2 and X.shape[1] == 1):
+                X_labels = X.squeeze(-1).long()
+                counts = torch.bincount(X_labels, minlength=self.n_features).to(dtype=DTYPE, device=self.device)
+            else:
+                counts = X.sum(dim=0).to(dtype=DTYPE, device=self.device)
+            probs = counts / counts.sum()
+            probs = (probs + delta.mean(dim=0)).clamp_min(EPS)  # delta is additive adjustment
+            probs = probs / probs.sum()
+            return Categorical(probs=probs.repeat(K, 1).to(dtype=DTYPE, device=self.device))
 
+        # --- Gaussian emission ---
         elif self.emission_type == "gaussian":
             Nk = posterior.sum(dim=0).clamp_min(EPS)  # (K,)
-            Nk_mat = Nk.unsqueeze(1)  # (K,1)
-            mean = (posterior.T @ X) / Nk_mat  # (K, F)
-
-            diff = X.unsqueeze(1) - mean.unsqueeze(0)  # (T, K, F)
-            weighted = diff * posterior.unsqueeze(-1)  # (T, K, F)
-            cov = torch.einsum("tkf,tkh->kfh", weighted, diff) / Nk_mat.unsqueeze(-1)  # (K, F, F)
-            cov = cov + torch.eye(F, device=self.device, dtype=DTYPE).unsqueeze(0) * self.min_covar
-
+            mean = (posterior.T @ X) / Nk.unsqueeze(1)  # (K, F)
+            diff = X.unsqueeze(1) - mean.unsqueeze(0)   # (T, K, F)
+            weighted = diff * posterior.unsqueeze(-1)  # weight residuals
+            cov = torch.einsum("tkf,tkh->kfh", weighted, diff) / Nk.unsqueeze(1).unsqueeze(-1)
+            cov += torch.eye(F, dtype=DTYPE, device=self.device).unsqueeze(0) * self.min_covar
             mean = mean + delta
-            return MultivariateNormal(loc=mean.to(self.device, DTYPE), covariance_matrix=cov.to(self.device, DTYPE))
+            return MultivariateNormal(loc=mean, covariance_matrix=cov)
 
         else:
             raise ValueError(f"Unsupported emission_type '{self.emission_type}'")
 
     def initialize_emissions(self, X, method: str = "moment"):
-        """Initialize emission parameters from raw data X (keeps original behavior)."""
-        K = self.n_states
-
-        if not torch.is_tensor(X): X = torch.tensor(X, dtype=DTYPE, device=self.device)
+        """Initialize emission parameters from raw data X."""
+        if not torch.is_tensor(X):
+            X = torch.tensor(X, dtype=DTYPE, device=self.device)
         X = X.to(dtype=DTYPE, device=self.device)
+        K = self.n_states
 
         if self.emission_type == "gaussian":
             if X.ndim != 2:
@@ -542,54 +581,31 @@ class NeuralHSMM(HSMM, nn.Module):
                 mu_init = X.mean(dim=0, keepdim=True).repeat(K, 1)
                 var_init = X.var(dim=0, unbiased=False, keepdim=True).repeat(K, 1)
             elif method == "kmeans":
-                X_np = X.cpu().numpy()
                 from sklearn.cluster import KMeans
-                km = KMeans(n_clusters=K, n_init=10, random_state=0)
-                labels = torch.tensor(km.fit_predict(X_np), device=self.device)
-                mu_init = torch.zeros(K, F, dtype=DTYPE, device=self.device)
-                var_init = torch.zeros(K, F, dtype=DTYPE, device=self.device)
-                for k in range(K):
-                    mask = labels == k
-                    Nk = mask.sum()
-                    if Nk > 0:
-                        mu_init[k] = X[mask].mean(dim=0)
-                        var_init[k] = X[mask].var(dim=0, unbiased=False)
-                    else:
-                        mu_init[k] = X.mean(dim=0)
-                        var_init[k] = X.var(dim=0, unbiased=False)
+                labels = torch.tensor(KMeans(n_clusters=K, n_init=10, random_state=0).fit_predict(X.cpu().numpy()), device=self.device)
+                mu_init = torch.stack([X[labels==k].mean(dim=0) if (labels==k).any() else X.mean(dim=0) for k in range(K)])
+                var_init = torch.stack([X[labels==k].var(dim=0, unbiased=False) if (labels==k).any() else X.var(dim=0, unbiased=False) for k in range(K)])
             else:
                 raise ValueError(f"Unknown initialization method '{method}'")
 
             var_init = var_init.clamp_min(self.min_covar)
             cov = torch.diag_embed(var_init)
 
-            # set module & pdf
-            if hasattr(self.emission_module, "mu"):
-                self.emission_module.mu.data.copy_(mu_init)
-            else:
-                self.emission_module.mu = nn.Parameter(mu_init)
-
-            if hasattr(self.emission_module, "cov"):
-                self.emission_module.cov.data.copy_(cov)
-            else:
-                self.emission_module.cov = nn.Parameter(cov)
-
-            self._params["emission_pdf"] = MultivariateNormal(loc=mu_init.to(self.device, DTYPE), covariance_matrix=cov.to(self.device, DTYPE))
+            self.emission_module.mu = nn.Parameter(mu_init)
+            self.emission_module.cov = nn.Parameter(cov)
+            self._params["emission_pdf"] = MultivariateNormal(mu_init, covariance_matrix=cov)
 
         elif self.emission_type in ("categorical", "bernoulli"):
             if X.ndim == 1 or (X.ndim == 2 and X.shape[1] == 1):
-                labels = X.squeeze(-1).long()
-                counts = torch.bincount(labels, minlength=self.n_features).to(dtype=DTYPE, device=self.device)
+                counts = torch.bincount(X.squeeze(-1).long(), minlength=self.n_features).to(dtype=DTYPE, device=self.device)
             else:
                 counts = X.sum(dim=0).to(dtype=DTYPE, device=self.device)
-
             probs = counts / counts.sum()
-            logits = (probs.clamp_min(EPS).log()).unsqueeze(0).repeat(K, 1)
+            logits = probs.clamp_min(EPS).log().unsqueeze(0).repeat(K, 1)
 
-            # keep placeholders consistent
             self.emission_module.mu = nn.Parameter(torch.zeros_like(logits))
             self.emission_module.cov = nn.Parameter(torch.zeros_like(logits))
-            self._params["emission_pdf"] = Categorical(logits=logits.to(self.device, DTYPE))
+            self._params["emission_pdf"] = Categorical(logits=logits)
 
         else:
             raise RuntimeError(f"Unsupported emission_type '{self.emission_type}'")
@@ -608,32 +624,32 @@ class NeuralHSMM(HSMM, nn.Module):
         self._context = None
 
     def _combine_context(self, theta: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        """Combine encoder-produced theta with externally set context self._context safely."""
-        if self._context is None:
-            if theta is None:
-                return None
-            return theta.to(device=self.device, dtype=DTYPE)
+        """Safely combine encoder-produced theta with externally set context."""
+        if theta is None and self._context is None:
+            return None
+
+        theta = theta.to(self.device, DTYPE) if theta is not None else None
+        ctx = self._context.to(self.device, DTYPE) if self._context is not None else None
+
         if theta is None:
-            return self._context.to(device=self.device, dtype=DTYPE)
+            return ctx
+        if ctx is None:
+            return theta
 
-        theta = theta.to(device=self.device, dtype=DTYPE)
-        ctx = self._context.to(device=self.device, dtype=DTYPE)
-
-        # align batch dims
+        # Align batch dimensions
         if theta.shape[0] != ctx.shape[0]:
             if theta.shape[0] == 1:
                 theta = theta.expand(ctx.shape[0], -1)
             elif ctx.shape[0] == 1:
                 ctx = ctx.expand(theta.shape[0], -1)
             else:
-                raise ValueError(f"Batch mismatch: theta {theta.shape} vs stored context {ctx.shape}")
+                raise ValueError(f"Batch mismatch: theta {theta.shape} vs context {ctx.shape}")
 
         return torch.cat([theta, ctx], dim=-1)
 
     def _contextual_emission_pdf(self, X: torch.Tensor, theta: Optional[torch.Tensor], scale: float = None):
-        """Return a contextually-shifted emission Distribution (same API as sample_emission_pdf)."""
-        scale = scale or self.scales.get('emission', 0.1)
-
+        """Return contextually-shifted emission distribution."""
+        scale = scale or self.config.emission_scale
         pdf = self.pdf
         if pdf is None:
             return None
@@ -642,106 +658,116 @@ class NeuralHSMM(HSMM, nn.Module):
         if combined is None:
             return pdf
 
+        # Determine delta shift
+        delta = self.ctx_emission(combined) if self.ctx_emission is not None else combined[:, :self.n_states * self.n_features]
+        if delta.ndim == 2:
+            delta = delta.view(delta.shape[0], self.n_states, self.n_features)
+            delta_mean = delta.mean(dim=0)
+        else:
+            delta_mean = delta.view(self.n_states, self.n_features) if delta.ndim == 1 else delta.mean(dim=0)
+
+        # Apply delta
         if isinstance(pdf, Categorical):
-            # compute additive logits shift and average over batch
-            if self.ctx_emission is not None:
-                delta = self.ctx_emission(combined)
-            else:
-                delta = combined[:, : self.n_states * self.n_features]
-            if delta.ndim == 2 and delta.shape[1] == self.n_states * self.n_features:
-                delta = delta.view(delta.shape[0], self.n_states, self.n_features)
-                delta_mean = delta.mean(dim=0)
-            else:
-                delta_mean = delta.view(self.n_states, self.n_features) if delta.ndim == 1 else delta.mean(dim=0)
             logits = getattr(pdf, "logits", None)
             if logits is None:
                 raise RuntimeError("Categorical pdf missing logits.")
-            logits = (logits + (scale * torch.tanh(delta_mean)).to(device=self.device, dtype=DTYPE)).to(device=self.device, dtype=DTYPE)
-            return Categorical(logits=logits)
+            return Categorical(logits=(logits + scale * torch.tanh(delta_mean)).to(self.device, DTYPE))
 
-        elif isinstance(pdf, MultivariateNormal):
-            mean = pdf.mean.to(device=self.device, dtype=DTYPE)
-            cov = pdf.covariance_matrix.to(device=self.device, dtype=DTYPE)
-            # compute mean shift
-            if self.ctx_emission is not None:
-                delta = self.ctx_emission(combined)
-            else:
-                delta = combined[:, : (self.n_states * self.n_features)]
-            if delta.ndim == 2:
-                delta = delta.view(delta.shape[0], self.n_states, self.n_features)
-                delta_mean = delta.mean(dim=0)
-            else:
-                delta_mean = delta.view(self.n_states, self.n_features)
-            new_mean = (mean + (scale * torch.tanh(delta_mean)).to(device=self.device, dtype=DTYPE)).to(device=self.device, dtype=DTYPE)
+        if isinstance(pdf, MultivariateNormal):
+            new_mean = (pdf.mean + scale * torch.tanh(delta_mean)).to(self.device, DTYPE)
+            cov = pdf.covariance_matrix.to(self.device, DTYPE)
             return MultivariateNormal(loc=new_mean, covariance_matrix=cov)
 
-        else:
-            raise TypeError(f"Unsupported PDF type: {type(pdf)}")
+        raise TypeError(f"Unsupported PDF type: {type(pdf)}")
 
     def _contextual_duration_pdf(self, theta: Optional[torch.Tensor], scale: float = None, temperature: float = None):
-        """Return (n_states, max_duration) duration probs, optionally modulated by context."""
-        temperature = temperature or self.temperatures.get('duration', 1.0)
-        scale = scale or self.scales.get('duration', 0.1)
-
+        """Return (n_states, max_duration) duration probabilities modulated by context."""
+        scale = scale or self.config.duration_scale
+        temperature = temperature or self.config.duration_temp
         logits = getattr(self.duration_module, "logits", None)
+
         if logits is None:
-            # fallback: ask duration_module for probs
-            out = self.duration_module.forward(context=None, log=False)
-            return out
+            return self.duration_module.forward(log=False)
 
         combined = self._combine_context(theta)
         if combined is None or self.ctx_duration is None:
-            return F.softmax(logits.to(dtype=DTYPE, device=self.device) / temperature, dim=-1)
+            return F.softmax(logits.to(self.device, DTYPE) / temperature, dim=-1)
 
         delta = self.ctx_duration(combined)
         if delta.ndim == 2 and delta.shape[1] == self.n_states * self.max_duration:
             delta = delta.view(-1, self.n_states, self.max_duration).mean(dim=0)
         else:
             delta = delta.view(self.n_states, self.max_duration)
-        return F.softmax((logits.to(dtype=DTYPE, device=self.device) + scale * torch.tanh(delta)) / temperature, dim=-1)
+
+        return F.softmax((logits.to(self.device, DTYPE) + scale * torch.tanh(delta)) / temperature, dim=-1)
 
     def _contextual_transition_matrix(self, theta: Optional[torch.Tensor], scale: float = None, temperature: float = None):
         """Return (n_states, n_states) transition matrix modulated by context."""
-        temperature = temperature or self.temperatures.get('transition', 1.0)
-        scale = scale or self.scales.get('transition', 0.1)
-
+        scale = scale or self.config.transition_scale
+        temperature = temperature or self.config.transition_temp
         logits = getattr(self.transition_module, "logits", None)
+
         if logits is None:
-            out = self.transition_module.forward(context=None, log=False)
-            return out
+            return self.transition_module.forward(log=False)
 
         combined = self._combine_context(theta)
         if combined is None or self.ctx_transition is None:
-            return F.softmax(logits.to(dtype=DTYPE, device=self.device) / temperature, dim=-1)
+            return F.softmax(logits.to(self.device, DTYPE) / temperature, dim=-1)
 
         delta = self.ctx_transition(combined)
         if delta.ndim == 2 and delta.shape[1] == self.n_states * self.n_states:
             delta = delta.view(-1, self.n_states, self.n_states).mean(dim=0)
         else:
             delta = delta.view(self.n_states, self.n_states)
-        return F.softmax((logits.to(dtype=DTYPE, device=self.device) + scale * torch.tanh(delta)) / temperature, dim=-1)
 
-    def encode_observations(self, X: torch.Tensor, detach: bool = True) -> Optional[torch.Tensor]:
-        """Encode observations with attached encoder. Returns (B, H) or None."""
+        return F.softmax((logits.to(self.device, DTYPE) + scale * torch.tanh(delta)) / temperature, dim=-1)
+
+    def encode_observations(
+        self,
+        X: torch.Tensor,
+        detach: bool = True,
+        keep_sequence: bool = False
+    ) -> Optional[torch.Tensor]:
+        """
+        Encode observations using the attached encoder.
+
+        Args:
+            X: Tensor of shape [T, F] or [B, T, F].
+            detach: If True, detaches the output from the computation graph.
+            keep_sequence: If True, keep sequence dimension [B, T, H]; otherwise collapse to [B, H].
+
+        Returns:
+            Encoded tensor of shape [B, H] or [B, T, H], or None if no encoder is attached.
+        """
         if self.encoder is None:
             return None
 
-        inp = X if X.ndim == 3 else X.unsqueeze(0)
-        inp = inp.to(dtype=DTYPE, device=self.device)
+        # Ensure batch dimension
+        if X.ndim == 2:
+            X = X.unsqueeze(0)  # [1, T, F]
 
+        inp = X.to(dtype=DTYPE, device=self.device)
+
+        # Encode
         out = self.encoder(inp)
         if isinstance(out, tuple):
             out = out[0]
+
         if detach:
             out = out.detach()
         out = out.to(dtype=DTYPE, device=self.device)
 
-        if out.ndim == 3:
-            return out.mean(dim=1)
-        elif out.ndim == 2:
-            return out
+        # Handle sequence dimension
+        if out.ndim == 3:  # [B, T, H]
+            if not keep_sequence:
+                out = out.mean(dim=1)  # collapse to [B, H]
+        elif out.ndim == 2:  # [B, H], keep as-is
+            if keep_sequence:
+                out = out.unsqueeze(1)  # add singleton sequence dimension [B, 1, H]
         else:
-            return out.unsqueeze(0)
+            raise RuntimeError(f"Unexpected encoder output shape: {out.shape}")
+
+        return out
 
     def forward(
         self,
@@ -749,24 +775,41 @@ class NeuralHSMM(HSMM, nn.Module):
         return_pdf: bool = False,
         context: Optional[torch.Tensor] = None,
         context_ids: Optional[torch.Tensor] = None
-    ):
-        """Top-level forward: set/merge context, encode, optionally return contextual emission PDF."""
-        prev_ctx = self._context
+    ) -> Union[torch.Tensor, "PDFType"]:
+        """
+        Top-level forward pass: merge context, encode observations, optionally return emission PDF.
 
-        ctx_emb = None
-        if context_ids is not None and self.context_embedding is not None:
+        Args:
+            X: Observation tensor [T, n_features] or [batch, T, n_features].
+            return_pdf: If True, returns the contextually-modulated emission PDF.
+            context: Optional raw context features.
+            context_ids: Optional context IDs to embed and merge with raw context.
+
+        Returns:
+            Theta tensor or emission PDF, depending on return_pdf.
+        """
+        prev_ctx = self._context
+        ctx_list = []
+
+        # Compute context embedding if applicable
+        if context_ids is not None:
+            if self.context_embedding is None:
+                raise ValueError("context_ids provided but no context_embedding defined.")
             ctx_emb = self.context_embedding(context_ids.to(self.device))
             if ctx_emb.ndim == 3:
                 ctx_emb = ctx_emb.mean(dim=1)
+            ctx_list.append(ctx_emb.to(dtype=DTYPE))
 
+        # Include raw context if provided
         if context is not None:
-            ctx = context if ctx_emb is None else torch.cat([context.to(device=self.device, dtype=DTYPE), ctx_emb.to(device=self.device, dtype=DTYPE)], dim=-1)
-        else:
-            ctx = ctx_emb
+            ctx_list.append(context.to(device=self.device, dtype=DTYPE))
 
+        # Merge contexts if any
+        ctx = torch.cat(ctx_list, dim=-1) if ctx_list else None
         if ctx is not None:
             self.set_context(ctx)
 
+        # Encode observations
         theta = self.encode_observations(X)
 
         if return_pdf:
@@ -785,37 +828,79 @@ class NeuralHSMM(HSMM, nn.Module):
         context: Optional[torch.Tensor] = None,
         context_ids: Optional[torch.Tensor] = None,
         batch_size: int = 256,
-    ) -> List[torch.Tensor]:
-        """Compute context-aware emission/transition/duration then call HSMM.predict (keeps interface)."""
+    ) -> list[torch.Tensor]:
+        """
+        Context-aware prediction wrapper.
+
+        Args:
+            X: Observations (T x features) or batch of sequences (B x T x features)
+            lengths: Optional sequence lengths for batched sequences
+            algorithm: "viterbi" or "map"
+            context: Optional context tensor (B x T x C)
+            context_ids: Optional context IDs (for embedding lookups)
+            batch_size: Batch size for prediction
+
+        Returns:
+            List of predicted state sequences (torch.Tensor)
+        """
+        # Ensure tensor on correct device
+        if not torch.is_tensor(X):
+            X = torch.as_tensor(X, dtype=DTYPE, device=self.device)
+        else:
+            X = X.to(dtype=DTYPE, device=self.device)
+
+        # Encode context if present
         theta = self.forward(X, return_pdf=False, context=context, context_ids=context_ids)
+
+        # Compute context-aware parameters
         pdf = self._contextual_emission_pdf(X, theta)
         transition = self._contextual_transition_matrix(theta)
         duration = self._contextual_duration_pdf(theta)
 
-        # Temporarily set HSMM internals for prediction
+        # Backup original HSMM internals
         prev_pdf = self._params.get("emission_pdf", None)
         prev_transition_logits = getattr(self, "_transition_logits", None)
         prev_duration_logits = getattr(self, "_duration_logits", None)
 
-        self._params["emission_pdf"] = pdf
+        # Assign temporary parameters for prediction
+        if pdf is not None:
+            self._params["emission_pdf"] = pdf
+
         if transition is not None:
-            # copy into internal logits if expected shape matches
             if isinstance(transition, torch.Tensor) and transition.shape == (self.n_states, self.n_states):
                 self._transition_logits = transition
+            else:
+                print(f"[predict] Warning: transition shape {transition.shape} unexpected, skipping assignment.")
+
         if duration is not None:
             if isinstance(duration, torch.Tensor) and duration.shape == (self.n_states, self.max_duration):
                 self._duration_logits = duration
+            else:
+                print(f"[predict] Warning: duration shape {duration.shape} unexpected, skipping assignment.")
 
+        # Run base HSMM prediction
         preds = super().predict(X, lengths=lengths, algorithm=algorithm, batch_size=batch_size)
 
-        # restore
+        # Restore previous parameters
         self._params["emission_pdf"] = prev_pdf
         if prev_transition_logits is not None:
             self._transition_logits = prev_transition_logits
+        else:
+            if hasattr(self, "_transition_logits"):
+                del self._transition_logits
         if prev_duration_logits is not None:
             self._duration_logits = prev_duration_logits
+        else:
+            if hasattr(self, "_duration_logits"):
+                del self._duration_logits
 
-        return preds
+        # Ensure output is always a list of tensors
+        if isinstance(preds, torch.Tensor):
+            return [preds]
+        elif isinstance(preds, list):
+            return [p if torch.is_tensor(p) else torch.as_tensor(p, device=self.device) for p in preds]
+        else:
+            return [torch.as_tensor(preds, device=self.device)]
 
     def decode(
         self,
@@ -825,29 +910,40 @@ class NeuralHSMM(HSMM, nn.Module):
         context_ids: Optional[torch.Tensor] = None,
         algorithm: Literal["viterbi", "map"] = "viterbi",
     ) -> np.ndarray:
-        """Convenience wrapper that encodes context, updates contextual PDFs and returns numpy predictions."""
+        """
+        Context-aware decoding wrapper.
+        Encodes observations, applies duration weighting, and returns numpy predictions.
+
+        Args:
+            X: Observations (T x features) or batch (B x T x features)
+            duration_weight: Weighting factor for duration probabilities
+            context: Optional context tensor
+            context_ids: Optional context ID tensor
+            algorithm: "viterbi" or "map"
+
+        Returns:
+            numpy.ndarray of predicted states
+        """
         if not torch.is_tensor(X):
             X = torch.as_tensor(X, dtype=DTYPE, device=self.device)
         else:
             X = X.to(dtype=DTYPE, device=self.device)
 
+        # Forward pass to get encoded context
         theta = self.forward(X, return_pdf=False, context=context, context_ids=context_ids)
 
-        # compute contextually-modulated params (side-effects kept minimal)
+        # Apply duration weighting
         _ = self._contextual_transition_matrix(theta, scale=duration_weight)
         _ = self._contextual_duration_pdf(theta, scale=duration_weight)
         _ = self._contextual_emission_pdf(X, theta)
 
-        preds = self.predict(X, algorithm=algorithm, context=theta, context_ids=context_ids)
-        # unify to numpy
-        if isinstance(preds, list):
-            if len(preds) == 1:
-                out = preds[0]
-            else:
-                out = torch.stack([p.to(self.device) if torch.is_tensor(p) else torch.tensor(p, device=self.device) for p in preds])
-        elif torch.is_tensor(preds):
-            out = preds
+        # Use improved predict
+        preds_list = self.predict(X, algorithm=algorithm, context=theta, context_ids=context_ids)
+
+        # Flatten or unify output to numpy
+        if len(preds_list) == 1:
+            out = preds_list[0]
         else:
-            out = torch.as_tensor(preds, dtype=torch.long, device=self.device)
+            out = torch.stack(preds_list)
 
         return out.detach().cpu().numpy()

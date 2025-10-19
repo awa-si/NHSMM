@@ -35,45 +35,45 @@ class HSMM(ABC):
         n_states: int,
         n_features: int,
         max_duration: int,
-        alpha: float = 1.0,
+        alpha: float = None,
+        min_covar: float = None,
         seed: Optional[int] = None,
-        context_dim: Optional[int] = None,
         transition_constraint: Any = None,
-        min_covar: float = 1e-3,
+        context_dim: Optional[int] = None,
         device: Optional[torch.device] = None,
     ):
         super().__init__()
 
-        self.device = device or torch.device("cpu")
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.transition_constraint = transition_constraint or constraints.Transitions.SEMI
+        self._context: Optional[torch.Tensor] = None
+        self.encoder: Optional[nn.Module] = None
+        self._seed_gen = SeedGenerator(seed)
+        self._params: Dict[str, Any] = {}
         self.max_duration = max_duration
+        self.context_dim = context_dim
         self.n_features = n_features
         self.min_covar = min_covar
         self.n_states = n_states
         self.alpha = alpha
 
-        self._params: Dict[str, Any] = {}
-        self._seed_gen = SeedGenerator(seed)
-        self._context: Optional[torch.Tensor] = None
-
-        self.encoder: Optional[nn.Module] = None
-        self.emission_module = Emission(n_states, n_features, min_covar, context_dim)
-        self.duration_module = Duration(n_states, max_duration, context_dim)
-        self.transition_module = Transition(n_states, context_dim)
-
-        self.transition_constraint = transition_constraint or constraints.Transitions.SEMI
-
         self._init_buffers()
+        self._init_modules()
         self._params['emission_pdf'] = self.sample_emission_pdf(None)
+
+    def _init_modules(self):
+        self.emission_module = Emission(self.n_states, self.n_features, self.min_covar, self.context_dim)
+        self.duration_module = Duration(self.n_states, self.max_duration, self.context_dim)
+        self.transition_module = Transition(self.n_states, self.context_dim)
 
     def _init_buffers(self):
         device = next(self.buffers(), torch.zeros(1, dtype=DTYPE)).device
 
         def sample_logits(shape):
-            # Determine which sampling function to use
             if len(shape) == 1:
                 probs = constraints.sample_probs(self.alpha, shape)
             elif len(shape) == 2:
-                if shape[1] == getattr(self, 'max_duration', None):
+                if shape[1] == self.max_duration:
                     probs = constraints.sample_probs(self.alpha, shape)
                 else:
                     probs = constraints.sample_transition(self.alpha, shape[0], self.transition_constraint)
@@ -95,8 +95,8 @@ class HSMM(ABC):
 
         # Store shapes for later
         self._init_shape = init_shape
-        self._transition_shape = transition_shape
         self._duration_shape = duration_shape
+        self._transition_shape = transition_shape
 
         # Optional super-states
         n_super_states = getattr(self, "n_super_states", 0)
@@ -432,7 +432,6 @@ class HSMM(ABC):
         Uses gamma/xi/eta returned as probabilities (not log-probs).
         """
         gamma_list, xi_list, eta_list = self._compute_posteriors(X)
-        eps = 1e-12
 
         # -------------------------------
         # Initial state distribution
@@ -441,7 +440,7 @@ class HSMM(ABC):
                    else torch.zeros(self.n_states, dtype=DTYPE, device=self.device)
                    for g in gamma_list]
         if pi_cols:
-            pi_counts = torch.stack(pi_cols, dim=1).sum(dim=1).clamp_min(eps)
+            pi_counts = torch.stack(pi_cols, dim=1).sum(dim=1).clamp_min(EPS)
             new_init = constraints.log_normalize(torch.log(pi_counts), dim=0)
         else:
             new_init = self.init_logits.to(device=self.device, dtype=DTYPE)
@@ -452,7 +451,7 @@ class HSMM(ABC):
         xi_valid = [x for x in xi_list if x is not None and x.numel() > 0]
         if xi_valid:
             xi_cat = torch.cat(xi_valid, dim=0).to(device=self.device, dtype=DTYPE)
-            trans_counts = xi_cat.sum(dim=0).clamp_min(eps)
+            trans_counts = xi_cat.sum(dim=0).clamp_min(EPS)
             new_transition = constraints.log_normalize(torch.log(trans_counts), dim=1)
         else:
             new_transition = self.transition_logits.to(device=self.device, dtype=DTYPE)
@@ -463,7 +462,7 @@ class HSMM(ABC):
         eta_valid = [e for e in eta_list if e is not None and e.numel() > 0]
         if eta_valid:
             eta_cat = torch.cat(eta_valid, dim=0).to(device=self.device, dtype=DTYPE)
-            dur_counts = eta_cat.sum(dim=0).clamp_min(eps)
+            dur_counts = eta_cat.sum(dim=0).clamp_min(EPS)
             new_duration = constraints.log_normalize(torch.log(dur_counts), dim=1)
         else:
             new_duration = self.duration_logits.to(device=self.device, dtype=DTYPE)
@@ -1187,23 +1186,23 @@ class HSMM(ABC):
     def fit(
         self,
         X: torch.Tensor,
+        n_init: int = 1,
         tol: float = 1e-4,
         max_iter: int = 15,
-        n_init: int = 1,
         post_conv_iter: int = 1,
         ignore_conv: bool = False,
-        sample_B_from_X: bool = False,
-        verbose: bool = True,
-        plot_conv: bool = False,
+        sample_D_from_X: bool = False,
         lengths: Optional[List[int]] = None,
-        theta: Optional[torch.Tensor] = None
+        theta: Optional[torch.Tensor] = None,
+        plot_conv: bool = False,
+        verbose: bool = True,
     ):
         """
         Fit the HSMM using EM with context-aware, vectorized emissions.
         """
 
         # Optional initialization from data
-        if sample_B_from_X:
+        if sample_D_from_X:
             self._params['emission_pdf'] = self.sample_emission_pdf(X)
 
         # Encode observations if needed

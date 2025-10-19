@@ -23,7 +23,6 @@ class Contextual(nn.Module):
         hidden_dim: Optional[int] = None,
         activation: str = "tanh",
         device: Optional[torch.device] = None,
-        dtype: torch.dtype = DTYPE,
     ):
         super().__init__()
 
@@ -32,19 +31,18 @@ class Contextual(nn.Module):
         if target_dim <= 0:
             raise HSMMError(f"target_dim must be positive, got {target_dim}")
 
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.aggregate_context = aggregate_context
         self.context_dim = context_dim
         self.target_dim = target_dim
-        self.aggregate_context = aggregate_context
-        self.device = torch.device(device) if device else torch.device("cpu")
-        self.dtype = dtype
 
         if context_dim:
             hidden_dim = hidden_dim or max(context_dim, target_dim)
             self.context_net = nn.Sequential(
-                nn.Linear(context_dim, hidden_dim, device=self.device, dtype=self.dtype),
-                nn.LayerNorm(hidden_dim, device=self.device, dtype=self.dtype),
+                nn.Linear(context_dim, hidden_dim, device=self.device, dtype=DTYPE),
+                nn.LayerNorm(hidden_dim, device=self.device, dtype=DTYPE),
                 self._get_activation(activation),
-                nn.Linear(hidden_dim, target_dim, device=self.device, dtype=self.dtype),
+                nn.Linear(hidden_dim, target_dim, device=self.device, dtype=DTYPE),
             )
             self._init_weights()
         else:
@@ -74,7 +72,7 @@ class Contextual(nn.Module):
             return None
         if not torch.is_tensor(context):
             raise HSMMError(f"Context must be a tensor, got {type(context)}")
-        context = context.to(self.device, self.dtype)
+        context = context.to(self.device, DTYPE)
         if context.ndim == 1:
             context = context.unsqueeze(0)
         if context.shape[-1] != self.context_dim:
@@ -103,7 +101,7 @@ class Contextual(nn.Module):
             target_dim=self.target_dim,
             aggregate_context=self.aggregate_context,
             device=str(self.device),
-            dtype=str(self.dtype),
+            dtype=str(DTYPE),
         )
 
     def to(self, device, **kwargs):
@@ -122,15 +120,14 @@ class Emission(Contextual):
         n_features: int,
         min_covar: float = 1e-3,
         context_dim: Optional[int] = None,
-        scale: float = 0.1,
+        hidden_dim: Optional[int] = None,
         emission_type: str = "gaussian",
         aggregate_context: bool = True,
-        hidden_dim: Optional[int] = None,
         device: Optional[torch.device] = None,
-        dtype: torch.dtype = DTYPE,
+        scale: float = 0.1,
     ):
         target_dim = n_states * n_features
-        super().__init__(context_dim, target_dim, aggregate_context, hidden_dim, "tanh", device, dtype)
+        super().__init__(context_dim, target_dim, aggregate_context, hidden_dim, "tanh", device)
         self.n_states = n_states
         self.n_features = n_features
         self.min_covar = min_covar
@@ -140,10 +137,10 @@ class Emission(Contextual):
 
     def _init_parameters(self):
         if self.emission_type == "gaussian":
-            self.mu = nn.Parameter(torch.randn(self.n_states, self.n_features, device=self.device, dtype=self.dtype) * 0.1)
-            self.log_var = nn.Parameter(torch.full((self.n_states, self.n_features), -1.0, device=self.device, dtype=self.dtype))
+            self.mu = nn.Parameter(torch.randn(self.n_states, self.n_features, device=self.device, dtype=DTYPE) * 0.1)
+            self.log_var = nn.Parameter(torch.full((self.n_states, self.n_features), -1.0, device=self.device, dtype=DTYPE))
         elif self.emission_type in ["categorical", "bernoulli"]:
-            self.logits = nn.Parameter(torch.zeros(self.n_states, self.n_features, device=self.device, dtype=self.dtype))
+            self.logits = nn.Parameter(torch.zeros(self.n_states, self.n_features, device=self.device, dtype=DTYPE))
         else:
             raise HSMMError(f"Unsupported emission_type: {self.emission_type}")
 
@@ -165,7 +162,7 @@ class Emission(Contextual):
 
     def log_prob(self, x: torch.Tensor, context: Optional[torch.Tensor] = None):
         dist = self.forward(context=context, return_dist=True)
-        x = x.to(self.device, self.dtype)
+        x = x.to(self.device, DTYPE)
         if self.emission_type == "gaussian" and x.ndim < dist.event_shape[0] + 1:
             x = x.unsqueeze(1)
         return dist.log_prob(x)
@@ -197,19 +194,19 @@ class Duration(Contextual):
         n_states: int,
         max_duration: int = 20,
         context_dim: Optional[int] = None,
-        temperature: float = 1.0,
         aggregate_context: bool = True,
         hidden_dim: Optional[int] = None,
         device: Optional[torch.device] = None,
-        dtype: torch.dtype = DTYPE,
+        temperature: float = 1.0,
+        scale: float = 0.1
     ):
         target_dim = n_states * max_duration
-        super().__init__(context_dim, target_dim, aggregate_context, hidden_dim, "tanh", device, dtype)
+        super().__init__(context_dim, target_dim, aggregate_context, hidden_dim, "tanh", device)
         self.n_states = n_states
         self.max_duration = max_duration
         self.temperature = max(temperature, 1e-6)
-        self.scale = 0.1
-        self.logits = nn.Parameter(torch.randn(n_states, max_duration, device=self.device, dtype=self.dtype) * 0.1)
+        self.scale = scale
+        self.logits = nn.Parameter(torch.randn(n_states, max_duration, device=self.device, dtype=DTYPE) * 0.1)
 
     def forward(self, context: Optional[torch.Tensor] = None, log: bool = False, return_dist: bool = False):
         logits = self._apply_context(self.logits, context, self.scale) / self.temperature
@@ -220,7 +217,7 @@ class Duration(Contextual):
 
     def expected_duration(self, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         probs = self.forward(context=context, log=False, return_dist=False)
-        durations = torch.arange(1, self.max_duration + 1, device=self.device, dtype=self.dtype)
+        durations = torch.arange(1, self.max_duration + 1, device=self.device, dtype=DTYPE)
         return (probs * durations).sum(dim=-1)
 
     def sample(self, n_samples: int = 1, context: Optional[torch.Tensor] = None, state_indices: Optional[torch.Tensor] = None):
@@ -247,18 +244,18 @@ class Transition(Contextual):
         self,
         n_states: int,
         context_dim: Optional[int] = None,
-        temperature: float = 1.0,
-        aggregate_context: bool = True,
         hidden_dim: Optional[int] = None,
+        aggregate_context: bool = True,
         device: Optional[torch.device] = None,
-        dtype: torch.dtype = DTYPE,
+        temperature: float = 1.0,
+        scale: float = 0.1
     ):
         target_dim = n_states * n_states
-        super().__init__(context_dim, target_dim, aggregate_context, hidden_dim, "tanh", device, dtype)
-        self.n_states = n_states
+        super().__init__(context_dim, target_dim, aggregate_context, hidden_dim, "tanh", device)
+        self.logits = nn.Parameter(torch.randn(n_states, n_states, device=self.device, dtype=DTYPE) * 0.1)
         self.temperature = max(temperature, 1e-6)
-        self.scale = 0.1
-        self.logits = nn.Parameter(torch.randn(n_states, n_states, device=self.device, dtype=self.dtype) * 0.1)
+        self.n_states = n_states
+        self.scale = scale
 
     def forward(self, context: Optional[torch.Tensor] = None, log: bool = False, return_dist: bool = False):
         logits = self._apply_context(self.logits, context, self.scale) / self.temperature

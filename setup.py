@@ -6,11 +6,9 @@ here = pathlib.Path(__file__).parent.resolve()
 long_description = (here / "README.md").read_text(encoding="utf-8")
 
 setup(
-    name="NeuralHSMM",
+    name="nhsmm",
     version="0.1.0",
     author="AWA",
-    user="awwea",
-    branch="master",
     author_email="andre@awwea.com",
     description="Neural Hidden Semi-Markov Models with contextual duration and emission modeling.",
     long_description=long_description,
@@ -22,11 +20,10 @@ setup(
     python_requires=">=3.9",
 
     install_requires=[
-        "torch>=2.4.0",
-        "numpy>=1.26",
-        "scipy>=1.12",
-        "scikit-learn>=1.7.2",
-        "polars>=1.34.0",
+        "torch>=2.0",
+        "numpy>=1.24",
+        "scipy>=1.10",
+        "scikit-learn>=1.2",
         "tqdm>=4.66",
         "matplotlib>=3.9",
         "typing_extensions>=4.11",
@@ -58,7 +55,7 @@ setup(
         "Operating System :: OS Independent",
     ],
 
-    keywords="neural-hsmm hidden-semi-markov-model probabilistic deep-learning pytorch regime-detection",
+    keywords="neural-hsmm, hidden-semi-markov-model, probabilistic, deep-learning, pytorch, regime-detection",
     include_package_data=True,
     zip_safe=False,
 )
