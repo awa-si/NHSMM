@@ -424,9 +424,11 @@ class NeuralHSMM(HSMM):
         if config.n_context_states and config.context_dim:
             self.context_embedding = nn.Embedding(config.n_context_states, config.context_dim)
             nn.init.normal_(self.context_embedding.weight, 0.0, 1e-3)
+
             self.ctx_transition = nn.Linear(config.context_dim, config.n_states**2, device=self.device, dtype=DTYPE)
             self.ctx_duration = nn.Linear(config.context_dim, config.n_states*config.max_duration, device=self.device, dtype=DTYPE)
             self.ctx_emission = nn.Linear(config.context_dim, config.n_states*config.n_features, device=self.device, dtype=DTYPE)
+
             for m in (self.ctx_transition, self.ctx_duration, self.ctx_emission):
                 nn.init.normal_(m.weight, 0.0, 1e-3)
                 nn.init.normal_(m.bias, 0.0, 1e-3)
@@ -748,15 +750,7 @@ class NeuralHSMM(HSMM):
 
     def _contextual_emission_pdf(self, X: torch.Tensor, theta: Optional[torch.Tensor] = None, scale: Optional[float] = None):
         """
-        Compute context-modulated emission PDF.
-
-        Args:
-            X (torch.Tensor): Observation tensor (optional, not used for computing base PDF here).
-            theta (torch.Tensor, optional): Context tensor for modulation.
-            scale (float, optional): Scaling factor for context modulation.
-
-        Returns:
-            torch.distributions.Distribution: Modulated emission distribution.
+        Compute context-modulated emission PDF with safe batch/covariance handling.
         """
         scale = scale or getattr(self.config, "emission_scale", 1.0)
         pdf = self.pdf
@@ -768,7 +762,6 @@ class NeuralHSMM(HSMM):
             return pdf
 
         try:
-            # Compute delta using context module if exists
             if hasattr(self, "ctx_emission") and self.ctx_emission is not None:
                 delta = self.ctx_emission(combined)
             else:
@@ -776,13 +769,17 @@ class NeuralHSMM(HSMM):
 
             delta = delta.to(self.device, DTYPE)
             if delta.ndim == 1:
-                delta = delta.unsqueeze(0)  # ensure batch dim
+                delta = delta.unsqueeze(0)
 
-            # Ensure correct delta shape: (B, n_states, n_features)
             B = delta.shape[0]
-            if delta.shape[1] != self.n_states * self.n_features:
-                print(f"[contextual_emission_pdf] delta shape mismatch ({delta.shape[1]}), using base PDF")
-                return pdf
+            expected = self.n_states * self.n_features
+
+            # Reshape safely
+            if delta.shape[1] != expected:
+                if delta.shape[1] < expected:
+                    delta = F.pad(delta, (0, expected - delta.shape[1]))
+                else:
+                    delta = delta[..., :expected]
             delta = delta.view(B, self.n_states, self.n_features)
             delta = scale * torch.tanh(delta)
             delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
@@ -791,24 +788,44 @@ class NeuralHSMM(HSMM):
             print(f"[contextual_emission_pdf] Failed to compute delta, using base PDF: {e}")
             return pdf
 
-        # Apply delta to PDF
+        # --- Apply modulation ---
         if isinstance(pdf, Categorical):
             logits = pdf.logits.to(self.device, DTYPE)
             if logits.ndim == 1:
-                logits = logits.unsqueeze(0).expand(B, -1)  # broadcast batch
-            # Apply mean delta per state
-            logits = logits + delta.mean(dim=-1)  # (B, n_states)
+                logits = logits.unsqueeze(0).expand(B, -1)
+            logits = logits + delta.mean(dim=-1)
             logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
             return Categorical(logits=logits)
 
         elif isinstance(pdf, MultivariateNormal):
             mean = pdf.mean.to(self.device, DTYPE)
-            cov = pdf.covariance_matrix.to(self.device, DTYPE).clamp_min(1e-6)
+            cov = pdf.covariance_matrix.to(self.device, DTYPE)
+
+            # Add jitter to keep PD
+            if cov.ndim == 4:
+                cov = cov + EPS * torch.eye(cov.shape[-1], device=cov.device, dtype=cov.dtype).view(1, 1, cov.shape[-1], cov.shape[-1])
+            elif cov.ndim == 3:
+                cov = cov + EPS * torch.eye(cov.shape[-1], device=cov.device, dtype=cov.dtype).view(1, cov.shape[-1], cov.shape[-1])
+            elif cov.ndim == 2:
+                cov = cov + EPS * torch.eye(cov.shape[-1], device=cov.device, dtype=cov.dtype)
+
+            # Align mean batch shape
             if mean.ndim == 1:
-                mean = mean.unsqueeze(0).expand(B, -1)  # broadcast batch
-            elif mean.ndim == 2 and mean.shape[0] != B:
-                mean = mean.unsqueeze(0).expand(B, -1, -1)
+                mean = mean.unsqueeze(0).expand(B, -1)
+            elif mean.ndim == 2:
+                if B > 1:
+                    mean = mean.unsqueeze(0).expand(B, -1, -1)
+            elif mean.ndim == 3 and mean.shape[0] != B:
+                mean = mean[0].unsqueeze(0).expand(B, -1, -1)
+
             mean = mean + delta
+
+            # Keep covariance per-state — only expand if singleton
+            if cov.ndim == 3 and cov.shape[0] == 1 and B > 1:
+                cov = cov.expand(B, *cov.shape[1:])
+            elif cov.ndim == 4 and cov.shape[0] == 1 and B > 1:
+                cov = cov.expand(B, *cov.shape[1:])
+
             return MultivariateNormal(loc=mean, covariance_matrix=cov)
 
         else:
@@ -1244,3 +1261,131 @@ class NeuralHSMM(HSMM):
             out = torch.cat(preds_list, dim=0)
 
         return out.detach().cpu().numpy()
+
+    def tune(
+        self,
+        X: torch.Tensor,
+        lengths: list[int] = None,
+        configs: list[dict] = None,
+        score_metric: str = "log_likelihood",
+        verbose: bool = False
+    ) -> dict:
+        """
+        GPU-batched hyperparameter tuning with vectorized normalization and type/shape checks.
+        """
+
+        if not configs:
+            raise ValueError("configs must be provided as a list of dicts.")
+
+        X = X.to(device=self.device, dtype=DTYPE)
+
+        # --- sequence handling ---
+        if hasattr(self, "to_observations"):
+            obs_X = self.to_observations(X, lengths)
+        else:
+            obs_X = type("Obs", (), {"sequence": [X], "lengths": [len(X)], "log_probs": None})()
+
+        B = len(obs_X.sequence)
+        n_configs = len(configs)
+        K, Dmax = self.n_states, self.max_duration
+        scores: dict[int, float] = {}
+
+        # --- prepare parameter stack ---
+        param_keys = set().union(*[cfg.keys() for cfg in configs])
+        param_stack = {k: [] for k in param_keys if k != "encoder_params"}
+
+        for i, cfg in enumerate(configs):
+            for k in list(param_stack.keys()):
+                try:
+                    val = cfg.get(k, getattr(self, k, None) or getattr(self, "_params", {}).get(k, None))
+                    if val is None:
+                        if verbose:
+                            print(f"[Config {i}] skipping field '{k}' (unhandled)")
+                        continue
+
+                    if not isinstance(val, torch.Tensor):
+                        val = torch.as_tensor(val, device=self.device, dtype=DTYPE)
+                    else:
+                        val = val.to(device=self.device, dtype=DTYPE)
+
+                    param_stack[k].append(val)
+                except Exception as e:
+                    if verbose:
+                        print(f"[Config {i}] skipping field '{k}' due to: {e}")
+                    continue
+
+        # --- stack tensors ---
+        for k in list(param_stack.keys()):
+            try:
+                param_stack[k] = torch.stack(param_stack[k], dim=0).to(dtype=DTYPE, device=self.device)
+            except Exception as e:
+                if verbose:
+                    print(f"[tune] skipping field '{k}' (stacking failed: {e})")
+                param_stack.pop(k, None)
+
+        # --- vectorized normalization for logits ---
+        if "transition_logits" in param_stack:
+            vals = param_stack["transition_logits"]
+            if vals.ndim == 3 and vals.shape[1:] == (K, K):
+                param_stack["transition_logits"] = vals - torch.logsumexp(vals, dim=-1, keepdim=True)
+
+        if "duration_logits" in param_stack:
+            vals = param_stack["duration_logits"]
+            if vals.ndim == 3 and vals.shape[1:] == (K, Dmax):
+                param_stack["duration_logits"] = vals - torch.logsumexp(vals, dim=-1, keepdim=True)
+
+        # --- emission PDF check ---
+        pdf = getattr(self, "_params", {}).get("emission_pdf", None)
+        if pdf is None or not hasattr(pdf, "log_prob"):
+            raise RuntimeError("Emission PDF must be initialized for batched tuning.")
+
+        seq_tensor = torch.cat(obs_X.sequence, dim=0).to(dtype=DTYPE, device=self.device)
+        seq_offsets = [0] + list(torch.cumsum(torch.tensor(obs_X.lengths, device=self.device, dtype=torch.int64), dim=0).tolist())
+
+        try:
+            lp_base = pdf.log_prob(seq_tensor.unsqueeze(1)).to(dtype=DTYPE)
+            if lp_base.ndim > 2:
+                lp_base = lp_base.sum(dim=list(range(2, lp_base.ndim)))
+            all_log_probs = lp_base.unsqueeze(0).repeat(n_configs, 1, 1)
+        except Exception as e:
+            raise RuntimeError(f"Emission log-prob computation failed: {e}")
+
+        # --- assign fields to model and compute scores ---
+        with torch.no_grad():
+            for i in range(n_configs):
+                last_key, last_val = None, None
+                try:
+                    for k, vals in param_stack.items():
+                        last_key, last_val = k, vals[i]
+                        val = last_val
+
+                        if hasattr(self, k):
+                            try:
+                                setattr(self, k, val)
+                            except:
+                                if verbose:
+                                    print(f"[Config {i}] skipping field '{k}' (cannot set attribute)")
+                        elif k in getattr(self, "_params", {}):
+                            self._params[k] = val
+                        else:
+                            if verbose:
+                                print(f"[Config {i}] skipping field '{k}' (unknown)")
+
+                    obs_X.log_probs = [all_log_probs[i, seq_offsets[j]:seq_offsets[j+1]] for j in range(B)]
+                    score_tensor = self._compute_log_likelihood(obs_X)
+                    score = float(torch.nan_to_num(score_tensor, nan=-float("inf"), posinf=-float("inf"), neginf=-float("inf")).sum().item())
+                    scores[i] = score
+
+                    if verbose:
+                        print(f"[Config {i}] score={score:.4f}")
+
+                except Exception as e:
+                    print(f"[Config {i}] Internal tuning failed in field '{last_key or 'unknown'}': {e}")
+                    if last_val is not None:
+                        try:
+                            print(f"  param '{last_key}' shape={tuple(last_val.shape)}, dtype={last_val.dtype}, device={last_val.device}")
+                        except:
+                            pass
+                    scores[i] = float('-inf')
+
+        return scores

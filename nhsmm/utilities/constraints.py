@@ -1,7 +1,8 @@
-# constraints.py
+# utilities/constraints.py
 import torch
 from enum import Enum
 from typing import Tuple, Optional, Union
+
 from nhsmm.defaults import DTYPE, EPS
 
 
