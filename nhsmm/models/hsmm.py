@@ -1485,32 +1485,50 @@ class HSMM(nn.Module, ABC):
 
         return seq_ll.detach().cpu() if by_sample else seq_ll.sum().detach().cpu()
 
-    def _compute_log_likelihood(self, X: utils.Observations) -> torch.Tensor:
-        """Fully vectorized log-likelihood computation for HSMM sequences."""
+    def _compute_log_likelihood(self, X: utils.Observations, verbose: bool = False) -> torch.Tensor:
+        """
+        Fully vectorized log-likelihood computation for HSMM sequences using padded alpha tensors.
+
+        Args:
+            X: Observations object with sequences.
+            verbose: Print debug info about shapes.
+
+        Returns:
+            Tensor of log-likelihoods, shape (batch_size,)
+        """
         alpha_list = self._forward(X)
         if not alpha_list:
             raise RuntimeError("Forward pass returned empty results. Model may be uninitialized.")
 
         B = len(alpha_list)
         K, Dmax = self.n_states, self.max_duration
-        seq_lengths = torch.tensor([a.shape[0] for a in alpha_list], device=self.device)
+        dtype, device = DTYPE, self.device
+
+        # --- sequence lengths and max ---
+        seq_lengths = torch.tensor([a.shape[0] for a in alpha_list], device=device, dtype=torch.long)
         max_T = seq_lengths.max()
-        neg_inf = torch.tensor(-float('inf'), device=self.device, dtype=DTYPE)
+        neg_inf = torch.tensor(-float('inf'), device=device, dtype=dtype)
 
-        # Padded alpha tensor
-        alpha_padded = torch.full((B, max_T, K, Dmax), neg_inf, device=self.device, dtype=DTYPE)
+        # --- pad sequences efficiently ---
+        alpha_list_clamped = [a.nan_to_num(nan=neg_inf, posinf=neg_inf, neginf=neg_inf) for a in alpha_list]
+        # each alpha: (T_i, K, Dmax) -> pad to (max_T, K, Dmax)
+        alpha_padded = torch.nn.utils.rnn.pad_sequence(alpha_list_clamped, batch_first=True,
+                                                       padding_value=neg_inf)  # shape (B, max_T, K, Dmax)
 
-        for i, alpha in enumerate(alpha_list):
-            T_i = alpha.shape[0]
-            if T_i > 0:
-                alpha_padded[i, :T_i] = alpha.nan_to_num(nan=neg_inf, posinf=neg_inf, neginf=neg_inf)
+        if verbose:
+            print(f"[compute_ll] alpha_padded shape: {alpha_padded.shape}, seq_lengths: {seq_lengths.tolist()}")
 
-        # Compute logsumexp over states and durations at last valid timestep
+        # --- logsumexp over states & durations at last valid timestep ---
+        batch_idx = torch.arange(B, device=device)
         last_idx = (seq_lengths - 1).clamp(min=0)
-        ll_list = torch.logsumexp(alpha_padded[torch.arange(B, device=self.device), last_idx], dim=(-1, -2))
+        last_alpha = alpha_padded[batch_idx, last_idx]  # shape (B, K, Dmax)
+        ll_list = torch.logsumexp(last_alpha.reshape(B, -1), dim=-1)  # sum over K*Dmax
 
-        # Set -inf for sequences of length 0
+        # Set -inf for zero-length sequences
         ll_list = torch.where(seq_lengths > 0, ll_list, neg_inf)
+
+        if verbose:
+            print(f"[compute_ll] log-likelihoods: {ll_list}")
 
         return ll_list
 
@@ -1584,8 +1602,7 @@ class HSMM(nn.Module, ABC):
         verbose: bool = False
     ) -> dict:
         """
-        GPU-batched hyperparameter tuning for HSMM with enforced dtype/device consistency.
-        Automatically skips unhandled or invalid parameter fields.
+        GPU-batched hyperparameter tuning with vectorized normalization and type/shape checks.
         """
 
         if not configs:
@@ -1599,32 +1616,22 @@ class HSMM(nn.Module, ABC):
         else:
             obs_X = type("Obs", (), {"sequence": [X], "lengths": [len(X)], "log_probs": None})()
 
-        B = len(obs_X.sequence) if hasattr(obs_X, "sequence") else 1
+        B = len(obs_X.sequence)
         n_configs = len(configs)
         K, Dmax = self.n_states, self.max_duration
         scores: dict[int, float] = {}
 
-        # --- parameter stacking (skip encoder_params) ---
+        # --- prepare parameter stack ---
         param_keys = set().union(*[cfg.keys() for cfg in configs])
         param_stack = {k: [] for k in param_keys if k != "encoder_params"}
 
-        # Collect keys to skip to avoid dict mutation during iteration
-        skip_keys_overall = set()
-
         for i, cfg in enumerate(configs):
-            skip_keys_local = []
             for k in list(param_stack.keys()):
                 try:
-                    # Lookup: candidate config -> model attribute -> self._params
-                    if k in cfg:
-                        val = cfg[k]
-                    else:
-                        val = getattr(self, k, None) or getattr(self, "_params", {}).get(k, None)
-
+                    val = cfg.get(k, getattr(self, k, None) or getattr(self, "_params", {}).get(k, None))
                     if val is None:
                         if verbose:
                             print(f"[Config {i}] skipping field '{k}' (unhandled)")
-                        skip_keys_local.append(k)
                         continue
 
                     if not isinstance(val, torch.Tensor):
@@ -1633,27 +1640,32 @@ class HSMM(nn.Module, ABC):
                         val = val.to(device=self.device, dtype=DTYPE)
 
                     param_stack[k].append(val)
-
                 except Exception as e:
-                    print(f"[Config {i}] skipping field '{k}' due to: {e}")
-                    skip_keys_local.append(k)
+                    if verbose:
+                        print(f"[Config {i}] skipping field '{k}' due to: {e}")
                     continue
 
-            skip_keys_overall.update(skip_keys_local)
-
-        # Remove skipped keys from param_stack
-        for k in skip_keys_overall:
-            param_stack.pop(k, None)
-
-        # Stack tensors
+        # --- stack tensors ---
         for k in list(param_stack.keys()):
             try:
                 param_stack[k] = torch.stack(param_stack[k], dim=0).to(dtype=DTYPE, device=self.device)
             except Exception as e:
-                print(f"[tune] skipping field '{k}' (stacking failed: {e})")
+                if verbose:
+                    print(f"[tune] skipping field '{k}' (stacking failed: {e})")
                 param_stack.pop(k, None)
 
-        # --- emission PDF ---
+        # --- vectorized normalization for logits ---
+        if "transition_logits" in param_stack:
+            vals = param_stack["transition_logits"]
+            if vals.ndim == 3 and vals.shape[1:] == (K, K):
+                param_stack["transition_logits"] = vals - torch.logsumexp(vals, dim=-1, keepdim=True)
+
+        if "duration_logits" in param_stack:
+            vals = param_stack["duration_logits"]
+            if vals.ndim == 3 and vals.shape[1:] == (K, Dmax):
+                param_stack["duration_logits"] = vals - torch.logsumexp(vals, dim=-1, keepdim=True)
+
+        # --- emission PDF check ---
         pdf = getattr(self, "_params", {}).get("emission_pdf", None)
         if pdf is None or not hasattr(pdf, "log_prob"):
             raise RuntimeError("Emission PDF must be initialized for batched tuning.")
@@ -1661,7 +1673,6 @@ class HSMM(nn.Module, ABC):
         seq_tensor = torch.cat(obs_X.sequence, dim=0).to(dtype=DTYPE, device=self.device)
         seq_offsets = [0] + list(torch.cumsum(torch.tensor(obs_X.lengths, device=self.device, dtype=torch.int64), dim=0).tolist())
 
-        # Compute emission log-probs once
         try:
             lp_base = pdf.log_prob(seq_tensor.unsqueeze(1)).to(dtype=DTYPE)
             if lp_base.ndim > 2:
@@ -1670,49 +1681,26 @@ class HSMM(nn.Module, ABC):
         except Exception as e:
             raise RuntimeError(f"Emission log-prob computation failed: {e}")
 
-        # --- batched scoring ---
+        # --- assign fields to model and compute scores ---
         with torch.no_grad():
             for i in range(n_configs):
-                last_key = None
-                last_val = None
+                last_key, last_val = None, None
                 try:
                     for k, vals in param_stack.items():
-                        last_key = k
-                        val = vals[i]
-                        last_val = val
+                        last_key, last_val = k, vals[i]
+                        val = last_val
 
-                        # shape validation & normalization
-                        if k == "transition_logits":
-                            expected_shape = (self.n_states, self.n_states)
-                            if val.shape != expected_shape:
-                                if verbose:
-                                    print(f"[Config {i}] skipping field '{k}' (bad shape {tuple(val.shape)})")
-                                continue
-                            val = val - torch.logsumexp(val, dim=-1, keepdim=True)
-                        elif k == "duration_logits":
-                            expected_shape = (self.n_states, self.max_duration)
-                            if val.shape != expected_shape:
-                                if verbose:
-                                    print(f"[Config {i}] skipping field '{k}' (bad shape {tuple(val.shape)})")
-                                continue
-                            val = val - torch.logsumexp(val, dim=-1, keepdim=True)
-
-                        val = val.to(dtype=DTYPE, device=self.device)
-
-                        # assign to model or _params
                         if hasattr(self, k):
                             try:
                                 setattr(self, k, val)
-                            except Exception:
+                            except:
                                 if verbose:
-                                    print(f"[Config {i}] skipping field '{k}' (cannot set attr)")
-                                continue
+                                    print(f"[Config {i}] skipping field '{k}' (cannot set attribute)")
                         elif k in getattr(self, "_params", {}):
                             self._params[k] = val
                         else:
                             if verbose:
                                 print(f"[Config {i}] skipping field '{k}' (unknown)")
-                            continue
 
                     obs_X.log_probs = [all_log_probs[i, seq_offsets[j]:seq_offsets[j+1]] for j in range(B)]
                     score_tensor = self._compute_log_likelihood(obs_X)
@@ -1728,7 +1716,7 @@ class HSMM(nn.Module, ABC):
                     if last_val is not None:
                         try:
                             print(f"  param '{last_key}' shape={tuple(last_val.shape)}, dtype={last_val.dtype}, device={last_val.device}")
-                        except Exception:
+                        except:
                             pass
                     scores[i] = float('-inf')
 

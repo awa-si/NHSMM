@@ -9,8 +9,11 @@ EPS = 1e-12
 MAX_LOGITS = 50.0
 DTYPE = torch.float64
 
+
 class HSMMError(ValueError):
+    """Custom error class for HSMM module."""
     pass
+
 
 class Contextual(nn.Module):
     """Base class for context-modulated parameters."""
@@ -20,6 +23,7 @@ class Contextual(nn.Module):
         context_dim: Optional[int],
         target_dim: int,
         aggregate_context: bool = True,
+        aggregate_method: str = "mean",
         hidden_dim: Optional[int] = None,
         activation: str = "tanh",
         device: Optional[torch.device] = None,
@@ -32,9 +36,10 @@ class Contextual(nn.Module):
             raise HSMMError(f"target_dim must be positive, got {target_dim}")
 
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.aggregate_context = aggregate_context
         self.context_dim = context_dim
         self.target_dim = target_dim
+        self.aggregate_context = aggregate_context
+        self.aggregate_method = aggregate_method.lower()
 
         if context_dim:
             hidden_dim = hidden_dim or max(context_dim, target_dim)
@@ -42,7 +47,7 @@ class Contextual(nn.Module):
                 nn.Linear(context_dim, hidden_dim, device=self.device, dtype=DTYPE),
                 nn.LayerNorm(hidden_dim, device=self.device, dtype=DTYPE),
                 self._get_activation(activation),
-                nn.Linear(hidden_dim, target_dim, device=self.device, dtype=DTYPE),
+                nn.Linear(hidden_dim, target_dim, device=self.device, dtype=DTYPE)
             )
             self._init_weights()
         else:
@@ -55,6 +60,7 @@ class Contextual(nn.Module):
             "leaky_relu": nn.LeakyReLU(0.01),
             "gelu": nn.GELU(),
             "softplus": nn.Softplus(),
+            "identity": nn.Identity(),
         }
         if name.lower() not in activations:
             raise HSMMError(f"Unsupported activation: {name}")
@@ -71,7 +77,7 @@ class Contextual(nn.Module):
         if context is None or self.context_net is None:
             return None
         if not torch.is_tensor(context):
-            raise HSMMError(f"Context must be a tensor, got {type(context)}")
+            raise HSMMError(f"Context must be a torch.Tensor, got {type(context)}")
         context = context.to(self.device, DTYPE)
         if context.ndim == 1:
             context = context.unsqueeze(0)
@@ -80,19 +86,26 @@ class Contextual(nn.Module):
         return context
 
     def _contextual_modulation(self, base: torch.Tensor, context: Optional[torch.Tensor], scale: float = 0.1) -> torch.Tensor:
+        base = base.to(self.device)
         if self.context_net is None or context is None:
             return torch.zeros_like(base)
         context = self._validate_context(context)
         delta = self.context_net(context)
-        # reshape delta to broadcast over base
         while delta.ndim < base.ndim:
             delta = delta.unsqueeze(1)
         if self.aggregate_context:
-            delta = delta.mean(dim=0, keepdim=True)
+            if self.aggregate_method == "mean":
+                delta = delta.mean(dim=0, keepdim=True)
+            elif self.aggregate_method == "sum":
+                delta = delta.sum(dim=0, keepdim=True)
+            elif self.aggregate_method == "max":
+                delta, _ = delta.max(dim=0, keepdim=True)
+            else:
+                raise HSMMError(f"Unsupported aggregate_method: {self.aggregate_method}")
         return scale * torch.tanh(delta + torch.zeros_like(base))
 
     def _apply_context(self, base: torch.Tensor, context: Optional[torch.Tensor], scale: float = 0.1) -> torch.Tensor:
-        modulated = base + self._contextual_modulation(base, context, scale)
+        modulated = base.to(self.device) + self._contextual_modulation(base, context, scale)
         return torch.where(torch.isfinite(modulated), modulated, base)
 
     def get_config(self) -> Dict[str, Any]:
@@ -100,8 +113,9 @@ class Contextual(nn.Module):
             context_dim=self.context_dim,
             target_dim=self.target_dim,
             aggregate_context=self.aggregate_context,
+            aggregate_method=self.aggregate_method,
             device=str(self.device),
-            dtype=str(DTYPE),
+            dtype=str(DTYPE)
         )
 
     def to(self, device, **kwargs):
@@ -110,6 +124,11 @@ class Contextual(nn.Module):
         if self.context_net:
             self.context_net.to(device, **kwargs)
         return self
+
+
+# ---------------------------------------
+# Emission, Duration, Transition modules
+# ---------------------------------------
 
 class Emission(Contextual):
     """Contextual emission distribution."""
@@ -123,11 +142,12 @@ class Emission(Contextual):
         hidden_dim: Optional[int] = None,
         emission_type: str = "gaussian",
         aggregate_context: bool = True,
+        aggregate_method: str = "mean",
         device: Optional[torch.device] = None,
-        scale: float = 0.1,
+        scale: float = 0.1
     ):
         target_dim = n_states * n_features
-        super().__init__(context_dim, target_dim, aggregate_context, hidden_dim, "tanh", device)
+        super().__init__(context_dim, target_dim, aggregate_context, aggregate_method, hidden_dim, "tanh", device)
         self.n_states = n_states
         self.n_features = n_features
         self.min_covar = min_covar
@@ -151,7 +171,6 @@ class Emission(Contextual):
             if return_dist:
                 return Independent(Normal(mu, var.sqrt()), 1)
             return mu, var
-
         logits = self._apply_context(self.logits, context, self.scale)
         if return_dist:
             if self.emission_type == "categorical":
@@ -169,8 +188,7 @@ class Emission(Contextual):
 
     def sample(self, n_samples: int = 1, context: Optional[torch.Tensor] = None, state_indices: Optional[torch.Tensor] = None):
         dist = self.forward(context=context, return_dist=True)
-        samples = dist.sample((n_samples,))  # (n_samples, n_states, F)
-        samples = samples.transpose(0, 1)  # (n_states, n_samples, F)
+        samples = dist.sample((n_samples,)).transpose(0, 1)  # (n_states, n_samples, F)
         if state_indices is not None:
             samples = samples[state_indices, ...]
         return samples
@@ -182,12 +200,13 @@ class Emission(Contextual):
             n_features=self.n_features,
             min_covar=self.min_covar,
             scale=self.scale,
-            emission_type=self.emission_type,
+            emission_type=self.emission_type
         ))
         return cfg
 
+
 class Duration(Contextual):
-    """Contextual duration distribution for HSMM states."""
+    """Contextual duration distribution."""
 
     def __init__(
         self,
@@ -195,13 +214,14 @@ class Duration(Contextual):
         max_duration: int = 20,
         context_dim: Optional[int] = None,
         aggregate_context: bool = True,
+        aggregate_method: str = "mean",
         hidden_dim: Optional[int] = None,
         device: Optional[torch.device] = None,
         temperature: float = 1.0,
         scale: float = 0.1
     ):
         target_dim = n_states * max_duration
-        super().__init__(context_dim, target_dim, aggregate_context, hidden_dim, "tanh", device)
+        super().__init__(context_dim, target_dim, aggregate_context, aggregate_method, hidden_dim, "tanh", device)
         self.n_states = n_states
         self.max_duration = max_duration
         self.temperature = max(temperature, 1e-6)
@@ -222,7 +242,7 @@ class Duration(Contextual):
 
     def sample(self, n_samples: int = 1, context: Optional[torch.Tensor] = None, state_indices: Optional[torch.Tensor] = None):
         dist = self.forward(context=context, return_dist=True)
-        samples = dist.sample((n_samples,)).T  # (n_states, n_samples)
+        samples = dist.sample((n_samples,)).transpose(0,1)  # (n_states, n_samples)
         if state_indices is not None:
             samples = samples[state_indices, ...]
         return samples
@@ -233,12 +253,13 @@ class Duration(Contextual):
             n_states=self.n_states,
             max_duration=self.max_duration,
             temperature=self.temperature,
-            scale=self.scale,
+            scale=self.scale
         ))
         return cfg
 
+
 class Transition(Contextual):
-    """Contextual transition distribution with batched context support."""
+    """Contextual transition distribution."""
 
     def __init__(
         self,
@@ -246,12 +267,13 @@ class Transition(Contextual):
         context_dim: Optional[int] = None,
         hidden_dim: Optional[int] = None,
         aggregate_context: bool = True,
+        aggregate_method: str = "mean",
         device: Optional[torch.device] = None,
         temperature: float = 1.0,
         scale: float = 0.1
     ):
         target_dim = n_states * n_states
-        super().__init__(context_dim, target_dim, aggregate_context, hidden_dim, "tanh", device)
+        super().__init__(context_dim, target_dim, aggregate_context, aggregate_method, hidden_dim, "tanh", device)
         self.logits = nn.Parameter(torch.randn(n_states, n_states, device=self.device, dtype=DTYPE) * 0.1)
         self.temperature = max(temperature, 1e-6)
         self.n_states = n_states
@@ -276,5 +298,8 @@ class Transition(Contextual):
 
     def get_config(self):
         cfg = super().get_config()
-        cfg.update(dict(n_states=self.n_states, temperature=self.temperature))
+        cfg.update(dict(
+            n_states=self.n_states,
+            temperature=self.temperature
+        ))
         return cfg

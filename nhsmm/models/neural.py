@@ -4,7 +4,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Distribution, Normal, Independent, Categorical, Poisson, LogNormal, MultivariateNormal
+from torch.distributions import Distribution, Normal, Independent, Categorical, Poisson, LogNormal, MultivariateNormal, Dirichlet
 
 from typing import Literal, Optional, Union, Tuple
 from sklearn.cluster import KMeans
@@ -17,7 +17,7 @@ from nhsmm import utils
 
 
 class NeuralEmission(Emission):
-    """Neural/contextual emission distribution for HSMM states with dynamic DOF."""
+    """Neural/contextual emission distribution with dynamic DOF and adapters."""
 
     def __init__(
         self,
@@ -43,76 +43,63 @@ class NeuralEmission(Emission):
         super().__init__(n_states=n_states, n_features=n_features, emission_type=emission_type)
         self.encoder = encoder
 
-        # Gaussian parameters
         if emission_type == "gaussian":
             self.mu = nn.Parameter(mu.to(self.device, DTYPE))
             if cov.ndim == 2:
                 cov = torch.diag_embed(cov)
             self.cov = nn.Parameter(cov.to(self.device, DTYPE))
+            self._gaussian_proj = nn.Linear(n_features, 2 * n_states * n_features, bias=False).to(self.device, DTYPE)
         else:
             self.logits = nn.Parameter(params.to(self.device, DTYPE))
 
-        # Optional contextual adapters
+        # Contextual adapters
         self.temporal_adapter = (
-            nn.Conv1d(self.n_features, self.n_features, kernel_size=3, padding=1, bias=False)
-            .to(self.device, DTYPE)
-            if self.context_mode == "temporal"
-            else None
+            nn.Conv1d(n_features, n_features, kernel_size=3, padding=1, bias=False).to(self.device, DTYPE)
+            if self.context_mode == "temporal" else None
         )
         self.spatial_adapter = (
-            nn.Linear(self.n_features, self.n_features, bias=False)
-            .to(self.device, DTYPE)
-            if self.context_mode == "spatial"
-            else None
+            nn.Linear(n_features, n_features, bias=False).to(self.device, DTYPE)
+            if self.context_mode == "spatial" else None
         )
 
     @property
     def dof(self) -> int:
-        dof = 0
-        if self.emission_type == "gaussian":
-            dof += self.mu.numel() + self.cov.numel()
-        else:
-            dof += self.logits.numel()
-        if self.encoder is not None:
+        dof = self.mu.numel() + getattr(self, "cov", torch.tensor([])).numel() if self.emission_type == "gaussian" else self.logits.numel()
+        if self.encoder:
             dof += sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
-        if getattr(self, "temporal_adapter", None):
+        if self.temporal_adapter:
             dof += sum(p.numel() for p in self.temporal_adapter.parameters() if p.requires_grad)
-        if getattr(self, "spatial_adapter", None):
+        if self.spatial_adapter:
             dof += sum(p.numel() for p in self.spatial_adapter.parameters() if p.requires_grad)
         return dof
 
-    # ---------------- Contextual Params ---------------- #
     def contextual_params(self, theta: Optional[torch.Tensor] = None):
-        if self.encoder is None and theta is None:
-            return (self.mu, self.cov) if self.emission_type == "gaussian" else self.logits
-
-        if theta is not None:
-            theta = theta.to(self.device, DTYPE)
-            if self.temporal_adapter is not None and theta.ndim == 3:  # (B,T,F)
-                theta = theta.transpose(1, 2)
-                theta = self.temporal_adapter(theta)
-                theta = theta.transpose(1, 2)
-            if self.spatial_adapter is not None:
-                theta = self.spatial_adapter(theta)
-
-        out = self.encoder(theta) if self.encoder else theta
+        out = theta
+        if self.encoder and theta is not None:
+            out = self.encoder(theta)
+        if self.temporal_adapter and out is not None and out.ndim == 3:  # (B,T,F)
+            out = out.transpose(1, 2)
+            out = self.temporal_adapter(out)
+            out = out.transpose(1, 2)
+        if self.spatial_adapter and out is not None:
+            out = self.spatial_adapter(out)
 
         if self.emission_type == "gaussian":
+            if out is None:
+                return self.mu, self.cov
             if isinstance(out, (tuple, list)) and len(out) == 2:
                 mu, cov = out
             else:
-                proj = nn.Linear(out.shape[-1], 2 * self.n_states * self.n_features, bias=False).to(self.device, DTYPE)
-                tmp = proj(out).view(-1, 2, self.n_states, self.n_features)
+                tmp = self._gaussian_proj(out).view(-1, 2, self.n_states, self.n_features)
                 mu, cov = tmp[:, 0], torch.diag_embed(F.softplus(tmp[:, 1]) + EPS)
             return mu.to(self.device, DTYPE), cov.to(self.device, DTYPE)
         else:
-            logits = torch.log_softmax(out, dim=-1).clamp_min(EPS)
+            logits = out if out is not None else self.logits
             if logits.shape[-1] != self.n_features:
                 proj = nn.Linear(logits.shape[-1], self.n_features, bias=False).to(self.device, DTYPE)
                 logits = proj(logits)
-            return logits.to(self.device, DTYPE)
+            return F.log_softmax(logits, dim=-1).clamp_min(EPS)
 
-    # ---------------- Forward / Log-Prob ---------------- #
     def forward(self, X: torch.Tensor, theta: Optional[torch.Tensor] = None, log: bool = False):
         X = X.to(self.device, DTYPE)
         batch_mode = X.ndim == 3
@@ -143,7 +130,17 @@ class NeuralEmission(Emission):
     def log_prob(self, X: torch.Tensor, theta: Optional[torch.Tensor] = None):
         return self.forward(X, theta=theta, log=True)
 
-    # ---------------- EM Update ---------------- #
+    def sample(self, n_samples: int = 1, theta: Optional[torch.Tensor] = None, state_indices: Optional[torch.Tensor] = None):
+        if self.emission_type == "gaussian":
+            mu, cov = self.contextual_params(theta)
+            dist = Independent(MultivariateNormal(mu, covariance_matrix=cov), 1)
+            samples = dist.rsample((n_samples,)).transpose(0, 1)  # (K, n_samples, F)
+        else:
+            logits = self.contextual_params(theta)
+            dist = Categorical(logits=logits)
+            samples = dist.sample((n_samples,)).transpose(0, 1)  # (K, n_samples)
+        return samples if state_indices is None else samples[state_indices]
+
     def update(self, posterior: torch.Tensor, X: torch.Tensor, inplace: bool = True):
         posterior = posterior.to(self.device, DTYPE)
         X = X.to(self.device, DTYPE)
@@ -174,7 +171,6 @@ class NeuralEmission(Emission):
             return NeuralEmission(self.emission_type, logits_new, encoder=self.encoder,
                                   context_mode=self.context_mode, device=self.device)
 
-    # ---------------- Initialization ---------------- #
     @classmethod
     def initialize(cls, emission_type: str, n_states: int, n_features: int = None,
                    n_categories: int = None, alpha: float = 1.0,
@@ -185,18 +181,11 @@ class NeuralEmission(Emission):
             cov = torch.stack([torch.ones(n_features, device=device, dtype=DTYPE) for _ in range(n_states)])
             return cls("gaussian", (mu, cov), encoder=encoder, device=device)
         else:
-            logits = torch.distributions.Dirichlet(
-                torch.ones(n_categories, device=device, dtype=DTYPE) * alpha
-            ).sample([n_states]).clamp_min(EPS).log()
+            logits = Dirichlet(torch.ones(n_categories, device=device, dtype=DTYPE) * alpha).sample([n_states]).clamp_min(EPS).log()
             return cls(emission_type.lower(), logits, encoder=encoder, device=device)
 
-    def __repr__(self):
-        if self.emission_type == "gaussian":
-            return f"NeuralEmission(Gaussian, n_states={self.n_states}, n_features={self.n_features})"
-        return f"NeuralEmission({self.emission_type.capitalize()}, n_states={self.n_states}, n_categories={self.n_features})"
-
 class NeuralDuration(Duration):
-    """Neural/contextual duration distribution for HSMM states with dynamic DOF and adapters."""
+    """Neural/contextual duration distribution with adapters."""
 
     def __init__(
         self,
@@ -218,6 +207,13 @@ class NeuralDuration(Duration):
         self.context_mode = context_mode.lower()
         self.scale = scale
 
+        self.temporal_adapter = None
+        self.spatial_adapter = None
+        if self.context_mode == "temporal":
+            self.temporal_adapter = nn.Conv1d(n_states, n_states, kernel_size=3, padding=1, bias=False).to(self.device, DTYPE)
+        elif self.context_mode == "spatial":
+            self.spatial_adapter = nn.Linear(n_states, n_states, bias=False).to(self.device, DTYPE)
+
         if self.mode == "poisson":
             self.rate = nn.Parameter(rate if rate is not None else torch.ones(n_states, device=self.device, dtype=DTYPE))
         else:
@@ -226,95 +222,64 @@ class NeuralDuration(Duration):
 
     @property
     def dof(self) -> int:
-        dof = 0
-        if self.mode == "poisson":
-            dof += self.rate.numel()
-        else:
-            dof += self.mean.numel() + self.std.numel()
-        if self.encoder is not None:
+        dof = self.rate.numel() if self.mode == "poisson" else self.mean.numel() + self.std.numel()
+        if self.encoder:
             dof += sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
+        if self.temporal_adapter:
+            dof += sum(p.numel() for p in self.temporal_adapter.parameters() if p.requires_grad)
+        if self.spatial_adapter:
+            dof += sum(p.numel() for p in self.spatial_adapter.parameters() if p.requires_grad)
         return dof
 
-    # ---------------- Contextual Parameters ---------------- #
     def _contextual_params(self, context: Optional[torch.Tensor] = None):
         X = getattr(context, "X", context) if hasattr(context, "X") else context
         if X is not None:
             X = X.to(self.device, DTYPE)
         encoded = self.encoder(X) if self.encoder and X is not None else None
-
         if encoded is not None:
-            if self.temporal_adapter is not None and encoded.ndim == 3:
+            if self.temporal_adapter and encoded.ndim == 3:
                 encoded = encoded.transpose(1, 2)
                 encoded = self.temporal_adapter(encoded)
                 encoded = encoded.transpose(1, 2)
-            if self.spatial_adapter is not None:
+            if self.spatial_adapter:
                 encoded = self.spatial_adapter(encoded)
-
         if self.mode == "poisson":
             rate = F.softplus(encoded).squeeze(-1) if encoded is not None else self.rate
-            if rate.ndim == 1:
-                rate = rate.unsqueeze(0)
             return rate.clamp_min(EPS)
         else:
             if encoded is not None:
                 mean, log_std = torch.chunk(encoded, 2, dim=-1)
             else:
                 mean, log_std = self.mean, self.std.log()
-            if mean.ndim == 1:
-                mean = mean.unsqueeze(0)
-                log_std = log_std.unsqueeze(0)
             return mean, log_std.exp().clamp_min(EPS)
 
-    # ---------------- Forward / Log-Prob ---------------- #
     def forward(self, context: Optional[torch.Tensor] = None, log: bool = False, return_dist: bool = False):
         durations = torch.arange(1, self.max_duration + 1, device=self.device, dtype=DTYPE)
-
         if self.mode == "poisson":
             rate = self._contextual_params(context)
-            logits = durations.unsqueeze(0) * torch.log(rate.unsqueeze(-1)) \
-                     - rate.unsqueeze(-1) - torch.lgamma(durations.unsqueeze(0) + 1)
+            logits = durations.unsqueeze(0) * torch.log(rate.unsqueeze(-1)) - rate.unsqueeze(-1) - torch.lgamma(durations.unsqueeze(0) + 1)
         else:
             mean, std = self._contextual_params(context)
-            logits = -0.5 * ((durations.unsqueeze(0) - mean.unsqueeze(-1)) / std.unsqueeze(-1)) ** 2 \
-                     - torch.log(std.unsqueeze(-1)) - 0.5 * torch.log(2 * torch.pi)
-
+            logits = -0.5 * ((durations.unsqueeze(0) - mean.unsqueeze(-1)) / std.unsqueeze(-1)) ** 2 - torch.log(std.unsqueeze(-1)) - 0.5 * torch.log(2 * torch.pi)
         logits = logits - logits.max(dim=-1, keepdim=True)[0]
         probs = F.softmax(logits, dim=-1)
-
         if return_dist:
             if self.mode == "poisson":
                 return [Poisson(rate[k]) for k in range(self.n_states)]
             else:
                 return [LogNormal(mean[k], std[k]) for k in range(self.n_states)]
-
         return torch.log(probs) if log else probs
 
-    # ---------------- Sampling ---------------- #
     def sample(self, n_samples: int = 1, context: Optional[torch.Tensor] = None, state_indices: Optional[torch.Tensor] = None):
         dists = self.forward(context=context, return_dist=True)
         samples = torch.stack([dist.sample((n_samples,)) for dist in dists], dim=0)
         return samples if state_indices is None else samples[state_indices]
 
-    # ---------------- Device ---------------- #
-    def to(self, device: torch.device):
-        super().to(device)
-        self.device = device
-        if hasattr(self, "rate"):
-            self.rate = nn.Parameter(self.rate.to(device))
-        if hasattr(self, "mean"):
-            self.mean = nn.Parameter(self.mean.to(device))
-        if hasattr(self, "std"):
-            self.std = nn.Parameter(self.std.to(device))
-        if self.encoder:
-            self.encoder.to(device)
-        if self.temporal_adapter:
-            self.temporal_adapter.to(device)
-        if self.spatial_adapter:
-            self.spatial_adapter.to(device)
-        return self
+    def log_prob(self, X: torch.Tensor, context: Optional[torch.Tensor] = None):
+        return self.forward(context=context, log=True)
 
 class NeuralTransition(Transition):
-    """Neural/contextual transition distribution for HSMM states with safe logits and dynamic DOF."""
+    """Neural/contextual transition distribution with safe logits and adapters."""
 
     def __init__(
         self,
@@ -339,52 +304,33 @@ class NeuralTransition(Transition):
             uniform = torch.full((n_states, n_states), 1.0 / n_states, device=self.device, dtype=DTYPE)
             self.logits = nn.Parameter(torch.log(uniform.clamp_min(EPS)))
 
-        # Optional context adapters
-        if self.context_mode == "temporal":
-            self.temporal_adapter = nn.Conv1d(
-                in_channels=n_states,
-                out_channels=n_states,
-                kernel_size=3,
-                padding=1,
-                bias=False
-            ).to(self.device, DTYPE)
-        else:
-            self.temporal_adapter = None
-
-        if self.context_mode == "spatial":
-            self.spatial_adapter = nn.Linear(n_states, n_states, bias=False).to(self.device, DTYPE)
-        else:
-            self.spatial_adapter = None
+        self.temporal_adapter = nn.Conv1d(n_states, n_states, kernel_size=3, padding=1, bias=False).to(self.device, DTYPE) if self.context_mode == "temporal" else None
+        self.spatial_adapter = nn.Linear(n_states, n_states, bias=False).to(self.device, DTYPE) if self.context_mode == "spatial" else None
 
     @property
     def dof(self) -> int:
-        """Dynamic DOF including base logits, encoder, and adapters."""
-        dof = self.n_states * (self.n_states - 1)  # row-stochastic logits
+        dof = self.n_states * (self.n_states - 1)
         if self.encoder:
             dof += sum(p.numel() for p in self.encoder.parameters() if p.requires_grad)
-        if getattr(self, "temporal_adapter", None):
+        if self.temporal_adapter:
             dof += sum(p.numel() for p in self.temporal_adapter.parameters() if p.requires_grad)
-        if getattr(self, "spatial_adapter", None):
+        if self.spatial_adapter:
             dof += sum(p.numel() for p in self.spatial_adapter.parameters() if p.requires_grad)
         return dof
 
-    # ---------------- Safe Contextual Logits ---------------- #
-    def contextual_logits(self, theta: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def contextual_logits(self, theta: Optional[torch.Tensor] = None):
         base_logits = self.logits.clone()
-
         if self.encoder is not None and theta is not None:
             X = getattr(theta, "X", theta)
             out = self.encoder(X)
             if isinstance(out, tuple):
                 out = out[0]
-
-            if out.ndim == 2 and out.shape[1] == self.n_states**2:
+            if out.ndim == 2 and out.shape[1] == self.n_states ** 2:
                 out = out.view(-1, self.n_states, self.n_states)
             elif out.ndim == 3 and out.shape[1:] == (self.n_states, self.n_states):
                 pass
             else:
                 out = out.view(-1, self.n_states, self.n_states)
-
             delta = torch.tanh(out) * self.scale
             base_logits = base_logits.unsqueeze(0).expand_as(delta) + delta
 
@@ -398,75 +344,22 @@ class NeuralTransition(Transition):
             delta = self.spatial_adapter(theta)
             base_logits = base_logits + delta
 
-        base_logits = base_logits / self.temperature
-        safe_logits = F.log_softmax(base_logits, dim=-1)
-
-        if torch.isnan(safe_logits).any() or torch.isinf(safe_logits).any():
-            safe_logits = torch.log(torch.full_like(safe_logits, 1.0 / self.n_states))
-
+        safe_logits = F.log_softmax(base_logits / self.temperature, dim=-1)
+        safe_logits = torch.where(torch.isnan(safe_logits) | torch.isinf(safe_logits),
+                                  torch.log(torch.full_like(safe_logits, 1.0 / self.n_states)), safe_logits)
         return safe_logits
 
-    # ---------------- EM Update ---------------- #
     def update(self, posterior: torch.Tensor, inplace: bool = True):
         posterior = posterior / posterior.sum(dim=-1, keepdim=True).clamp_min(EPS)
         logits = torch.log(posterior.to(self.device, DTYPE))
-
         if inplace:
             self.logits.data.copy_(logits)
             return self
+        return NeuralTransition(self.n_states, logits=logits, encoder=self.encoder, context_mode=self.context_mode,
+                                device=self.device, scale=self.scale, temperature=self.temperature)
 
-        return NeuralTransition(
-            n_states=self.n_states,
-            logits=logits,
-            encoder=self.encoder,
-            context_mode=self.context_mode,
-            device=self.device,
-            scale=self.scale,
-            temperature=self.temperature,
-        )
-
-    # ---------------- Initialization ---------------- #
-    @classmethod
-    def initialize(
-        cls,
-        n_states: int,
-        alpha: float = 1.0,
-        batch: int = 1,
-        encoder: Optional[nn.Module] = None,
-        device: Optional[torch.device] = None,
-        scale: float = 0.1,
-        temperature: float = 1.0,
-    ):
-        device = device or torch.device("cpu")
-        probs = torch.distributions.Dirichlet(
-            torch.ones(n_states, device=device, dtype=DTYPE) * alpha
-        ).sample([batch])
-        if batch == 1:
-            probs = probs.squeeze(0)
-
-        return cls(
-            n_states=n_states,
-            logits=torch.log(probs.clamp_min(EPS)),
-            encoder=encoder,
-            device=device,
-            scale=scale,
-            temperature=temperature,
-        )
-
-    # ---------------- Device Management ---------------- #
-    def to(self, device: torch.device):
-        super().to(device)
-        self.device = device
-        if hasattr(self, "logits"):
-            self.logits.data = self.logits.data.to(device)
-            self.logits = nn.Parameter(self.logits.data)
-        if self.encoder:
-            self.encoder.to(device)
-        if self.temporal_adapter:
-            self.temporal_adapter.to(device)
-        if self.spatial_adapter:
-            self.spatial_adapter.to(device)
-        return self
+    def forward(self, theta: Optional[torch.Tensor] = None):
+        return self.contextual_logits(theta)
 
 
 @dataclass
@@ -854,6 +747,17 @@ class NeuralHSMM(HSMM):
         return torch.cat([theta, ctx], dim=-1)
 
     def _contextual_emission_pdf(self, X: torch.Tensor, theta: Optional[torch.Tensor] = None, scale: Optional[float] = None):
+        """
+        Compute context-modulated emission PDF.
+
+        Args:
+            X (torch.Tensor): Observation tensor (optional, not used for computing base PDF here).
+            theta (torch.Tensor, optional): Context tensor for modulation.
+            scale (float, optional): Scaling factor for context modulation.
+
+        Returns:
+            torch.distributions.Distribution: Modulated emission distribution.
+        """
         scale = scale or getattr(self.config, "emission_scale", 1.0)
         pdf = self.pdf
         if pdf is None:
@@ -864,16 +768,21 @@ class NeuralHSMM(HSMM):
             return pdf
 
         try:
-            delta = self.ctx_emission(combined) if getattr(self, "ctx_emission", None) else combined[..., :self.n_states * self.n_features]
+            # Compute delta using context module if exists
+            if hasattr(self, "ctx_emission") and self.ctx_emission is not None:
+                delta = self.ctx_emission(combined)
+            else:
+                delta = combined[..., :self.n_states * self.n_features]
+
             delta = delta.to(self.device, DTYPE)
             if delta.ndim == 1:
-                delta = delta.unsqueeze(0)
+                delta = delta.unsqueeze(0)  # ensure batch dim
+
+            # Ensure correct delta shape: (B, n_states, n_features)
             B = delta.shape[0]
-
             if delta.shape[1] != self.n_states * self.n_features:
-                print(f"[contextual_emission_pdf] delta.shape mismatch ({delta.shape[1]}), using base PDF")
+                print(f"[contextual_emission_pdf] delta shape mismatch ({delta.shape[1]}), using base PDF")
                 return pdf
-
             delta = delta.view(B, self.n_states, self.n_features)
             delta = scale * torch.tanh(delta)
             delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
@@ -886,42 +795,58 @@ class NeuralHSMM(HSMM):
         if isinstance(pdf, Categorical):
             logits = pdf.logits.to(self.device, DTYPE)
             if logits.ndim == 1:
-                logits = logits.unsqueeze(0).expand(B, -1)
-            logits = logits + delta.mean(dim=-1)
+                logits = logits.unsqueeze(0).expand(B, -1)  # broadcast batch
+            # Apply mean delta per state
+            logits = logits + delta.mean(dim=-1)  # (B, n_states)
             logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
             return Categorical(logits=logits)
 
         elif isinstance(pdf, MultivariateNormal):
             mean = pdf.mean.to(self.device, DTYPE)
-            mean = mean.unsqueeze(0) + delta if mean.ndim == 2 else mean + delta
             cov = pdf.covariance_matrix.to(self.device, DTYPE).clamp_min(1e-6)
+            if mean.ndim == 1:
+                mean = mean.unsqueeze(0).expand(B, -1)  # broadcast batch
+            elif mean.ndim == 2 and mean.shape[0] != B:
+                mean = mean.unsqueeze(0).expand(B, -1, -1)
+            mean = mean + delta
             return MultivariateNormal(loc=mean, covariance_matrix=cov)
 
         else:
             print(f"[contextual_emission_pdf] Unsupported PDF type {type(pdf)}, using base PDF")
             return pdf
 
-    def _contextual_duration_pdf(self, theta: Optional[torch.Tensor], scale: float = None, temperature: float = None):
+    def _contextual_duration_pdf(self, theta: Optional[torch.Tensor] = None, scale: Optional[float] = None, temperature: Optional[float] = None):
+        """
+        Compute context-modulated duration probabilities for HSMM states.
+
+        Args:
+            theta (torch.Tensor, optional): Context tensor for modulation.
+            scale (float, optional): Scaling factor for context modulation.
+            temperature (float, optional): Temperature for softmax smoothing.
+
+        Returns:
+            torch.Tensor: Duration probabilities, shape (n_states, max_duration) or (B, n_states, max_duration)
+        """
         scale = scale or getattr(self.config, "duration_scale", 1.0)
-        temperature = temperature or getattr(self.config, "duration_temp", 1.0)
-        temperature = max(temperature, 1e-6)
+        temperature = max(temperature or getattr(self.config, "duration_temp", 1.0), 1e-6)
 
         logits = getattr(self.duration_module, "logits", None)
         if logits is None:
             return self.duration_module.forward(log=False)
 
         combined = self._combine_context(theta)
-        if combined is None or getattr(self, "ctx_duration", None) is None:
+        if combined is None or not hasattr(self, "ctx_duration") or self.ctx_duration is None:
             return F.softmax(logits.to(self.device, DTYPE) / temperature, dim=-1)
 
         try:
             delta = self.ctx_duration(combined).to(self.device, DTYPE)
+            # reshape delta to (B, n_states, max_duration) if needed
             if delta.ndim == 2 and delta.shape[1] == self.n_states * self.max_duration:
                 delta = delta.view(-1, self.n_states, self.max_duration)
                 if delta.shape[0] > 1:
-                    delta = delta.mean(dim=0)
+                    delta = delta.mean(dim=0, keepdim=True)
             elif delta.ndim == 1:
-                delta = delta.view(self.n_states, self.max_duration)
+                delta = delta.view(1, self.n_states, self.max_duration)
             elif delta.ndim == 3 and delta.shape[1:] == (self.n_states, self.max_duration):
                 pass
             else:
@@ -932,50 +857,69 @@ class NeuralHSMM(HSMM):
             delta = torch.zeros_like(logits, device=self.device, dtype=DTYPE)
 
         logits = logits.to(self.device, DTYPE)
+        # expand logits if batch delta exists
+        if delta.ndim == 3 and delta.shape[0] > 1:
+            logits = logits.unsqueeze(0).expand_as(delta)
+        else:
+            logits = logits.unsqueeze(0)
+
         combined_logits = logits + scale * torch.tanh(delta)
         combined_logits = torch.nan_to_num(combined_logits, nan=0.0, posinf=0.0, neginf=0.0)
+
         return F.softmax(combined_logits / temperature, dim=-1)
 
-    def _contextual_transition_matrix(self, theta: Optional[torch.Tensor], scale: float = None, temperature: float = None):
-        scale = scale if scale is not None else getattr(self.config, "transition_scale", 1.0)
-        temperature = temperature if temperature is not None else getattr(self.config, "transition_temp", 1.0)
-        temperature = max(temperature, 1e-6)
+    def _contextual_transition_matrix(self, theta: Optional[torch.Tensor] = None, scale: Optional[float] = None, temperature: Optional[float] = None):
+        """
+        Compute context-modulated transition probabilities for HSMM states.
+
+        Args:
+            theta (torch.Tensor, optional): Context tensor for modulation.
+            scale (float, optional): Scaling factor for context modulation.
+            temperature (float, optional): Temperature for softmax smoothing.
+
+        Returns:
+            torch.Tensor: Transition probabilities, shape (n_states, n_states) or (B, n_states, n_states)
+        """
+        scale = scale or getattr(self.config, "transition_scale", 1.0)
+        temperature = max(temperature or getattr(self.config, "transition_temp", 1.0), 1e-6)
 
         logits = getattr(self.transition_module, "logits", None)
         if logits is None:
             return self.transition_module.forward(log=False)
 
         combined = self._combine_context(theta)
-        if combined is None or getattr(self, "ctx_transition", None) is None:
+        if combined is None or not hasattr(self, "ctx_transition") or self.ctx_transition is None:
             return F.softmax(logits.to(self.device, DTYPE) / temperature, dim=-1)
 
         try:
-            delta = self.ctx_transition(combined)
+            delta = self.ctx_transition(combined).to(self.device, DTYPE)
+            # reshape delta to (B, n_states, n_states)
             if delta.ndim == 2 and delta.shape[1] == self.n_states * self.n_states:
                 delta = delta.view(-1, self.n_states, self.n_states)
+                if delta.shape[0] > 1:
+                    delta = delta.mean(dim=0, keepdim=True)
             elif delta.ndim == 1:
                 delta = delta.view(1, self.n_states, self.n_states)
             elif delta.ndim == 3 and delta.shape[1:] == (self.n_states, self.n_states):
                 pass
             else:
-                raise RuntimeError(f"Unexpected delta shape: {delta.shape}")
-
-            delta = scale * torch.tanh(delta)
-            delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
-
+                print(f"[contextual_transition_matrix] Unexpected delta shape: {delta.shape}, using base logits")
+                delta = torch.zeros_like(logits, device=self.device, dtype=DTYPE)
         except Exception as e:
             print(f"[contextual_transition_matrix] Failed to compute delta: {e}, using base logits")
             delta = torch.zeros_like(logits, device=self.device, dtype=DTYPE)
 
         logits = logits.to(self.device, DTYPE)
-        logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
-
+        # expand logits if batch delta exists
         if delta.ndim == 3 and delta.shape[0] > 1:
             logits = logits.unsqueeze(0).expand_as(delta)
-        elif delta.ndim == 3 and delta.shape[0] == 1:
+        else:
             logits = logits.unsqueeze(0)
 
-        return F.softmax((logits + delta) / temperature, dim=-1)
+        combined_logits = logits + scale * torch.tanh(delta)
+        combined_logits = torch.nan_to_num(combined_logits, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return F.softmax(combined_logits / temperature, dim=-1)
 
     def encode_observations(
         self,

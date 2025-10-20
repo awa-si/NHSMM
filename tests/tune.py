@@ -1,8 +1,28 @@
+#!/usr/bin/env python3
+"""
+Enhanced Optuna tuning script for NeuralHSMM.
+
+Features:
+- configurable regimes/durations
+- multi-feature + optional context support
+- robust internal tuning
+- picklable trial.user_attrs (state_means, duration_logits, model_state, model_build_params)
+- atomic save/load of best trial + model reconstruction
+- logging and reproducibility (seeds)
+"""
+
+import os
+import optuna
+import pickle
+import logging
+import traceback
+import numpy as np
+from typing import Tuple, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import optuna
-import numpy as np
+
 from sklearn.metrics import confusion_matrix
 from scipy.optimize import linear_sum_assignment
 
@@ -10,23 +30,54 @@ from nhsmm.models.neural import NeuralHSMM, NHSMMConfig
 from nhsmm.defaults import DTYPE
 from nhsmm import constraints
 
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger(__name__)
+
+
+MODEL_LOAD = False
+MIN_N_STATES = 3
+MAX_N_STATES = 5
+MIN_DURATION = 10
+MAX_DURATION = 60
+DEFAULT_N_FEATURES = 3
+DEFAULT_CONTEXT_DIM = 2
+N_TRIALS = 40
+
+PATH_TRIAL = "./best_trial.pkl"
+PATH_MODEL = "./best_model.pt"
+DEFAULT_SEED = 0
+
 # -------------------------
-# Best permutation accuracy
+# Reproducibility seeds
 # -------------------------
-def best_permutation_accuracy(true, pred, n_classes):
+torch.manual_seed(DEFAULT_SEED)
+np.random.seed(DEFAULT_SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(DEFAULT_SEED)
+
+# -------------------------
+# Utilities
+# -------------------------
+def best_permutation_accuracy(true, pred, n_classes: int) -> Tuple[float, np.ndarray]:
     C = confusion_matrix(true, pred, labels=list(range(n_classes)))
     row_ind, col_ind = linear_sum_assignment(-C)
     mapping = {col: row for row, col in zip(row_ind, col_ind)}
     mapped_pred = np.array([mapping.get(p, p) for p in pred])
-    acc = (mapped_pred == true).mean()
+    acc = float((mapped_pred == true).mean())
     return acc, mapped_pred
 
 # -------------------------
-# CNN+LSTM encoder
+# CNN + LSTM Encoder
 # -------------------------
 class CNN_LSTM_Encoder(nn.Module):
-    def __init__(self, n_features, hidden_dim=32, cnn_channels=16, kernel_size=3,
-                 dropout=0.1, bidirectional=True, normalize=True):
+    def __init__(self, n_features: int, hidden_dim: int = 32, cnn_channels: int = 16,
+                 kernel_size: int = 3, dropout: float = 0.1, bidirectional: bool = True,
+                 normalize: bool = True):
         super().__init__()
         padding = kernel_size // 2
         self.conv1 = nn.Conv1d(n_features, cnn_channels, kernel_size, padding=padding)
@@ -40,10 +91,10 @@ class CNN_LSTM_Encoder(nn.Module):
         )
         self.out_dim = hidden_dim * (2 if bidirectional else 1)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (T, F) or (B, T, F) expected depending on caller; in our usage we pass (B, T, F)
         x = x.transpose(1, 2)
-        x = self.conv1(x)
-        x = F.relu(x)
+        x = F.relu(self.conv1(x))
         x = x.transpose(1, 2)
         x = self.norm(x)
         x = self.dropout(x)
@@ -52,64 +103,55 @@ class CNN_LSTM_Encoder(nn.Module):
         return out[:, -1, :]
 
 # -------------------------
-# Synthetic Gaussian sequence
+# Gaussian sequence generator
 # -------------------------
-def generate_gaussian_sequence(n_states=3, n_features=1, seg_len_range=(5,20),
-                               n_segments_per_state=3, seed=0, noise_scale=0.05,
-                               context_dim=None):
+def generate_gaussian_sequence(n_states: int = MIN_N_STATES, n_features: int = DEFAULT_N_FEATURES,
+                               seg_len_range: Tuple[int, int] = (5, 20), n_segments_per_state: int = 3,
+                               seed: int = DEFAULT_SEED, noise_scale: float = 0.05, context_dim: Optional[int] = None):
     rng = np.random.default_rng(seed)
-    states_list, X_list, C_list = [], [], []
     base_means = rng.uniform(-1.0, 1.0, size=(n_states, n_features))
+    X_list, states_list, C_list = [], [], []
+
     for s in range(n_states):
         for _ in range(n_segments_per_state):
-            L = int(rng.integers(seg_len_range[0], seg_len_range[1]+1))
-            noise = rng.normal(scale=noise_scale, size=(L, n_features))
-            segment_obs = base_means[s] + noise
+            L = int(rng.integers(seg_len_range[0], seg_len_range[1] + 1))
+            segment_obs = base_means[s] + rng.normal(scale=noise_scale, size=(L, n_features))
             X_list.append(segment_obs)
-            states_list.extend([s]*L)
-            if context_dim is not None and context_dim > 0:
+            states_list.extend([s] * L)
+            if context_dim:
                 C_list.append(rng.normal(scale=0.5, size=(L, context_dim)))
+
     X = np.vstack(X_list)
-    states = np.array(states_list)
-    if context_dim is not None and context_dim > 0:
-        C = np.vstack(C_list)
-        return states, torch.tensor(X, dtype=DTYPE), torch.tensor(C, dtype=DTYPE)
-    return states, torch.tensor(X, dtype=DTYPE), None
+    states = np.array(states_list, dtype=int)
+    C = np.vstack(C_list) if context_dim else None
+    return states, torch.tensor(X, dtype=DTYPE), torch.tensor(C, dtype=DTYPE) if C is not None else None
 
 # -------------------------
-# Robust internal GPU-parallel tuning
+# Internal tuning
 # -------------------------
-def internal_tune(model, X, n_states, max_duration, hidden_dim, cnn_channels, dropout,
-                  bidirectional, trial, n_candidates=8, debug=False):
+def internal_tune(model: NeuralHSMM, X: torch.Tensor, n_states: int, max_duration: int, hidden_dim: int, cnn_channels: int, dropout: float, bidirectional: bool, trial: optuna.trial.Trial, n_candidates: int = 8):
     device = X.device
-    dtype = DTYPE  # float64 enforced globally
 
-    # --- Helper: generate valid transition logits candidates ---
-    def init_masked_transition_logits(model, n_candidates, debug=True):
+    def init_transition_logits(n_candidates_local: int):
         K = model.n_states
-        transition_type = getattr(model, "transition_type", constraints.Transitions.ERGODIC)
         logits_list = []
-        for i in range(n_candidates):
+        for i in range(n_candidates_local):
             try:
-                probs = constraints.sample_transition(model.alpha, K, transition_type, device=device)
-                probs = probs.to(dtype=dtype)
-                if debug:
-                    print(f"[internal_tune][debug] Candidate {i} transition matrix:\n{probs}")
-                logits = torch.log(probs.clamp_min(1e-12))
-                logits_list.append(logits)
+                probs = constraints.sample_transition(
+                    model.alpha, K,
+                    getattr(model, "transition_type", constraints.Transitions.SEMI),
+                    device=device
+                )
+                logits_list.append(torch.log(probs.clamp_min(1e-12)))
             except Exception as e:
-                print(f"[internal_tune][warn] Transition sampling failed for candidate {i}: {e}")
-                logits_list.append(torch.zeros((K, K), device=device, dtype=dtype))
-        return torch.stack(logits_list, dim=0).to(dtype=dtype, device=device)
+                logger.warning(f"[internal_tune] Transition logits sampling failed for candidate {i}: {e}")
+                logits_list.append(torch.zeros((K, K), device=device, dtype=DTYPE))
+        return torch.stack(logits_list, dim=0)
 
-    # --- Duration logits normalized ---
-    duration_logits_batch = torch.randn(n_candidates, n_states, max_duration, device=device, dtype=dtype)
+    transition_logits_batch = init_transition_logits(n_candidates)
+    duration_logits_batch = torch.randn(n_candidates, n_states, max_duration, device=device, dtype=DTYPE)
     duration_logits_batch -= torch.logsumexp(duration_logits_batch, dim=-1, keepdim=True)
 
-    # --- Transition logits strictly valid ---
-    transition_logits_batch = init_masked_transition_logits(model, n_candidates, debug=debug)
-
-    # --- Encoder parameters per candidate ---
     encoder_params_batch = []
     for i in range(n_candidates):
         encoder_params_batch.append({
@@ -123,103 +165,89 @@ def internal_tune(model, X, n_states, max_duration, hidden_dim, cnn_channels, dr
     for i in range(n_candidates):
         configs.append({
             "encoder_params": encoder_params_batch[i],
-            "duration_logits": duration_logits_batch[i].to(dtype=dtype, device=device),
-            "transition_logits": transition_logits_batch[i].to(dtype=dtype, device=device),
+            "duration_logits": duration_logits_batch[i],
+            "transition_logits": transition_logits_batch[i],
         })
 
-    # --- Try tuning ---
     try:
-        scores = model.tune(X, lengths=[len(X)], configs=configs, verbose=debug)
+        scores = model.tune(X, lengths=[len(X)], configs=configs, verbose=False)
         best_idx = max(scores, key=scores.get)
         best_cfg = configs[best_idx]
+        logger.info(f"[internal_tune] Applied candidate {best_idx} with score {scores[best_idx]:.4f}")
 
-        # --- Safe assign helper ---
-        def safe_assign(field, value):
-            if not hasattr(model, field):
-                print(f"[internal_tune][skip] Field '{field}' not found — skipping.")
-                return False
-            try:
+        # Safely assign normalized duration/transition logits if shapes match
+        for field in ["duration_logits", "transition_logits"]:
+            if hasattr(model, field):
+                val = best_cfg[field].to(device=device, dtype=DTYPE)
                 param = getattr(model, field)
-                if value.dtype != dtype:
-                    if debug:
-                        print(f"[internal_tune][cast] Auto-upcasting {field} from {value.dtype} → {dtype}")
-                    value = value.to(dtype=dtype)
-                if value.device != device:
-                    value = value.to(device)
-                if param.shape != value.shape:
-                    print(f"[internal_tune][skip] Shape mismatch for '{field}': {param.shape} vs {value.shape}")
-                    return False
-                # Optional: normalize if not row-stochastic
-                if "transition" in field:
-                    value = value - torch.logsumexp(value, dim=-1, keepdim=True)
-                elif "duration" in field:
-                    value = value - torch.logsumexp(value, dim=-1, keepdim=True)
-                param.data.copy_(value)
-                return True
-            except Exception as e:
-                print(f"[internal_tune][skip] Could not assign '{field}': {e}")
-                return False
+                if param.shape == val.shape:
+                    val = val - torch.logsumexp(val, dim=-1, keepdim=True)
+                    param.data.copy_(val)
 
-        # Assign best params
-        safe_assign("duration_logits", best_cfg["duration_logits"])
-        safe_assign("transition_logits", best_cfg["transition_logits"])
-
-        # --- Encoder rebuild ---
-        enc_params = best_cfg.get("encoder_params", {})
-        kernel_size = 3
-        if hasattr(model, "encoder") and hasattr(model.encoder, "conv1"):
-            kernel_size = getattr(model.encoder.conv1, "kernel_size", (3,))[0]
-
-        try:
-            new_encoder = CNN_LSTM_Encoder(
-                n_features=model.n_features,
-                hidden_dim=enc_params.get("hidden_dim", hidden_dim),
-                cnn_channels=enc_params.get("cnn_channels", cnn_channels),
-                kernel_size=kernel_size,
-                dropout=enc_params.get("dropout", dropout),
-                bidirectional=enc_params.get("bidirectional", bidirectional)
-            ).to(device, dtype=dtype)
-            model.attach_encoder(new_encoder, batch_first=True, pool="mean", n_heads=4)
-        except Exception as e:
-            print(f"[internal_tune][warn] Encoder rebuild failed: {e}")
-
-        best_score = scores.get(best_idx, float('-inf'))
-        print(f"[internal_tune] Applied best candidate #{best_idx} with score={best_score:.4f}")
+        enc_params = best_cfg["encoder_params"]
+        kernel_size = getattr(getattr(model, "encoder", None), "conv1", nn.Conv1d(1, 1, 3)).kernel_size[0]
+        new_encoder = CNN_LSTM_Encoder(
+            n_features=model.n_features,
+            hidden_dim=enc_params.get("hidden_dim", hidden_dim),
+            cnn_channels=enc_params.get("cnn_channels", cnn_channels),
+            kernel_size=kernel_size,
+            dropout=enc_params.get("dropout", dropout),
+            bidirectional=enc_params.get("bidirectional", bidirectional)
+        ).to(device, dtype=DTYPE)
+        model.attach_encoder(new_encoder, batch_first=True, pool="mean", n_heads=4)
 
     except Exception as e:
-        print(f"[internal_tune] Failed during tuning: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error(f"[internal_tune] Failed tuning: {e}\n{traceback.format_exc()}")
+
+# -------------------------
+# Safe emission mean getter
+# -------------------------
+def get_emission_means(model: NeuralHSMM) -> np.ndarray:
+    # emission_module.mu exists on the NeuralEmission wrapper (from your code)
+    if hasattr(model, "emission_module") and hasattr(model.emission_module, "mu"):
+        return model.emission_module.mu.detach().cpu().numpy()
+    raise AttributeError("NeuralHSMM emission means not found")
+
+# -------------------------
+# Market regime tie-breaker
+# -------------------------
+def market_tie_breaker_from_attrs(trial_obj: optuna.trial.FrozenTrial) -> float:
+    means = trial_obj.user_attrs["state_means"]
+    durations = trial_obj.user_attrs.get("duration_logits", np.ones_like(means))
+    min_dist = np.min([np.linalg.norm(means[i] - means[j])
+                       for i in range(means.shape[0]) for j in range(i + 1, means.shape[0])]) if means.shape[0] > 1 else float("inf")
+    duration_penalty = np.sum(durations.sum(axis=-1) < 3)
+    return float(min_dist - 0.1 * duration_penalty)
 
 # -------------------------
 # Optuna objective
 # -------------------------
-def objective(trial):
-    n_states = trial.suggest_int("n_states", 2, 6)
-    n_features = trial.suggest_int("n_features", 1, 3)
-    max_duration = trial.suggest_int("max_duration", 10, 60)
-    alpha = trial.suggest_float("alpha", 0.1, 5.0, log=True)
-    n_init = trial.suggest_int("n_init", 1, 3)
-    k_means_init = trial.suggest_categorical("k_means_init", [True, False])
-    context_dim = trial.suggest_int("context_dim", 0, 6)
-    noise_scale = trial.suggest_float("noise_scale", 0.01, 0.2)
-    duration_weight = trial.suggest_float("duration_weight", 0.0, 0.2)
-    n_segments_per_state = trial.suggest_int("n_segments_per_state", 1, 4)
+def objective(trial: optuna.trial.Trial) -> float:
 
-    hidden_dim = trial.suggest_int("hidden_dim", 16, 64, step=16)
-    cnn_channels = trial.suggest_int("cnn_channels", 8, 32, step=8)
-    kernel_size = trial.suggest_int("kernel_size", 1, 5, step=2)
-    dropout = trial.suggest_float("dropout", 0.0, 0.5)
-    bidirectional = trial.suggest_categorical("bidirectional", [True, False])
+    n_states = int(trial.suggest_int("n_states", MIN_N_STATES, MAX_N_STATES))
+    max_duration = int(trial.suggest_int("max_duration", MIN_DURATION, MAX_DURATION))
+    alpha = float(trial.suggest_float("alpha", 0.1, 5.0, log=True))
+    noise_scale = float(trial.suggest_float("noise_scale", 0.01, 0.2))
+    duration_weight = float(trial.suggest_float("duration_weight", 0.0, 0.2))
+    n_segments_per_state = int(trial.suggest_int("n_segments_per_state", 1, 4))
+    n_init = int(trial.suggest_int("n_init", 1, 3))
+    n_features = DEFAULT_N_FEATURES
+    context_dim = DEFAULT_CONTEXT_DIM
 
+    hidden_dim = int(trial.suggest_int("hidden_dim", 16, 64, step=16))
+    cnn_channels = int(trial.suggest_int("cnn_channels", 8, 32, step=8))
+    kernel_size = int(trial.suggest_int("kernel_size", 1, 5, step=2))
+    dropout = float(trial.suggest_float("dropout", 0.0, 0.5))
+    bidirectional = bool(trial.suggest_categorical("bidirectional", [True, False]))
+
+    # Generate synthetic sequence
     true_states, X, C = generate_gaussian_sequence(
-        n_states=n_states,
-        n_features=n_features,
-        seg_len_range=(5,20),
+        n_states=n_states, n_features=n_features,
+        seg_len_range=(5, 20),
         n_segments_per_state=n_segments_per_state,
-        seed=0,
+        seed=DEFAULT_SEED,
         noise_scale=noise_scale,
-        context_dim=context_dim if context_dim>0 else None
+        context_dim=context_dim
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -241,11 +269,11 @@ def objective(trial):
         n_features=n_features,
         max_duration=max_duration,
         alpha=alpha,
-        seed=0,
+        seed=DEFAULT_SEED,
         emission_type="gaussian",
         encoder=encoder,
         device=device,
-        context_dim=context_dim if context_dim>0 else None,
+        context_dim=context_dim,
         min_covar=1e-6
     )
 
@@ -254,34 +282,237 @@ def objective(trial):
     model.to(device)
 
     try:
-        init_method = "kmeans" if k_means_init else "moment"
-        X_init = X.detach().cpu().numpy() if init_method=="kmeans" else X
-        model.initialize_emissions(X_init, method=init_method)
-    except Exception:
-        pass
-
-    model.fit(X=X, max_iter=20, n_init=n_init, tol=1e-4, verbose=False, sample_D_from_X=True)
-    internal_tune(model, X, n_states, max_duration, hidden_dim, cnn_channels, dropout, bidirectional, trial, n_candidates=8)
+        model.initialize_emissions(X.detach().cpu().numpy(), method="kmeans")
+    except Exception as e:
+        logger.warning(f"[objective] initialize_emissions failed: {e}", exc_info=True)
 
     try:
-        pred = model.decode(X, context=C, duration_weight=duration_weight, algorithm="viterbi") if C is not None else model.decode(X, duration_weight=duration_weight, algorithm="viterbi")
+        model.fit(X=X, max_iter=20, n_init=n_init, tol=1e-4, verbose=False, sample_D_from_X=True)
+    except Exception as e:
+        logger.error(f"[objective] model.fit failed: {e}\n{traceback.format_exc()}")
+        raise
+
+    # internal_tune may mutate model and attach a new encoder
+    internal_tune(model, X, n_states, max_duration, hidden_dim, cnn_channels, dropout, bidirectional, trial)
+
+    try:
+        pred = model.decode(X, context=C, duration_weight=duration_weight, algorithm="viterbi")
     except TypeError:
         pred = model.decode(X, duration_weight=duration_weight, algorithm="viterbi")
 
     acc, _ = best_permutation_accuracy(true_states, np.asarray(pred), n_classes=n_states)
+
+    # --- Save picklable arrays + model_state + build params into trial.user_attrs ---
+    try:
+        trial.set_user_attr("state_means", get_emission_means(model))
+    except Exception as e:
+        logger.warning(f"[objective] could not save state_means: {e}", exc_info=True)
+
+    try:
+        if hasattr(model, "duration_logits"):
+            trial.set_user_attr("duration_logits", model.duration_logits.detach().cpu().numpy())
+    except Exception as e:
+        logger.warning(f"[objective] could not save duration_logits: {e}", exc_info=True)
+
+    # Save model weights (CPU tensors) and minimal build params for later reconstruction
+    try:
+        state_dict_cpu = {k: v.cpu() for k, v in model.state_dict().items()}
+        trial.set_user_attr("model_state", state_dict_cpu)
+        trial.set_user_attr("model_build_params", {
+            "n_states": n_states,
+            "n_features": n_features,
+            "max_duration": max_duration,
+            "alpha": alpha,
+            "encoder_params": {
+                "hidden_dim": hidden_dim,
+                "cnn_channels": cnn_channels,
+                "kernel_size": kernel_size,
+                "dropout": dropout,
+                "bidirectional": bidirectional
+            },
+            "context_dim": context_dim,
+            "min_covar": 1e-6
+        })
+    except Exception as e:
+        logger.warning(f"[objective] could not save model_state/build_params: {e}", exc_info=True)
+
     trial.report(acc, step=0)
     if trial.should_prune():
         raise optuna.TrialPruned()
 
+    logger.info(f"[objective] Trial finished (acc={acc:.4f})")
     return acc
 
-# -------------------------
-# Run study
-# -------------------------
-if __name__=="__main__":
-    study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=40)
+# -------------------------------------------------------------
+# Safe partial state_dict loader
+# -------------------------------------------------------------
+def safe_load_state(model, state_dict):
+    """Safely load model weights, skipping mismatched keys."""
+    model_dict = model.state_dict()
+    filtered = {}
+    skipped = []
+    for k, v in state_dict.items():
+        if k in model_dict and model_dict[k].shape == v.shape:
+            filtered[k] = v
+        else:
+            skipped.append(k)
+    missing, unexpected = model.load_state_dict(filtered, strict=False)
+    if skipped:
+        logger.warning(f"Skipped {len(skipped)} mismatched keys: {skipped[:5]}{'...' if len(skipped) > 5 else ''}")
+    if unexpected:
+        logger.warning(f"Ignored unexpected keys: {unexpected}")
+    if missing:
+        logger.warning(f"Missing keys: {missing}")
+    return missing, unexpected, skipped
 
-    print("\nBest trial:")
-    print(f"  Accuracy: {study.best_value:.4f}")
-    print(f"  Params: {study.best_params}")
+# -------------------------------------------------------------
+# Main study runner
+# -------------------------------------------------------------
+def run_study(n_trials: int = N_TRIALS):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Try loading existing model/trial
+    if MODEL_LOAD and (os.path.exists(PATH_TRIAL) and os.path.exists(PATH_MODEL)):
+        logger.info(f"Loading saved trial and model from {PATH_TRIAL} and {PATH_MODEL}")
+        with open(PATH_TRIAL, "rb") as f:
+            best_trial = pickle.load(f)
+
+        try:
+            model_state = torch.load(PATH_MODEL, map_location=device)
+        except Exception as e:
+            logger.error(f"Failed to load model file {PATH_MODEL}: {e}", exc_info=True)
+            return best_trial, None
+
+        build = best_trial.get("user_attrs", {}).get("model_build_params")
+        if build is None:
+            logger.warning("Loaded trial has no model_build_params; returning trial only.")
+            return best_trial, None
+
+        try:
+            enc_p = build["encoder_params"]
+            encoder = CNN_LSTM_Encoder(
+                n_features=build.get("n_features", DEFAULT_N_FEATURES),
+                hidden_dim=enc_p["hidden_dim"],
+                cnn_channels=enc_p["cnn_channels"],
+                kernel_size=enc_p["kernel_size"],
+                dropout=enc_p["dropout"],
+                bidirectional=enc_p["bidirectional"]
+            ).to(device, dtype=DTYPE)
+
+            cfg = NHSMMConfig(
+                n_states=build["n_states"],
+                n_features=build["n_features"],
+                max_duration=build["max_duration"],
+                alpha=build["alpha"],
+                seed=DEFAULT_SEED,
+                emission_type="gaussian",
+                encoder=encoder,
+                device=device,
+                context_dim=build.get("context_dim"),
+                min_covar=build.get("min_covar", 1e-6)
+            )
+            model = NeuralHSMM(cfg).to(device)
+            model.attach_encoder(encoder, batch_first=True, pool="mean", n_heads=4)
+
+            safe_load_state(model, model_state)
+            logger.info("Model successfully rebuilt and weights loaded.")
+            return best_trial, model
+        except Exception as e:
+            logger.error(f"Failed to rebuild model from saved params: {e}\n{traceback.format_exc()}")
+            return best_trial, None
+
+    # ---------------------------------------------------------
+    # Otherwise run Optuna optimization
+    # ---------------------------------------------------------
+    study = optuna.create_study(direction="maximize")
+    logger.info("Starting Optuna study...")
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    best_value = study.best_value
+    best_trials = [t for t in study.trials if t.value == best_value]
+    best_trial_obj = max(best_trials, key=market_tie_breaker_from_attrs)
+
+    best_trial = {
+        "value": best_trial_obj.value,
+        "params": best_trial_obj.params,
+        "user_attrs": best_trial_obj.user_attrs
+    }
+
+    os.makedirs(os.path.dirname(PATH_TRIAL) or ".", exist_ok=True)
+    tmp_model = PATH_MODEL + ".tmp"
+    tmp_trial = PATH_TRIAL + ".tmp"
+    model_state = best_trial_obj.user_attrs.get("model_state", {})
+
+    try:
+        torch.save(model_state, tmp_model)
+        os.replace(tmp_model, PATH_MODEL)
+    except Exception as e:
+        logger.error(f"Failed to save model_state to {PATH_MODEL}: {e}", exc_info=True)
+        try:
+            if os.path.exists(tmp_model):
+                os.remove(tmp_model)
+        except Exception:
+            pass
+
+    try:
+        with open(tmp_trial, "wb") as f:
+            pickle.dump(best_trial, f)
+        os.replace(tmp_trial, PATH_TRIAL)
+    except Exception as e:
+        logger.error(f"Failed to save trial to {PATH_TRIAL}: {e}", exc_info=True)
+        try:
+            if os.path.exists(tmp_trial):
+                os.remove(tmp_trial)
+        except Exception:
+            pass
+
+    logger.info(f"Saved best trial to {PATH_TRIAL}")
+    logger.info(f"Saved model weights to {PATH_MODEL}")
+    logger.info(f"Best trial accuracy: {best_trial['value']:.4f}")
+    logger.info(f"Params: {best_trial['params']}")
+
+    # ---------------------------------------------------------
+    # Attempt rebuild of best model
+    # ---------------------------------------------------------
+    build = best_trial.get("user_attrs", {}).get("model_build_params")
+    if build is None:
+        return best_trial, model_state
+
+    try:
+        enc_p = build["encoder_params"]
+        encoder = CNN_LSTM_Encoder(
+            n_features=build.get("n_features", DEFAULT_N_FEATURES),
+            hidden_dim=enc_p["hidden_dim"],
+            cnn_channels=enc_p["cnn_channels"],
+            kernel_size=enc_p["kernel_size"],
+            dropout=enc_p["dropout"],
+            bidirectional=enc_p["bidirectional"]
+        ).to(device, dtype=DTYPE)
+
+        cfg = NHSMMConfig(
+            n_states=build["n_states"],
+            n_features=build["n_features"],
+            max_duration=build["max_duration"],
+            alpha=build["alpha"],
+            seed=DEFAULT_SEED,
+            emission_type="gaussian",
+            encoder=encoder,
+            device=device,
+            context_dim=build.get("context_dim"),
+            min_covar=build.get("min_covar", 1e-6)
+        )
+        model = NeuralHSMM(cfg).to(device)
+        model.attach_encoder(encoder, batch_first=True, pool="mean", n_heads=4)
+        safe_load_state(model, model_state)
+
+        logger.info("Rebuilt model from best trial (safe partial load successful).")
+        return best_trial, model
+    except Exception as e:
+        logger.error(f"Failed to rebuild model from saved best_trial: {e}\n{traceback.format_exc()}")
+        return best_trial, model_state
+
+# -------------------------
+# Entrypoint
+# -------------------------
+if __name__ == "__main__":
+    run_study()
