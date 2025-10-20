@@ -1044,48 +1044,106 @@ class NeuralHSMM(HSMM):
         context_ids: Optional[torch.Tensor] = None
     ) -> Union[torch.Tensor, "PDFType"]:
         """
-        Top-level forward pass: merge context, encode observations, optionally return emission PDF.
+        Monolithic forward pass: encode observations, merge context, return theta or contextually-modulated PDF.
 
         Args:
-            X: Observation tensor [T, n_features] or [batch, T, n_features].
-            return_pdf: If True, returns the contextually-modulated emission PDF.
+            X: Observation tensor [T, F] or [B, T, F].
+            return_pdf: If True, returns contextually-modulated emission PDF.
             context: Optional raw context features.
-            context_ids: Optional context IDs to embed and merge with raw context.
+            context_ids: Optional IDs to embed and merge with context.
 
         Returns:
-            Theta tensor or emission PDF, depending on return_pdf.
+            Encoded theta tensor [B, H] or [B, T, H], or contextually-modulated emission PDF.
         """
         prev_ctx = self._context
         ctx_list = []
 
-        # Compute context embedding if applicable
+        # --- Build context ---
         if context_ids is not None:
             if self.context_embedding is None:
                 raise ValueError("context_ids provided but no context_embedding defined.")
             ctx_emb = self.context_embedding(context_ids.to(self.device))
             if ctx_emb.ndim == 3:
                 ctx_emb = ctx_emb.mean(dim=1)
-            ctx_list.append(ctx_emb.to(dtype=DTYPE))
+            ctx_list.append(ctx_emb.to(dtype=DTYPE, device=self.device))
 
-        # Include raw context if provided
         if context is not None:
-            ctx_list.append(context.to(device=self.device, dtype=DTYPE))
+            ctx_list.append(context.to(dtype=DTYPE, device=self.device))
 
-        # Merge contexts if any
         ctx = torch.cat(ctx_list, dim=-1) if ctx_list else None
         if ctx is not None:
             self.set_context(ctx)
 
-        # Encode observations
-        theta = self.encode_observations(X)
+        # --- Encode observations ---
+        theta = self.encode_observations(X)  # [B, H] or [B, T, H]
 
-        if return_pdf:
-            pdf = self._contextual_emission_pdf(X, theta)
+        # --- Early return: just theta ---
+        if not return_pdf:
             self._context = prev_ctx
-            return pdf
+            return theta
+
+        # --- Contextual emission PDF ---
+        pdf = self.pdf
+        if pdf is None:
+            self._context = prev_ctx
+            return None
+
+        # Merge context + encoder
+        combined = self._combine_context(theta)
+        delta = None
+        try:
+            if combined is not None and self.ctx_emission is not None:
+                delta = self.ctx_emission(combined)
+            elif combined is not None:
+                delta = combined[..., :self.n_states * self.n_features]
+        except Exception as e:
+            print(f"[forward] ctx_emission failed: {e}")
+            delta = None
+
+        # --- Safe delta reshaping ---
+        if delta is not None:
+            delta = delta.to(self.device, DTYPE)
+            if delta.ndim == 1:
+                delta = delta.unsqueeze(0)
+            B = max(1, delta.shape[0])
+            expected = self.n_states * self.n_features
+            if delta.numel() < expected * B:
+                delta = delta.flatten().repeat(B)[:expected*B]
+            delta = delta.view(B, self.n_states, self.n_features)
+            delta = getattr(self.config, "emission_scale", 1.0) * torch.tanh(delta)
+
+        # --- Apply delta to PDF ---
+        if isinstance(pdf, Categorical):
+            logits = pdf.logits.to(self.device, DTYPE)
+            if logits.ndim == 1:
+                logits = logits.unsqueeze(0).expand(B, -1)
+            if delta is not None:
+                logits = logits + delta.mean(dim=-1)
+            # sanitize
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                logits = torch.log(torch.full_like(logits, 1.0 / self.n_features))
+            pdf_mod = Categorical(logits=logits)
+            # Dynamic DOF
+            self.emission_module.dof_dynamic = self.n_states * (pdf_mod.logits.shape[-1] - 1)
+
+        elif isinstance(pdf, MultivariateNormal):
+            mean = pdf.mean.to(self.device, DTYPE)
+            cov = pdf.covariance_matrix.to(self.device, DTYPE).clamp_min(1e-6)
+            if mean.ndim == 2:
+                mean = mean.unsqueeze(0)
+            if delta is not None:
+                mean = mean + delta
+            pdf_mod = MultivariateNormal(loc=mean, covariance_matrix=cov)
+            # Dynamic DOF
+            nS = mean.shape[-2]
+            nF = mean.shape[-1]
+            self.emission_module.dof_dynamic = nS * (2 * nF)
+
+        else:
+            pdf_mod = pdf
 
         self._context = prev_ctx
-        return theta
+        return pdf_mod
 
     def predict(
         self,
@@ -1097,74 +1155,102 @@ class NeuralHSMM(HSMM):
         batch_size: int = 256,
     ) -> list[torch.Tensor]:
         """
-        Context-aware prediction wrapper with safe handling for batch dimensions.
+        Monolithic, batch-safe, context-aware prediction with dynamic DOF handling.
 
         Args:
-            X: Observations (T x features) or batch (B x T x features)
-            lengths: Optional sequence lengths for padded batch
-            algorithm: "viterbi" or "map"
-            context: Optional context tensor (B x T x C)
-            context_ids: Optional context IDs (for embedding lookups)
-            batch_size: Batch size for prediction
+            X: Observations [T, F] or [B, T, F].
+            lengths: Optional sequence lengths for padded batch.
+            algorithm: "viterbi" or "map".
+            context: Optional raw context tensor.
+            context_ids: Optional context IDs for embedding.
+            batch_size: Batch size for HSMM prediction.
 
         Returns:
-            List of predicted state sequences (torch.Tensor)
+            List of predicted state sequences (torch.Tensor).
         """
-        # Ensure tensor on correct device
-        if not torch.is_tensor(X):
-            X = torch.as_tensor(X, dtype=DTYPE, device=self.device)
-        else:
+        with torch.no_grad():
+            # ---------------- Device + DType ---------------- #
+            X = X if torch.is_tensor(X) else torch.as_tensor(X, dtype=DTYPE)
             X = X.to(dtype=DTYPE, device=self.device)
 
-        # Forward pass to get encoded context
-        theta = self.forward(X, return_pdf=False, context=context, context_ids=context_ids)
+            # ---------------- Context Handling ---------------- #
+            prev_ctx = self._context
+            ctx_list = []
 
-        # Compute context-aware parameters
-        pdf = self._contextual_emission_pdf(X, theta)
-        transition = self._contextual_transition_matrix(theta)
-        duration = self._contextual_duration_pdf(theta)
+            if context_ids is not None:
+                if self.context_embedding is None:
+                    raise ValueError("context_ids provided but context_embedding is None.")
+                ctx_emb = self.context_embedding(context_ids.to(self.device, DTYPE))
+                if ctx_emb.ndim == 3:
+                    ctx_emb = ctx_emb.mean(dim=1)
+                ctx_list.append(ctx_emb)
 
-        # Backup original parameters
-        prev_pdf = self._params.get("emission_pdf", None)
-        prev_transition_logits = getattr(self, "_transition_logits", None)
-        prev_duration_logits = getattr(self, "_duration_logits", None)
+            if context is not None:
+                ctx_list.append(context.to(dtype=DTYPE, device=self.device))
 
-        # Assign context-aware parameters
-        if pdf is not None:
-            self._params["emission_pdf"] = pdf
+            ctx = torch.cat(ctx_list, dim=-1) if ctx_list else None
+            if ctx is not None:
+                self.set_context(ctx)
 
-        if transition is not None:
-            if isinstance(transition, torch.Tensor):
+            # ---------------- Encode Observations ---------------- #
+            theta = self.encode_observations(X)
+
+            # ---------------- Contextual PDFs ---------------- #
+            try:
+                pdf = self._contextual_emission_pdf(X, theta)
+            except Exception as e:
+                print(f"[predict] emission PDF failed: {e}")
+                pdf = self._params.get("emission_pdf", None)
+
+            try:
+                transition = self._contextual_transition_matrix(theta)
+            except Exception as e:
+                print(f"[predict] transition matrix failed: {e}")
+                transition = getattr(self, "_transition_logits", None)
+
+            try:
+                duration = self._contextual_duration_pdf(theta)
+            except Exception as e:
+                print(f"[predict] duration PDF failed: {e}")
+                duration = getattr(self, "_duration_logits", None)
+
+            # ---------------- Backup & Assign Contextual Params ---------------- #
+            prev_pdf = self._params.get("emission_pdf", None)
+            prev_transition = getattr(self, "_transition_logits", None)
+            prev_duration = getattr(self, "_duration_logits", None)
+
+            if pdf is not None:
+                self._params["emission_pdf"] = pdf
+                if hasattr(pdf, "dof"):
+                    self._dynamic_dof = pdf.dof  # update dynamic DOF if available
+
+            if transition is not None:
                 self._transition_logits = transition
-            else:
-                print(f"[predict] Warning: transition type {type(transition)} unexpected, skipping assignment.")
 
-        if duration is not None:
-            if isinstance(duration, torch.Tensor):
+            if duration is not None:
                 self._duration_logits = duration
-            else:
-                print(f"[predict] Warning: duration type {type(duration)} unexpected, skipping assignment.")
 
-        # Run base HSMM prediction
-        preds = super().predict(X, lengths=lengths, algorithm=algorithm, batch_size=batch_size)
+            # ---------------- Run Base HSMM Prediction ---------------- #
+            preds = super().predict(X, lengths=lengths, algorithm=algorithm, batch_size=batch_size)
 
-        # Restore previous parameters
-        self._params["emission_pdf"] = prev_pdf
-        if prev_transition_logits is not None:
-            self._transition_logits = prev_transition_logits
-        elif hasattr(self, "_transition_logits"):
-            del self._transition_logits
-        if prev_duration_logits is not None:
-            self._duration_logits = prev_duration_logits
-        elif hasattr(self, "_duration_logits"):
-            del self._duration_logits
+            # ---------------- Restore Previous Params ---------------- #
+            self._params["emission_pdf"] = prev_pdf
+            if prev_transition is not None:
+                self._transition_logits = prev_transition
+            elif hasattr(self, "_transition_logits"):
+                del self._transition_logits
+            if prev_duration is not None:
+                self._duration_logits = prev_duration
+            elif hasattr(self, "_duration_logits"):
+                del self._duration_logits
 
-        # Ensure list of tensors
-        if isinstance(preds, torch.Tensor):
-            return [preds]
-        elif isinstance(preds, list):
-            return [p if torch.is_tensor(p) else torch.as_tensor(p, device=self.device) for p in preds]
-        else:
+            self._context = prev_ctx
+
+            # ---------------- Ensure List[Tensor] ---------------- #
+            if isinstance(preds, torch.Tensor):
+                return [preds]
+            if isinstance(preds, list):
+                return [p if torch.is_tensor(p) else torch.as_tensor(p, device=self.device) for p in preds]
             return [torch.as_tensor(preds, device=self.device)]
 
     def decode(
@@ -1175,40 +1261,42 @@ class NeuralHSMM(HSMM):
         context_ids: Optional[torch.Tensor] = None,
         algorithm: Literal["viterbi", "map"] = "viterbi",
     ) -> np.ndarray:
-        """
-        Context-aware decoding wrapper.
-        Encodes observations, applies duration weighting, and returns numpy predictions.
-
-        Args:
-            X: Observations (T x features) or batch (B x T x features)
-            duration_weight: Weighting factor for duration probabilities
-            context: Optional context tensor
-            context_ids: Optional context ID tensor
-            algorithm: "viterbi" or "map"
-
-        Returns:
-            numpy.ndarray of predicted states
-        """
         if not torch.is_tensor(X):
             X = torch.as_tensor(X, dtype=DTYPE, device=self.device)
         else:
             X = X.to(dtype=DTYPE, device=self.device)
 
-        # Forward pass to get encoded context
+        # Encode observations/context
         theta = self.forward(X, return_pdf=False, context=context, context_ids=context_ids)
 
-        # Apply duration weighting
-        _ = self._contextual_transition_matrix(theta, scale=duration_weight)
-        _ = self._contextual_duration_pdf(theta, scale=duration_weight)
-        _ = self._contextual_emission_pdf(X, theta)
+        # Backup original parameters
+        prev_pdf = self._params.get("emission_pdf", None)
+        prev_transition = getattr(self, "_transition_logits", None)
+        prev_duration = getattr(self, "_duration_logits", None)
 
-        # Use improved predict
-        preds_list = self.predict(X, algorithm=algorithm, context=theta, context_ids=context_ids)
+        # Temporarily assign context-aware parameters
+        self._params["emission_pdf"] = self._contextual_emission_pdf(X, theta)
+        self._transition_logits = self._contextual_transition_matrix(theta)
+        self._duration_logits = self._contextual_duration_pdf(theta, scale=duration_weight)
 
-        # Flatten or unify output to numpy
+        # Run prediction
+        preds_list = self.predict(X, algorithm=algorithm)
+
+        # Restore original parameters
+        self._params["emission_pdf"] = prev_pdf
+        if prev_transition is not None:
+            self._transition_logits = prev_transition
+        else:
+            del self._transition_logits
+        if prev_duration is not None:
+            self._duration_logits = prev_duration
+        else:
+            del self._duration_logits
+
+        # Flatten/concatenate batch
         if len(preds_list) == 1:
             out = preds_list[0]
         else:
-            out = torch.stack(preds_list)
+            out = torch.cat(preds_list, dim=0)
 
         return out.detach().cpu().numpy()
