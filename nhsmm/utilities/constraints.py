@@ -3,7 +3,8 @@ from typing import Tuple, Optional, Union
 from dataclasses import dataclass
 import torch
 
-DTYPE = torch.float64
+from nhsmm.defaults import DTYPE, EPS
+
 
 @dataclass(frozen=True)
 class Transitions:
@@ -31,28 +32,52 @@ def _resolve_type(val, dataclass_type) -> str:
         return val
     raise ValueError(f"Expected {dataclass_type} or str, got {type(val)}")
 
+
 def sample_probs(prior: float, target_size: Union[Tuple[int, ...], torch.Size],
                  dtype=DTYPE, device=None) -> torch.Tensor:
     alphas = torch.full(target_size, prior, dtype=dtype, device=device)
     return torch.distributions.Dirichlet(alphas).sample()
 
-def sample_transition(prior: float, n_states: int, A_type: Union[str, Transitions],
-                      dtype=DTYPE, device=None) -> torch.Tensor:
+
+def sample_transition(
+    prior: float,
+    n_states: int,
+    A_type: Union[str, Transitions],
+    device=None,
+    dtype=DTYPE,
+) -> torch.Tensor:
     t = _resolve_type(A_type, Transitions)
+    
+    # Sample base probabilities
     probs = sample_probs(prior, (n_states, n_states), dtype=dtype, device=device)
+    
     if t == Transitions().SEMI:
         probs = probs.clone()
         probs.fill_diagonal_(0.0)
         row_sums = probs.sum(dim=-1, keepdim=True)
-        probs = torch.where(row_sums == 0, torch.ones_like(probs), probs)
+        # Replace zero rows with uniform probability
+        zero_rows = (row_sums == 0)
+        if zero_rows.any():
+            probs[zero_rows.expand_as(probs)] = 1.0
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    
     elif t == Transitions().LEFT_TO_RIGHT:
-        mask = torch.triu(torch.ones_like(probs))
+        mask = torch.triu(torch.ones_like(probs, dtype=dtype, device=device))
         probs = probs * mask
         row_sums = probs.sum(dim=-1, keepdim=True)
-        probs = torch.where(row_sums == 0, mask, probs)
-    elif t != Transitions().ERGODIC:
+        zero_rows = (row_sums == 0)
+        if zero_rows.any():
+            probs[zero_rows.expand_as(probs)] = mask[zero_rows.expand_as(mask)]
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    
+    elif t == Transitions().ERGODIC:
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    
+    else:
         raise NotImplementedError(f"Unsupported Transition type: {t}")
-    return probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    
+    return probs
+
 
 def compute_information_criteria(n_samples: int, log_likelihood: torch.Tensor, dof: int,
                                  criterion: Union[str, InformCriteria]) -> torch.Tensor:

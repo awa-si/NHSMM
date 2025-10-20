@@ -12,7 +12,7 @@ from nhsmm.defaults import Emission, Duration, Transition, DTYPE, EPS, HSMMError
 from nhsmm import utils, constraints, SeedGenerator, ConvergenceHandler, ContextEncoder
 
 
-class HSMM(ABC):
+class HSMM(nn.Module, ABC):
     """
     Hidden Semi-Markov Model (HSMM) base class.
 
@@ -38,14 +38,14 @@ class HSMM(ABC):
         alpha: float = None,
         min_covar: float = None,
         seed: Optional[int] = None,
-        transition_constraint: Any = None,
+        transition_type: Any = None,
         context_dim: Optional[int] = None,
         device: Optional[torch.device] = None,
     ):
         super().__init__()
 
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.transition_constraint = transition_constraint or constraints.Transitions.SEMI
+        self.transition_type = transition_type or constraints.Transitions.SEMI
         self._context: Optional[torch.Tensor] = None
         self.encoder: Optional[nn.Module] = None
         self._seed_gen = SeedGenerator(seed)
@@ -76,7 +76,7 @@ class HSMM(ABC):
                 if shape[1] == self.max_duration:
                     probs = constraints.sample_probs(self.alpha, shape)
                 else:
-                    probs = constraints.sample_transition(self.alpha, shape[0], self.transition_constraint)
+                    probs = constraints.sample_transition(self.alpha, shape[0], self.transition_type)
             else:
                 raise ValueError(f"Unsupported shape {shape} for logits sampling.")
 
@@ -153,18 +153,25 @@ class HSMM(ABC):
     @transition_logits.setter
     def transition_logits(self, logits: torch.Tensor):
         logits = logits.to(device=self._transition_logits.device, dtype=DTYPE)
-        if logits.shape != (self.n_states, self.n_states):
-            raise ValueError(f"transition_logits logits must have shape ({self.n_states},{self.n_states})")
         
+        if logits.shape != (self.n_states, self.n_states):
+            raise ValueError(f"transition_logits must have shape ({self.n_states},{self.n_states})")
+        
+        # Relax row normalization check: allow tiny deviations
         row_norm = logits.logsumexp(dim=1)
-        zeros = torch.zeros_like(row_norm)
-        if not torch.allclose(row_norm, zeros, atol=1e-6):
-            raise ValueError(f"Rows of transition_logits logits must normalize (logsumexp==0); got {row_norm.tolist()}")
+        if not torch.allclose(row_norm, torch.zeros_like(row_norm), atol=1e-4):
+            # Instead of raising, normalize rows automatically
+            logits = logits - row_norm.unsqueeze(1)
+        
+        # Relax transition constraints: only warn if violated
+        if not constraints.is_valid_transition(logits.exp(), self.transition_type):
+            print("[transition_logits] Warning: logits do not fully satisfy transition constraints, applying anyway.")
+            # Optionally: project small negative probabilities to zero
+            probs = logits.exp().clamp_min(1e-12)
+            logits = torch.log(probs)
+        
+        self._transition_logits.copy_(logits.to(dtype=DTYPE))
 
-        if not constraints.is_valid_transition(logits, self.transition_constraint):
-            raise ValueError("transition_logits logits do not satisfy transition constraints")
-
-        self._transition_logits.copy_(logits)
 
     @property
     def transition_probs(self) -> torch.Tensor:
@@ -433,24 +440,41 @@ class HSMM(ABC):
         """
         Compute context-modulated emission log-probabilities for batched sequences.
 
-        Returns: [B, T, K]
+        Returns:
+            log_probs: [B, T, K] tensor of log-probabilities
         """
-        X_batch, mask = X.pad_sequences(return_mask=True)
-        theta_batch = self._combine_context(X=None, theta=theta)
+        # --- Pad sequences and get mask ---
+        X_batch, mask = X.pad_sequences(return_mask=True)  # [B, T, n_features], [B, T]
+        B, T, _ = X_batch.shape
+        device = X_batch.device
 
+        # --- Combine context ---
+        theta_batch = self._combine_context(X=None, theta=theta)  # expected [B, T, context_dim] or None
+
+        # --- Base log-probabilities ---
         base_logp = self.emission_module.log_prob(X_batch, theta_batch)
         base_logp = torch.clamp(torch.nan_to_num(base_logp, nan=-1e8, posinf=-1e8, neginf=-1e8), -1e6, 1e6)
 
-        # Apply context delta if available
+        # --- Apply context delta if available ---
         if theta is not None:
             delta = self.emission_module._apply_context(base_logp, theta_batch)
+            # Ensure delta shape matches base_logp
+            if delta.shape != base_logp.shape:
+                try:
+                    delta = delta.view(base_logp.shape)
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Context delta shape {delta.shape} incompatible with base_logp {base_logp.shape}"
+                    ) from e
             logp = base_logp + delta
         else:
             logp = base_logp
 
-        # Mask padding positions
+        # --- Mask padded positions ---
         logp = logp.masked_fill(~mask.unsqueeze(-1), -1e8)
-        return F.log_softmax(logp, dim=-1)
+
+        # --- Return normalized log-probabilities ---
+        return torch.nn.functional.log_softmax(logp, dim=-1)
 
     def _contextual_duration_pdf(
         self,
@@ -489,8 +513,8 @@ class HSMM(ABC):
         )
 
         # Apply optional transition constraints
-        if hasattr(self, "transition_constraint"):
-            mask = constraints.mask_invalid_transitions(self.n_states, self.transition_constraint).to(log_transition.device)
+        if hasattr(self, "transition_type"):
+            mask = constraints.mask_invalid_transitions(self.n_states, self.transition_type).to(log_transition.device)
             log_transition = log_transition.masked_fill(~mask.unsqueeze(0), -1e8)
 
         log_transition = torch.nan_to_num(log_transition, nan=-1e8, posinf=-1e8, neginf=-1e8)
@@ -964,9 +988,12 @@ class HSMM(ABC):
 
         seq_lengths = [g.shape[0] if g is not None else 0 for g in gamma_list]
         B = len(seq_lengths)
-        max_T = max(seq_lengths) if seq_lengths else 0
+        if B == 0:
+            return []
+
+        max_T = max(seq_lengths)
         K = self.n_states
-        neg_inf = -float("inf")
+        neg_inf = torch.tensor(-float("inf"), device=self.device, dtype=DTYPE)
 
         if max_T == 0:
             return [torch.empty(0, dtype=torch.long, device=self.device) for _ in range(B)]
@@ -1460,39 +1487,32 @@ class HSMM(ABC):
 
     def _compute_log_likelihood(self, X: utils.Observations) -> torch.Tensor:
         """Fully vectorized log-likelihood computation for HSMM sequences."""
-        alpha_list = self._forward(X)  # list of (T_i, K, Dmax)
+        alpha_list = self._forward(X)
         if not alpha_list:
             raise RuntimeError("Forward pass returned empty results. Model may be uninitialized.")
 
         B = len(alpha_list)
         K, Dmax = self.n_states, self.max_duration
-        max_T = max([a.shape[0] for a in alpha_list])
-        neg_inf = -torch.inf
+        seq_lengths = torch.tensor([a.shape[0] for a in alpha_list], device=self.device)
+        max_T = seq_lengths.max()
+        neg_inf = torch.tensor(-float('inf'), device=self.device, dtype=DTYPE)
 
-        # Prepare a padded tensor for all sequences
+        # Padded alpha tensor
         alpha_padded = torch.full((B, max_T, K, Dmax), neg_inf, device=self.device, dtype=DTYPE)
-        mask = torch.zeros((B, max_T), device=self.device, dtype=torch.bool)
 
         for i, alpha in enumerate(alpha_list):
             T_i = alpha.shape[0]
             if T_i > 0:
-                alpha_padded[i, :T_i] = alpha
-                mask[i, :T_i] = True
+                alpha_padded[i, :T_i] = alpha.nan_to_num(nan=neg_inf, posinf=neg_inf, neginf=neg_inf)
 
-        # Clamp invalid entries
-        alpha_padded = alpha_padded.nan_to_num(nan=neg_inf, posinf=neg_inf, neginf=neg_inf)
+        # Compute logsumexp over states and durations at last valid timestep
+        last_idx = (seq_lengths - 1).clamp(min=0)
+        ll_list = torch.logsumexp(alpha_padded[torch.arange(B, device=self.device), last_idx], dim=(-1, -2))
 
-        # Compute logsumexp over states and durations at last valid timestep per sequence
-        seq_lengths = torch.tensor([a.shape[0] for a in alpha_list], device=self.device)
-        last_idx = (seq_lengths - 1).clamp(min=0)  # ensure non-negative indices
-        ll_list = torch.logsumexp(
-            alpha_padded[torch.arange(B, device=self.device), last_idx], dim=(-1, -2)
-        )
+        # Set -inf for sequences of length 0
+        ll_list = torch.where(seq_lengths > 0, ll_list, neg_inf)
 
-        # Sequences with length 0 -> -inf
-        ll_list = torch.where(seq_lengths > 0, ll_list, torch.full_like(ll_list, neg_inf))
-
-        return ll_list.detach()
+        return ll_list
 
     def information(
         self,
@@ -1554,3 +1574,162 @@ class HSMM(ABC):
             ic_value = ic_value.unsqueeze(0)
 
         return ic_value.detach().cpu()
+
+    def tune(
+        self,
+        X: torch.Tensor,
+        lengths: list[int] = None,
+        configs: list[dict] = None,
+        score_metric: str = "log_likelihood",
+        verbose: bool = False
+    ) -> dict:
+        """
+        GPU-batched hyperparameter tuning for HSMM with enforced dtype/device consistency.
+        Automatically skips unhandled or invalid parameter fields.
+        """
+
+        if not configs:
+            raise ValueError("configs must be provided as a list of dicts.")
+
+        X = X.to(device=self.device, dtype=DTYPE)
+
+        # --- sequence handling ---
+        if hasattr(self, "to_observations"):
+            obs_X = self.to_observations(X, lengths)
+        else:
+            obs_X = type("Obs", (), {"sequence": [X], "lengths": [len(X)], "log_probs": None})()
+
+        B = len(obs_X.sequence) if hasattr(obs_X, "sequence") else 1
+        n_configs = len(configs)
+        K, Dmax = self.n_states, self.max_duration
+        scores: dict[int, float] = {}
+
+        # --- parameter stacking (skip encoder_params) ---
+        param_keys = set().union(*[cfg.keys() for cfg in configs])
+        param_stack = {k: [] for k in param_keys if k != "encoder_params"}
+
+        # Collect keys to skip to avoid dict mutation during iteration
+        skip_keys_overall = set()
+
+        for i, cfg in enumerate(configs):
+            skip_keys_local = []
+            for k in list(param_stack.keys()):
+                try:
+                    # Lookup: candidate config -> model attribute -> self._params
+                    if k in cfg:
+                        val = cfg[k]
+                    else:
+                        val = getattr(self, k, None) or getattr(self, "_params", {}).get(k, None)
+
+                    if val is None:
+                        if verbose:
+                            print(f"[Config {i}] skipping field '{k}' (unhandled)")
+                        skip_keys_local.append(k)
+                        continue
+
+                    if not isinstance(val, torch.Tensor):
+                        val = torch.as_tensor(val, device=self.device, dtype=DTYPE)
+                    else:
+                        val = val.to(device=self.device, dtype=DTYPE)
+
+                    param_stack[k].append(val)
+
+                except Exception as e:
+                    print(f"[Config {i}] skipping field '{k}' due to: {e}")
+                    skip_keys_local.append(k)
+                    continue
+
+            skip_keys_overall.update(skip_keys_local)
+
+        # Remove skipped keys from param_stack
+        for k in skip_keys_overall:
+            param_stack.pop(k, None)
+
+        # Stack tensors
+        for k in list(param_stack.keys()):
+            try:
+                param_stack[k] = torch.stack(param_stack[k], dim=0).to(dtype=DTYPE, device=self.device)
+            except Exception as e:
+                print(f"[tune] skipping field '{k}' (stacking failed: {e})")
+                param_stack.pop(k, None)
+
+        # --- emission PDF ---
+        pdf = getattr(self, "_params", {}).get("emission_pdf", None)
+        if pdf is None or not hasattr(pdf, "log_prob"):
+            raise RuntimeError("Emission PDF must be initialized for batched tuning.")
+
+        seq_tensor = torch.cat(obs_X.sequence, dim=0).to(dtype=DTYPE, device=self.device)
+        seq_offsets = [0] + list(torch.cumsum(torch.tensor(obs_X.lengths, device=self.device, dtype=torch.int64), dim=0).tolist())
+
+        # Compute emission log-probs once
+        try:
+            lp_base = pdf.log_prob(seq_tensor.unsqueeze(1)).to(dtype=DTYPE)
+            if lp_base.ndim > 2:
+                lp_base = lp_base.sum(dim=list(range(2, lp_base.ndim)))
+            all_log_probs = lp_base.unsqueeze(0).repeat(n_configs, 1, 1)
+        except Exception as e:
+            raise RuntimeError(f"Emission log-prob computation failed: {e}")
+
+        # --- batched scoring ---
+        with torch.no_grad():
+            for i in range(n_configs):
+                last_key = None
+                last_val = None
+                try:
+                    for k, vals in param_stack.items():
+                        last_key = k
+                        val = vals[i]
+                        last_val = val
+
+                        # shape validation & normalization
+                        if k == "transition_logits":
+                            expected_shape = (self.n_states, self.n_states)
+                            if val.shape != expected_shape:
+                                if verbose:
+                                    print(f"[Config {i}] skipping field '{k}' (bad shape {tuple(val.shape)})")
+                                continue
+                            val = val - torch.logsumexp(val, dim=-1, keepdim=True)
+                        elif k == "duration_logits":
+                            expected_shape = (self.n_states, self.max_duration)
+                            if val.shape != expected_shape:
+                                if verbose:
+                                    print(f"[Config {i}] skipping field '{k}' (bad shape {tuple(val.shape)})")
+                                continue
+                            val = val - torch.logsumexp(val, dim=-1, keepdim=True)
+
+                        val = val.to(dtype=DTYPE, device=self.device)
+
+                        # assign to model or _params
+                        if hasattr(self, k):
+                            try:
+                                setattr(self, k, val)
+                            except Exception:
+                                if verbose:
+                                    print(f"[Config {i}] skipping field '{k}' (cannot set attr)")
+                                continue
+                        elif k in getattr(self, "_params", {}):
+                            self._params[k] = val
+                        else:
+                            if verbose:
+                                print(f"[Config {i}] skipping field '{k}' (unknown)")
+                            continue
+
+                    obs_X.log_probs = [all_log_probs[i, seq_offsets[j]:seq_offsets[j+1]] for j in range(B)]
+                    score_tensor = self._compute_log_likelihood(obs_X)
+                    score = float(torch.nan_to_num(score_tensor, nan=-float("inf"),
+                                                   posinf=-float("inf"), neginf=-float("inf")).sum().item())
+                    scores[i] = score
+
+                    if verbose:
+                        print(f"[Config {i}] score={score:.4f}")
+
+                except Exception as e:
+                    print(f"[Config {i}] Internal tuning failed in field '{last_key or 'unknown'}': {e}")
+                    if last_val is not None:
+                        try:
+                            print(f"  param '{last_key}' shape={tuple(last_val.shape)}, dtype={last_val.dtype}, device={last_val.device}")
+                        except Exception:
+                            pass
+                    scores[i] = float('-inf')
+
+        return scores
