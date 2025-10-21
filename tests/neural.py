@@ -1,3 +1,4 @@
+# tests/neural.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -35,12 +36,39 @@ def generate_gaussian_sequence(n_states=3, n_features=1, seg_len_range=(5, 20),
 # -------------------------
 # Best permutation accuracy
 # -------------------------
-def best_permutation_accuracy(true, pred, n_classes):
-    C = confusion_matrix(true, pred, labels=list(range(n_classes)))
+def best_permutation_accuracy(true: np.ndarray, pred: np.ndarray, n_classes: int):
+    """
+    Compute best-permutation accuracy and return mapped predictions.
+
+    Args:
+        true: Ground truth labels, shape [T] or [B, T].
+        pred: Predicted labels, shape [T] or [B, T].
+        n_classes: Number of states/classes.
+
+    Returns:
+        accuracy: float
+        mapped_pred: np.ndarray of same shape as pred
+    """
+    # Flatten both arrays to 1D for permutation computation
+    true_flat = true.ravel()
+    pred_flat = pred.ravel()
+
+    # Confusion matrix
+    C = confusion_matrix(true_flat, pred_flat, labels=list(range(n_classes)))
+
+    # Solve assignment problem for best permutation
     row_ind, col_ind = linear_sum_assignment(-C)
     mapping = {col: row for row, col in zip(row_ind, col_ind)}
-    mapped_pred = np.array([mapping.get(p, p) for p in pred])
-    return (mapped_pred == true).mean(), mapped_pred
+
+    # Map predictions
+    mapped_flat = np.array([mapping.get(p, p) for p in pred_flat], dtype=true_flat.dtype)
+
+    # Restore original shape
+    mapped_pred = mapped_flat.reshape(pred.shape)
+
+    accuracy = (mapped_pred == true).mean()
+    return accuracy, mapped_pred
+
 
 # -------------------------
 # CNN+LSTM Encoder

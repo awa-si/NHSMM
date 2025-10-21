@@ -7,9 +7,11 @@ from typing import List, Optional, Tuple, Union
 
 @dataclass(frozen=False)
 class Observations:
+
     sequence: List[torch.Tensor]
     log_probs: Optional[List[torch.Tensor]] = None
     lengths: Optional[List[int]] = None
+    context: Optional[List[torch.Tensor]] = None  # NEW: per-sequence context
 
     def __post_init__(self):
         if not self.sequence:
@@ -27,6 +29,12 @@ class Observations:
                 raise ValueError("`log_probs` length must match `sequence` length.")
             if not all(isinstance(lp, torch.Tensor) for lp in self.log_probs):
                 raise TypeError("All elements in `log_probs` must be torch.Tensor.")
+
+        if self.context is not None:
+            if len(self.context) != len(self.sequence):
+                raise ValueError("`context` length must match `sequence` length.")
+            if not all(isinstance(c, torch.Tensor) for c in self.context):
+                raise TypeError("All elements in `context` must be torch.Tensor.")
 
     @property
     def n_sequences(self) -> int:
@@ -59,26 +67,36 @@ class Observations:
     def std(self) -> torch.Tensor:
         return self.as_batch().std(0)
 
+    @property
+    def is_batch(self) -> bool:
+        if not self.sequence:
+            return False
+        return self.n_sequences > 1 or self.sequence[0].shape[0] > 1
+
     def to(self, device: Union[str, torch.device], dtype: Optional[torch.dtype] = None) -> "Observations":
         seqs = [s.to(device=device, dtype=dtype or s.dtype) for s in self.sequence]
         logs = [l.to(device=device, dtype=dtype or l.dtype) for l in self.log_probs] if self.log_probs else None
-        return Observations(seqs, logs, self.lengths)
+        ctxs = [c.to(device=device, dtype=dtype or c.dtype) for c in self.context] if self.context else None
+        return Observations(seqs, logs, self.lengths, ctxs)
 
     def detach(self) -> "Observations":
         seqs = [s.detach() for s in self.sequence]
         logs = [l.detach() for l in self.log_probs] if self.log_probs else None
-        return Observations(seqs, logs, self.lengths)
+        ctxs = [c.detach() for c in self.context] if self.context else None
+        return Observations(seqs, logs, self.lengths, ctxs)
 
     def clone(self) -> "Observations":
         seqs = [s.clone() for s in self.sequence]
         logs = [l.clone() for l in self.log_probs] if self.log_probs else None
-        return Observations(seqs, logs, self.lengths)
+        ctxs = [c.clone() for c in self.context] if self.context else None
+        return Observations(seqs, logs, self.lengths, ctxs)
 
     def __getitem__(self, idx: Union[int, slice]) -> "Observations":
         seqs = self.sequence[idx] if isinstance(idx, slice) else [self.sequence[idx]]
         logs = self.log_probs[idx] if self.log_probs else None
         lens = self.lengths[idx] if isinstance(idx, slice) else [self.lengths[idx]]
-        return Observations(seqs, logs, lens)
+        ctxs = self.context[idx] if self.context else None
+        return Observations(seqs, logs, lens, ctxs)
 
     def as_batch(self) -> torch.Tensor:
         return torch.cat(self.sequence, dim=0)
@@ -87,7 +105,7 @@ class Observations:
         all_obs = self.as_batch()
         mean, std = all_obs.mean(0, keepdim=True), all_obs.std(0, keepdim=True).clamp_min(eps)
         normed = [(s - mean) / std for s in self.sequence]
-        return Observations(normed, self.log_probs, self.lengths)
+        return Observations(normed, self.log_probs, self.lengths, self.context)
 
     def summary(self) -> str:
         return f"{self.n_sequences} seqs | total {self.total_length} steps | dim {self.feature_dim} | device {self.device}"
@@ -101,7 +119,8 @@ class Observations:
         log_pad_value: float = -float("inf"),
         return_mask: bool = False,
         include_log_probs: bool = True,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
+        include_context: bool = False,  # NEW: return padded context
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]]:
         B, T, D = self.n_sequences, max(self.lengths), self.feature_dim
         device, dtype = self.device, self.dtype
 
@@ -121,9 +140,17 @@ class Observations:
                 L = lp.shape[0]
                 log_batch[i, :L] = lp
 
+        ctx_batch = None
+        if include_context and self.context is not None:
+            H = self.context[0].shape[-1]
+            ctx_batch = torch.zeros((B, T, H), dtype=dtype, device=device)
+            for i, c in enumerate(self.context):
+                L = c.shape[0]
+                ctx_batch[i, :L] = c
+
         if return_mask:
-            return seq_batch, mask, log_batch
-        return seq_batch if log_batch is None else (seq_batch, log_batch)
+            return seq_batch, mask, log_batch, ctx_batch
+        return seq_batch if log_batch is None else (seq_batch, log_batch, ctx_batch)
 
 
 @dataclass(frozen=False)

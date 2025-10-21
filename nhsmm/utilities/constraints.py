@@ -53,8 +53,7 @@ def log_normalize(matrix: torch.Tensor, dim: Union[int, Tuple[int, ...]] = -1) -
 # -------------------------
 # Dirichlet / probability sampling
 # -------------------------
-def sample_probs(prior: float, target_size: Union[Tuple[int, ...], torch.Size],
-                 dtype=DTYPE, device=None) -> torch.Tensor:
+def sample_probs(prior: float, target_size: Union[Tuple[int, ...], torch.Size], dtype=DTYPE, device=None) -> torch.Tensor:
     prior = max(prior, EPS)
     alphas = torch.full(target_size, prior, dtype=dtype, device=device)
     return torch.distributions.Dirichlet(alphas).sample()
