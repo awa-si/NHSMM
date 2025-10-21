@@ -344,6 +344,7 @@ class NeuralHSMM(HSMM):
         self.n_features = config.n_features
         self.min_covar = config.min_covar
 
+
         # Neural modules
         self.emission_module = NeuralEmission.initialize(
             emission_type=config.emission_type,
@@ -386,6 +387,8 @@ class NeuralHSMM(HSMM):
             self.ctx_duration = None
             self.ctx_emission = None
 
+        self._params: dict = {"emission_type": config.emission_type}
+
         super().__init__(
             n_states=config.n_states,
             n_features=config.n_features,
@@ -396,20 +399,12 @@ class NeuralHSMM(HSMM):
             device=self.device,
             seed=config.seed,
         )
-        self._params: dict = {"emission_type": config.emission_type}
+
         self._params["emission_pdf"] = self.sample_emission_pdf(
             temperature=config.emission_temp,
             scale=config.emission_scale,
         )
         self._context = None
-
-    @property
-    def emission_type(self) -> str:
-        return self._params.get("emission_type", "gaussian")
-
-    @property
-    def pdf(self):
-        return self._params.get("emission_pdf", None)
 
     @property
     def dof(self) -> int:
@@ -453,7 +448,7 @@ class NeuralHSMM(HSMM):
         self,
         delta: Optional[torch.Tensor],
         shape: Tuple[int, int, int],
-        scale: float = 1.0,
+        scale: float = 0.1,
         broadcast: bool = True
     ) -> torch.Tensor:
         """
@@ -461,7 +456,7 @@ class NeuralHSMM(HSMM):
 
         Args:
             delta: Tensor from encoder or external context (any shape), or None.
-                   Can be [H], [B,H], or [B,T,H].
+                   Can be [H], [B,H], [B,T,H], or already [B,n_states,feature_dim].
             shape: Target shape (B, n_states, feature_dim)
             scale: Scaling factor for modulation.
             broadcast: If True, automatically broadcast singleton batch to target_B.
@@ -470,117 +465,58 @@ class NeuralHSMM(HSMM):
             Tensor of shape (B, n_states, feature_dim), padded/truncated and scaled.
         """
         target_B, n_states, feature_dim = shape
+        device, dtype = self.device, DTYPE
 
+        # === 1. Missing delta → zero tensor ===
         if delta is None:
-            return torch.zeros((target_B, n_states, feature_dim), dtype=DTYPE, device=self.device)
+            return torch.zeros((target_B, n_states, feature_dim), dtype=dtype, device=device)
 
-        delta = delta.to(self.device, dtype=DTYPE)
+        delta = delta.to(device=device, dtype=dtype)
 
-        # Flatten all but batch dimension
-        if delta.ndim == 1:
-            delta = delta.unsqueeze(0)  # [1, H]
-        elif delta.ndim > 2:
-            delta = delta.reshape(delta.shape[0], -1)  # flatten T,H -> L
+        # === 2. Handle already-correct shape ===
+        if delta.shape == (target_B, n_states, feature_dim):
+            return scale * torch.tanh(delta.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0))
 
-        B, L = delta.shape
+        # === 3. Remove temporal dimension or flatten arbitrary trailing dims ===
+        if delta.ndim == 1:               # [H]
+            delta = delta.unsqueeze(0)    # [1, H]
+        elif delta.ndim == 3 and delta.shape[1] != n_states:
+            # [B, T, H] → mean over time
+            delta = delta.mean(dim=1)
+        elif delta.ndim > 3:
+            # Flatten anything extra beyond batch
+            delta = delta.reshape(delta.shape[0], -1)
+
+        # === 4. Infer shape info ===
+        B, L = delta.shape[-2], delta.shape[-1]
         expected = n_states * feature_dim
 
-        # Pad/truncate to expected length
+        # === 5. Pad or truncate along feature axis ===
         if L < expected:
             delta = F.pad(delta, (0, expected - L))
         elif L > expected:
             delta = delta[..., :expected]
 
-        # Reshape to (B, n_states, feature_dim)
+        # === 6. Reshape to (B, n_states, feature_dim) ===
         delta = delta.view(B, n_states, feature_dim)
 
-        # Apply scaling and nonlinear activation
+        # === 7. Scale and clamp safely ===
         delta = scale * torch.tanh(delta)
-
-        # Numerical safety
         delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Broadcast batch if needed
-        if broadcast and B == 1 and target_B > 1:
-            delta = delta.expand(target_B, -1, -1)
+        # === 8. Broadcast batch if needed ===
+        if broadcast and B != target_B:
+            if B == 1:
+                delta = delta.expand(target_B, -1, -1)
+            else:
+                # Pad or crop batch dimension if partial mismatch
+                if B < target_B:
+                    extra = delta[:1].expand(target_B - B, -1, -1)
+                    delta = torch.cat([delta, extra], dim=0)
+                else:
+                    delta = delta[:target_B]
 
         return delta
-
-    def set_context(self, context: Optional[torch.Tensor], batch_size: Optional[int] = None):
-        """
-        Store a (B,H) or (H,) context tensor on model device/dtype.
-
-        Args:
-            context: Context tensor of shape (H,) or (B,H), or None to clear.
-            batch_size: Optional batch size to broadcast context if single (H,) vector.
-        """
-        if context is None:
-            self._context = None
-            return
-
-        ctx = context.detach().to(device=self.device, dtype=DTYPE)
-
-        if ctx.ndim == 1:
-            ctx = ctx.unsqueeze(0)  # ensure batch dim
-
-        if batch_size is not None and ctx.shape[0] == 1:
-            ctx = ctx.expand(batch_size, -1)
-
-        self._context = ctx
-
-    def clear_context(self):
-        self._context = None
-
-    def _combine_context(self, theta: Optional[torch.Tensor], allow_broadcast: bool = True) -> Optional[torch.Tensor]:
-        """
-        Combine encoder-produced theta with externally stored context safely.
-
-        Supports 1D (H,) or 2D (B,H) tensors, with optional broadcasting of singleton batches.
-
-        Args:
-            theta: Encoder output tensor (H,) or (B,H), or None.
-            allow_broadcast: If True, broadcast singleton batch to match other tensor.
-
-        Returns:
-            Combined tensor of shape (B, H_theta + H_ctx) or None if both inputs are None.
-        """
-        ctx = getattr(self, "_context", None)
-
-        # Move to device/dtype and ensure batch
-        theta = theta.detach().to(self.device, DTYPE) if theta is not None else None
-        ctx = ctx.detach().to(self.device, DTYPE) if ctx is not None else None
-
-        if theta is None and ctx is None:
-            return None
-        if theta is None:
-            return ctx
-        if ctx is None:
-            return theta
-
-        # Ensure batch dimension
-        if theta.ndim == 1:
-            theta = theta.unsqueeze(0)
-        if ctx.ndim == 1:
-            ctx = ctx.unsqueeze(0)
-
-        # Align batch dimension
-        B_theta, B_ctx = theta.shape[0], ctx.shape[0]
-        if B_theta != B_ctx:
-            if allow_broadcast:
-                if B_theta == 1:
-                    theta = theta.expand(B_ctx, *theta.shape[1:])
-                elif B_ctx == 1:
-                    ctx = ctx.expand(B_theta, *ctx.shape[1:])
-                else:
-                    raise ValueError(f"Batch mismatch: theta {theta.shape} vs context {ctx.shape}")
-            else:
-                raise ValueError(f"Batch mismatch and broadcasting disabled: theta {theta.shape} vs context {ctx.shape}")
-
-        # Feature dimension check
-        if theta.shape[1:] != ctx.shape[1:]:
-            raise ValueError(f"Feature dimension mismatch: theta {theta.shape} vs context {ctx.shape}")
-
-        return torch.cat([theta, ctx], dim=-1)
 
     def sample_emission_pdf(
         self,
@@ -588,19 +524,21 @@ class NeuralHSMM(HSMM):
         theta: Optional[torch.Tensor] = None,
         temperature: float = 1.0,
         scale: Optional[float] = None,
-    ):
+        seed: Optional[int] = None
+    ) -> Distribution:
         """
-        Create a batched emission distribution conditioned on optional X and theta.
-
-        Returns:
-            - Categorical (n_states distributions) or
-            - MultivariateNormal (n_states distributions)
+        Sample context-aware emission distribution (Gaussian or Categorical),
+        aligned with NHSMM, supporting optional context theta and batch X.
         """
         nS, nF = self.n_states, self.n_features
-        scale = scale or getattr(self.config, "emission_scale", 0.1)
         device, dtype = self.device, DTYPE
+        scale = scale or getattr(self.config, "emission_scale", 0.1)
 
-        # Prepare input X
+        # Set RNG for reproducibility
+        if seed is not None:
+            torch.manual_seed(seed)
+
+        # Flatten batch if provided
         if X is not None:
             X = X.to(dtype=dtype, device=device)
             batch_mode = X.ndim == 3
@@ -611,34 +549,32 @@ class NeuralHSMM(HSMM):
 
         # Compute context delta
         combined = self.combine_context(theta)
+        delta = None
         if combined is not None:
             delta = self.ctx_emission(combined) if getattr(self, "ctx_emission", None) else combined[..., :nS * nF]
-        else:
-            delta = None
         delta = self._prepare_delta(delta, shape=(1, nS, nF), scale=scale)
-        delta_mean = delta.mean(dim=0)  # (nS, nF)
+        delta_mean = delta.mean(dim=0)  # [nS, nF]
 
         # --- Categorical emission ---
-        if self.emission_type == "categorical":
+        if self.emission_type.lower() == "categorical":
             if X_flat is not None:
                 probs = X_flat.mean(dim=0, keepdim=True).expand(nS, -1)
             else:
                 probs = torch.full((nS, nF), 1.0 / nF, dtype=dtype, device=device)
 
-            probs = probs + delta_mean
-            logits = probs / max(temperature, 1e-6)
+            logits = (probs + delta_mean) / max(temperature, 1e-6)
             logits = logits - torch.logsumexp(logits, dim=-1, keepdim=True)
-            logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+            logits = torch.nan_to_num(logits)
             return Categorical(logits=logits)
 
         # --- Gaussian emission ---
-        elif self.emission_type == "gaussian":
+        elif self.emission_type.lower() == "gaussian":
             if X_flat is not None:
                 mean = X_flat.mean(dim=0, keepdim=True).expand(nS, -1)
-                var = X_flat.var(dim=0, unbiased=False, keepdim=True).expand(nS, -1).clamp_min(self.min_covar)
+                var = X_flat.var(dim=0, unbiased=False, keepdim=True).expand(nS, -1).clamp_min(getattr(self, "min_covar", 1e-6))
             else:
                 mean = torch.zeros(nS, nF, dtype=dtype, device=device)
-                var = torch.full((nS, nF), self.min_covar, dtype=dtype, device=device)
+                var = torch.full((nS, nF), getattr(self, "min_covar", 1e-6), dtype=dtype, device=device)
 
             mean = mean + delta_mean
             cov = torch.diag_embed(var)
@@ -653,28 +589,36 @@ class NeuralHSMM(HSMM):
         posterior: torch.Tensor,
         theta: Optional[torch.Tensor] = None,
         scale: Optional[float] = None
-    ):
+    ) -> Distribution:
         """
-        Estimate emission distributions from weighted data (posterior responsibilities),
-        optionally modulated by context/encoder outputs (theta).
+        Estimate emission distribution from weighted data (posterior responsibilities),
+        optionally modulated by context theta.
+
+        Args:
+            X: Observations [T, F] or [B*T, F].
+            posterior: Responsibility matrix [T, K] or [B*T, K].
+            theta: Optional context tensor [H] or [B, H].
+            scale: Scaling for context modulation.
 
         Returns:
-            - MultivariateNormal (for Gaussian)
-            - Categorical (for categorical)
+            MultivariateNormal (gaussian) or Categorical.
         """
         K, F = self.n_states, self.n_features
-        scale = scale or getattr(self.config, "emission_scale", 1.0)
         device, dtype = self.device, DTYPE
+        scale = scale or getattr(self.config, "emission_scale", 0.1)
 
         X = X.to(dtype=dtype, device=device)
         posterior = posterior.to(dtype=dtype, device=device)
 
-        # Compute context delta
-        combined = self._combine_context(theta)
+        # --- Compute context delta ---
+        combined = self.combine_context(theta)
         delta = None
         if combined is not None:
-            delta = self.ctx_emission(combined) if getattr(self, "ctx_emission", None) else combined[..., :K * F]
-        delta = self._prepare_delta(delta, shape=(1, K, F), scale=scale)  # (1, K, F)
+            if getattr(self, "ctx_emission", None):
+                delta = self.ctx_emission(combined)
+            else:
+                delta = combined[..., :K*F]
+        delta = self._prepare_delta(delta, shape=(1, K, F), scale=scale)
         delta_mean = delta.mean(dim=0)  # (K, F)
 
         # --- Categorical emission ---
@@ -694,9 +638,9 @@ class NeuralHSMM(HSMM):
             Nk = posterior.sum(dim=0).clamp_min(EPS)  # (K,)
             mean = (posterior.T @ X) / Nk.unsqueeze(1)  # (K, F)
 
-            # Compute weighted covariance efficiently
-            diff = X.unsqueeze(1) - mean.unsqueeze(0)   # (T, K, F)
-            weighted_diff = diff * posterior.unsqueeze(-1)  # (T, K, F)
+            # Weighted covariance
+            diff = X.unsqueeze(1) - mean.unsqueeze(0)  # (T, K, F)
+            weighted_diff = diff * posterior.unsqueeze(-1)
             cov = torch.einsum("tkf,tkh->kfh", weighted_diff, diff) / Nk.unsqueeze(-1).unsqueeze(-1)
             cov += torch.eye(F, dtype=dtype, device=device).unsqueeze(0) * getattr(self, "min_covar", 1e-6)
 
@@ -706,34 +650,45 @@ class NeuralHSMM(HSMM):
         else:
             raise ValueError(f"Unsupported emission_type '{self.emission_type}'")
 
-    def initialize_emissions(self, X, method: str = "moment"):
-        """Initialize emission parameters from raw data X (batched or unbatched) with context-aware enhancements."""
-
-        # Convert to tensor and ensure device/dtype
-        if not torch.is_tensor(X):
-            X = torch.tensor(X, dtype=DTYPE, device=self.device)
+    def initialize_emissions(self, X: torch.Tensor, method: str = "moment"):
+        """
+        Initialize emission parameters from raw data X (batched or unbatched),
+        using context-consistent shifts. Supports Gaussian, Categorical, and Bernoulli emissions.
+        """
+        # --- 1. Ensure tensor on correct device/dtype ---
+        X = X if torch.is_tensor(X) else torch.tensor(X)
         X = X.to(dtype=DTYPE, device=self.device)
+
         K = self.n_states
+        F = X.shape[-1]
         emission_type = self.emission_type.lower()
 
         # Flatten batch if present
-        if self.is_batch(X):
-            B, T, F = X.shape
-            X_flat = X.reshape(B * T, F)
-        else:
-            X_flat = X
-            F = X_flat.shape[1]
+        X_flat = X.reshape(-1, F) if self.is_batch(X) else X
 
-        # --- Gaussian emission ---
+        # --- 2. Compute context delta using same logic as _contextual_emission_pdf ---
+        delta = None
+        combined_ctx = self.combine_context(None) if getattr(self, "combine_context", None) else None
+        if getattr(self, "ctx_emission", None) and combined_ctx is not None:
+            delta_raw = self.ctx_emission(combined_ctx)
+            delta = self._prepare_delta(
+                delta_raw,
+                shape=(1, K, F),
+                scale=getattr(self.config, "emission_scale", 1.0)
+            )
+
+        # --- 3. Gaussian emission ---
         if emission_type == "gaussian":
             if method == "moment":
-                mu_init = X_flat.mean(dim=0, keepdim=True).expand(K, F)
-                var_init = X_flat.var(dim=0, unbiased=False, keepdim=True).expand(K, F)
+                mu_init = X_flat.mean(dim=0, keepdim=True)  # [1, F]
+                var_init = X_flat.var(dim=0, unbiased=False, keepdim=True)  # [1, F]
+                mu_init = mu_init.expand(K, F)
+                var_init = var_init.expand(K, F)
             elif method == "kmeans":
-                from sklearn.cluster import KMeans
                 labels = torch.tensor(
                     KMeans(n_clusters=K, n_init=10, random_state=0)
-                    .fit_predict(X_flat.cpu().numpy()), device=self.device
+                    .fit_predict(X_flat.cpu().numpy()),
+                    device=self.device, dtype=torch.long
                 )
                 mu_init = torch.stack([
                     X_flat[labels == k].mean(dim=0) if (labels == k).any() else X_flat.mean(dim=0)
@@ -746,24 +701,20 @@ class NeuralHSMM(HSMM):
             else:
                 raise ValueError(f"Unknown initialization method '{method}'")
 
+            # Apply context shift
+            if delta is not None:
+                mu_init = mu_init + delta.mean(dim=0)
+
+            # Covariance
             var_init = var_init.clamp_min(getattr(self, "min_covar", 1e-6))
-            cov = torch.diag_embed(var_init)
+            cov_init = torch.diag_embed(var_init)
 
-            # Apply optional context modulation if encoder/adapters exist
-            delta = self._prepare_delta(
-                getattr(self, "ctx_emission", None)(self._combine_context(None)) if getattr(self, "ctx_emission", None) else None,
-                shape=(1, K, F),
-                scale=getattr(self.config, "emission_scale", 1.0)
-            )
-            mu_init = mu_init + delta.mean(dim=0)
+            # Assign parameters
+            self.emission_module.mu = nn.Parameter(mu_init)
+            self.emission_module.cov = nn.Parameter(cov_init)
+            self._params["emission_pdf"] = MultivariateNormal(loc=mu_init, covariance_matrix=cov_init)
 
-            # Assign to emission module
-            self.emission_module.mu = nn.Parameter(mu_init.to(self.device, DTYPE))
-            self.emission_module.cov = nn.Parameter(cov.to(self.device, DTYPE))
-            self._params["emission_pdf"] = MultivariateNormal(loc=mu_init.to(self.device, DTYPE),
-                                                              covariance_matrix=cov.to(self.device, DTYPE))
-
-        # --- Categorical / Bernoulli emission ---
+        # --- 4. Categorical / Bernoulli emission ---
         elif emission_type in ("categorical", "bernoulli"):
             if X_flat.ndim == 1 or X_flat.shape[1] == 1:
                 counts = torch.bincount(X_flat.squeeze(-1).long(), minlength=self.n_features)
@@ -771,225 +722,217 @@ class NeuralHSMM(HSMM):
                 counts = X_flat.sum(dim=0)
             counts = counts.to(dtype=DTYPE, device=self.device)
 
-            probs = counts / counts.sum()
-            if probs.sum() == 0:
-                probs = torch.full_like(probs, 1.0 / len(probs))
+            probs = counts / counts.sum().clamp_min(EPS)
 
-            # Apply optional context modulation
-            delta = self._prepare_delta(
-                getattr(self, "ctx_emission", None)(self._combine_context(None)) if getattr(self, "ctx_emission", None) else None,
-                shape=(1, K, self.n_features),
-                scale=getattr(self.config, "emission_scale", 1.0)
-            )
-            probs = (probs + delta.mean(dim=0)).clamp_min(EPS)
-            probs = probs / probs.sum()
-            logits = probs.log().unsqueeze(0).expand(K, -1)
+            # Context modulation in logits space for consistency
+            logits = probs.log()[None, :]  # [1, F]
+            if delta is not None:
+                logits = logits + delta.mean(dim=0)  # broadcast across states
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0, neginf=-1.0)
+            if logits.shape[0] == 1:
+                logits = logits.expand(K, -1)  # [K, F]
 
             # Assign parameters
             self.emission_module.mu = nn.Parameter(torch.zeros_like(logits))
             self.emission_module.cov = nn.Parameter(torch.zeros_like(logits))
-            self._params["emission_pdf"] = Categorical(logits=logits.to(self.device, DTYPE))
+            self._params["emission_pdf"] = Categorical(logits=logits)
 
         else:
             raise RuntimeError(f"Unsupported emission_type '{self.emission_type}'")
 
-    def _contextual_emission_pdf(self, X: Optional[torch.Tensor] = None,
-                                 theta: Optional[torch.Tensor] = None,
-                                 scale: Optional[float] = None):
-        """Return context-modulated emission PDF (Categorical or Gaussian)."""
-        scale = scale or getattr(self.config, "emission_scale", 1.0)
+    def _contextual_emission_pdf(
+        self,
+        X: Optional[torch.Tensor] = None,
+        theta: Optional[torch.Tensor] = None,
+        scale: Optional[float] = None
+    ):
+        """
+        Compute context-modulated emission PDF for HSMM using unified delta logic.
+
+        Args:
+            X: Optional observation tensor [B, T, F] or [T, F].
+            theta: Optional contextual embedding [B, H], [B, T, H], or [H].
+            scale: Optional scaling for contextual delta.
+
+        Returns:
+            torch.distributions.Distribution: Context-modulated emission PDF.
+        """
+        device, dtype = self.device, DTYPE
         pdf = self.pdf
         if pdf is None:
             return None
 
-        # Compute delta from context
-        combined = self._combine_context(theta)
-        if combined is not None:
-            delta_raw = self.ctx_emission(combined) if getattr(self, "ctx_emission", None) else combined[..., :self.n_states * self.n_features]
-        else:
-            delta_raw = None
+        scale = scale or getattr(self.config, "emission_scale", 1.0)
+        K, F = self.n_states, self.n_features
 
-        delta = self._prepare_delta(delta_raw, shape=(1, self.n_states, self.n_features), scale=scale)
+        # --- 1. Compute delta using same logic as initialize_emissions ---
+        combined_ctx = theta if theta is not None else self.combine_context(None)
+        delta_raw = None
+        if getattr(self, "ctx_emission", None) and combined_ctx is not None:
+            delta_raw = self.ctx_emission(combined_ctx)
 
-        # --- Categorical emission ---
-        if isinstance(pdf, Categorical):
-            logits = pdf.logits.to(self.device, DTYPE)
-            # Ensure logits has batch dimension
-            if logits.ndim == 1:
-                logits = logits.unsqueeze(0)  # [1, n_features]
-            if logits.shape[0] != delta.shape[0]:
-                if logits.shape[0] == 1:
-                    logits = logits.repeat(delta.shape[0], 1)  # repeat along batch
-                else:
-                    raise RuntimeError(f"Cannot align logits batch {logits.shape[0]} with delta batch {delta.shape[0]}")
-            # Sum delta across features for categorical logits
-            logits = logits + delta.mean(dim=-1)
-            return Categorical(logits=torch.nan_to_num(logits))
+        # Target batch size
+        B = X.shape[0] if X is not None and X.ndim == 3 else 1
+        delta = self._prepare_delta(delta_raw, shape=(B, K, F), scale=scale)  # [B, K, F]
 
-        # --- Gaussian emission ---
-        elif isinstance(pdf, MultivariateNormal):
-            mean = pdf.mean.to(self.device, DTYPE)  # [n_states, n_features]
-            cov = pdf.covariance_matrix.to(self.device, DTYPE)
+        # --- 2. Gaussian emission ---
+        if isinstance(pdf, MultivariateNormal):
+            mean = pdf.mean.to(device=device, dtype=dtype)
+            cov = pdf.covariance_matrix.to(device=device, dtype=dtype)
 
-            # Ensure batch dimension for mean
-            if mean.ndim == 1:
-                mean = mean.unsqueeze(0)  # [1, n_features]
+            # Align shapes
+            if mean.ndim == 2:  # [K, F]
+                mean = mean.unsqueeze(0)
             if mean.shape[0] != delta.shape[0]:
-                mean = mean.unsqueeze(0) if mean.shape[0] == 1 else mean
-                if mean.shape[0] == 1:
-                    mean = mean.repeat(delta.shape[0], 1, 1) if mean.ndim == 3 else mean.repeat(delta.shape[0], 1)
-
+                mean = mean.expand(delta.shape[0], -1, -1)
             mean = mean + delta
 
-            # Ensure positive-definite covariance and batch
-            eye = EPS * torch.eye(cov.shape[-1], device=cov.device, dtype=cov.dtype)
+            # Covariance
+            F_cov = cov.shape[-1]
+            eps_eye = EPS * torch.eye(F_cov, device=device, dtype=dtype)
             if cov.ndim == 2:  # [F, F]
-                cov = cov + eye
-                if delta.shape[0] > 1:
-                    cov = cov.unsqueeze(0).repeat(delta.shape[0], 1, 1)
-            elif cov.ndim == 3:  # [B, F, F]
-                cov = cov + eye.unsqueeze(0)
-                if cov.shape[0] != delta.shape[0] and cov.shape[0] == 1:
-                    cov = cov.repeat(delta.shape[0], 1, 1)
-            elif cov.ndim == 4:  # [B, n_states, F, F]
-                cov = cov + eye.view(1, 1, cov.shape[-1], cov.shape[-1])
-                if cov.shape[0] != delta.shape[0] and cov.shape[0] == 1:
-                    cov = cov.repeat(delta.shape[0], 1, 1, 1)
+                cov = cov + eps_eye
+                cov = cov.unsqueeze(0).unsqueeze(0).expand(B, K, F_cov, F_cov)
+            elif cov.ndim == 3:  # [K, F, F]
+                cov = cov.unsqueeze(0).expand(B, -1, -1, -1) + eps_eye.view(1, 1, F_cov, F_cov)
+            elif cov.ndim == 4:  # [B, K, F, F]
+                if cov.shape[0] != B and cov.shape[0] == 1:
+                    cov = cov.expand(B, -1, -1, -1)
+                cov = cov + eps_eye.view(1, 1, F_cov, F_cov)
 
+            cov = torch.nan_to_num(cov, nan=0.0, posinf=1.0, neginf=1e-6)
             return MultivariateNormal(loc=mean, covariance_matrix=cov)
 
+        # --- 3. Categorical / Bernoulli emission ---
+        elif isinstance(pdf, Categorical):
+            logits = pdf.logits.to(device=device, dtype=dtype)
+            if logits.ndim == 1:  # [F]
+                logits = logits.unsqueeze(0).unsqueeze(0)
+            elif logits.ndim == 2:  # [K, F]
+                logits = logits.unsqueeze(0)
+
+            if logits.shape[0] != delta.shape[0]:
+                logits = logits.expand(delta.shape[0], -1, -1)
+
+            logits = logits + delta.mean(dim=-1, keepdim=True)
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=1.0, neginf=-1.0)
+            return Categorical(logits=logits)
+
+        # --- 4. Fallback ---
         return pdf
 
     def _contextual_duration_pdf(
-        self, theta: Optional[torch.Tensor] = None, scale: Optional[float] = None, temperature: Optional[float] = None):
-        """Return context-modulated duration distribution."""
-        scale = scale or getattr(self.config, "duration_scale", 1.0)
+        self,
+        theta: Optional[torch.Tensor] = None,
+        scale: Optional[float] = None,
+        temperature: Optional[float] = None
+    ):
+        """Return context-modulated duration distribution (softmax over max_duration)."""
+        scale = scale or getattr(self.config, "duration_scale", 0.1)
         temperature = max(temperature or getattr(self.config, "duration_temp", 1.0), 1e-6)
 
+        # Base logits from duration module
         logits = getattr(self.duration_module, "logits", None)
         if logits is None:
+            # If duration module directly returns probabilities
             return self.duration_module.forward(log=False)
 
-        combined = self._combine_context(theta)
-        delta = self._prepare_delta(
-            self.ctx_duration(combined) if combined is not None and getattr(self, "ctx_duration", None) else None,
-            shape=(1, self.n_states, self.max_duration),
-            scale=scale
-        )
+        # Context modulation
+        combined = self.combine_context(theta)
+        delta = None
+        if combined is not None and getattr(self, "ctx_duration", None):
+            delta = self.ctx_duration(combined)
+        delta = self._prepare_delta(delta, shape=(1, self.n_states, self.max_duration), scale=scale)
 
+        # Align logits batch with delta
         logits = self._align_logits(logits, delta.shape[0])
         combined_logits = logits + delta
+
+        # Softmax with temperature and safe numeric handling
         return F.softmax(torch.nan_to_num(combined_logits) / temperature, dim=-1)
 
     def _contextual_transition_matrix(
-        self, theta: Optional[torch.Tensor] = None, scale: Optional[float] = None, temperature: Optional[float] = None):
-        """Return context-modulated transition matrix."""
+        self,
+        theta: Optional[torch.Tensor] = None,
+        scale: Optional[float] = None,
+        temperature: Optional[float] = None
+    ):
+        """Return context-modulated transition matrix (softmax over states)."""
         scale = scale or getattr(self.config, "transition_scale", 1.0)
         temperature = max(temperature or getattr(self.config, "transition_temp", 1.0), 1e-6)
 
+        # Base logits from transition module
         logits = getattr(self.transition_module, "logits", None)
         if logits is None:
+            # If transition module directly returns probabilities
             return self.transition_module.forward(log=False)
 
-        combined = self._combine_context(theta)
-        delta = self._prepare_delta(
-            self.ctx_transition(combined) if combined is not None and getattr(self, "ctx_transition", None) else None,
-            shape=(1, self.n_states, self.n_states),
-            scale=scale
-        )
+        # Context modulation
+        combined = self.combine_context(theta)
+        delta = None
+        if combined is not None and getattr(self, "ctx_transition", None):
+            delta = self.ctx_transition(combined)
+        delta = self._prepare_delta(delta, shape=(1, self.n_states, self.n_states), scale=scale)
 
+        # Align batch dimension
         logits = self._align_logits(logits, delta.shape[0])
         combined_logits = logits + delta
+
         return F.softmax(torch.nan_to_num(combined_logits) / temperature, dim=-1)
 
-    def encode_observations(
+    def forward(
         self,
         X: torch.Tensor,
-        detach: bool = True,
-        keep_sequence: bool = False,
-        flatten_batch: bool = False
-    ) -> Optional[torch.Tensor]:
+        return_pdf: bool = False,
+        context: Optional[torch.Tensor] = None,
+        context_ids: Optional[torch.Tensor] = None
+    ):
         """
-        Encode observations using the attached encoder with flexible batching.
+        Encode observations, merge optional context, and optionally return
+        a contextually-modulated emission PDF.
 
         Args:
-            X: Tensor of shape [T, F] or [B, T, F].
-            detach: Detach output from computation graph if True.
-            keep_sequence: If True, output retains sequence dimension [B, T, H].
-            flatten_batch: If True and keep_sequence=False, output flattened to [B*T, H].
+            X: Observation tensor [T, F] or [B, T, F].
+            return_pdf: If True, return emission PDF instead of encoded theta.
+            context: Optional raw context tensor.
+            context_ids: Optional categorical context IDs for embedding.
 
         Returns:
-            Encoded tensor of shape [B, H], [B, T, H], or [B*T, H], or None if no encoder.
-        """
-        if self.encoder is None:
-            return None
-
-        if X.ndim == 2:
-            X = X.unsqueeze(0)
-        elif X.ndim != 3:
-            raise ValueError(f"Input X must be [T,F] or [B,T,F], got {X.shape}")
-
-        B, T, F = X.shape
-        inp = X.to(dtype=DTYPE, device=self.device)
-
-        out = self.encoder(inp)
-        if isinstance(out, tuple):
-            out = out[0]
-
-        if detach:
-            out = out.detach().clone()
-        out = out.to(dtype=DTYPE, device=self.device)
-
-        if out.ndim == 2:
-            if keep_sequence:
-                out = out.unsqueeze(1)
-        elif out.ndim == 3:
-            if not keep_sequence:
-                out = out.mean(dim=1)
-            if flatten_batch and not keep_sequence:
-                out = out.reshape(B * T, -1)
-        else:
-            raise RuntimeError(f"Unexpected encoder output shape {out.shape} from {type(self.encoder)}")
-
-        return out
-
-    def forward(self, X: torch.Tensor,
-                return_pdf: bool = False,
-                context: Optional[torch.Tensor] = None,
-                context_ids: Optional[torch.Tensor] = None):
-        """
-        Encode observations, merge context, and optionally return contextually-modulated emission PDF.
+            Theta tensor [B, latent_dim] or context-modulated emission PDF.
         """
         prev_ctx = getattr(self, "_context", None)
         ctx_list = []
 
-        # Context embedding
+        # --- Context embedding from IDs ---
         if context_ids is not None:
             if self.context_embedding is None:
                 raise ValueError("context_ids provided but no context_embedding defined.")
             ctx_emb = self.context_embedding(context_ids.to(self.device))
-            if ctx_emb.ndim == 3:
+            if ctx_emb.ndim == 3:  # [B, L, H] -> mean over L
                 ctx_emb = ctx_emb.mean(dim=1)
             ctx_list.append(ctx_emb.to(dtype=DTYPE, device=self.device))
+
+        # --- Raw context tensor ---
         if context is not None:
             ctx_list.append(context.to(dtype=DTYPE, device=self.device))
 
-        # Merge context
-        ctx = torch.cat(ctx_list, dim=-1) if ctx_list else None
-        if ctx is not None:
-            self.set_context(ctx)
+        # --- Merge context and set internal state ---
+        merged_ctx = torch.cat(ctx_list, dim=-1) if ctx_list else None
+        if merged_ctx is not None:
+            self.set_context(merged_ctx)
 
-        # Encode
+        # --- Encode observations ---
         theta = self.encode_observations(X)
 
-        if not return_pdf:
+        # --- Return context-modulated emission PDF if requested ---
+        if return_pdf:
+            pdf_mod = self._contextual_emission_pdf(X=X, theta=theta)
             self._context = prev_ctx
-            return theta
+            return pdf_mod
 
-        # Contextual PDF
-        pdf_mod = self._contextual_emission_pdf(X=X, theta=theta)
+        # --- Return encoded latent theta ---
         self._context = prev_ctx
-        return pdf_mod
+        return theta
 
     def predict(
         self,
@@ -1023,7 +966,7 @@ class NeuralHSMM(HSMM):
 
             # ---------------- Save previous context ---------------- #
             prev_ctx = getattr(self, "_context", None)
-            prev_pdf = getattr(self._params, "emission_pdf", None)
+            prev_pdf = self._params.get("emission_pdf", None)
             prev_transition = getattr(self, "_transition_logits", None)
             prev_duration = getattr(self, "_duration_logits", None)
 
@@ -1036,7 +979,7 @@ class NeuralHSMM(HSMM):
                 ctx_emb = self.context_embedding(context_ids.to(self.device))
                 if ctx_emb.ndim == 3:
                     ctx_emb = ctx_emb.mean(dim=1)
-                ctx_list.append(ctx_emb.to(dtype=DTYPE))
+                ctx_list.append(ctx_emb.to(dtype=DTYPE, device=self.device))
 
             if context is not None:
                 ctx_list.append(context.to(dtype=DTYPE, device=self.device))
@@ -1059,7 +1002,6 @@ class NeuralHSMM(HSMM):
             duration_logits = self._contextual_duration_pdf(theta)
 
             # ---------------- Ensure batch alignment ---------------- #
-            # Expand 2D logits to [B, K, ...] if needed
             def expand_to_batch(logits: torch.Tensor, target_B: int):
                 if logits.ndim == 2:
                     return logits.unsqueeze(0).expand(target_B, *logits.shape)
@@ -1198,21 +1140,23 @@ class NeuralHSMM(HSMM):
         verbose: bool = False
     ) -> dict:
         """
-        GPU-batched hyperparameter tuning with vectorized normalization and type/shape checks.
+        GPU-batched hyperparameter tuning using `Observations` for vectorized handling of sequences,
+        log_probs, and optional context. Supports dynamic assignment of parameters and safe scoring.
         """
 
         if not configs:
             raise ValueError("configs must be provided as a list of dicts.")
 
+        # --- convert to device/dtype ---
         X = X.to(device=self.device, dtype=DTYPE)
 
-        # --- sequence handling ---
+        # --- build Observations ---
         if hasattr(self, "to_observations"):
             obs_X = self.to_observations(X, lengths)
         else:
-            obs_X = type("Obs", (), {"sequence": [X], "lengths": [len(X)], "log_probs": None})()
+            obs_X = Observations(sequence=[X] if X.ndim == 2 else [x for x in X], lengths=lengths)
 
-        B = len(obs_X.sequence)
+        B = obs_X.n_sequences
         n_configs = len(configs)
         K, Dmax = self.n_states, self.max_duration
         scores: dict[int, float] = {}
@@ -1224,17 +1168,12 @@ class NeuralHSMM(HSMM):
         for i, cfg in enumerate(configs):
             for k in list(param_stack.keys()):
                 try:
-                    val = cfg.get(k, getattr(self, k, None) or getattr(self, "_params", {}).get(k, None))
+                    val = cfg.get(k, getattr(self, k, None) or self._params.get.get(k, None))
                     if val is None:
                         if verbose:
                             print(f"[Config {i}] skipping field '{k}' (unhandled)")
                         continue
-
-                    if not isinstance(val, torch.Tensor):
-                        val = torch.as_tensor(val, device=self.device, dtype=DTYPE)
-                    else:
-                        val = val.to(device=self.device, dtype=DTYPE)
-
+                    val = torch.as_tensor(val, device=self.device, dtype=DTYPE) if not isinstance(val, torch.Tensor) else val.to(device=self.device, dtype=DTYPE)
                     param_stack[k].append(val)
                 except Exception as e:
                     if verbose:
@@ -1250,12 +1189,11 @@ class NeuralHSMM(HSMM):
                     print(f"[tune] skipping field '{k}' (stacking failed: {e})")
                 param_stack.pop(k, None)
 
-        # --- vectorized normalization for logits ---
+        # --- normalize logits ---
         if "transition_logits" in param_stack:
             vals = param_stack["transition_logits"]
             if vals.ndim == 3 and vals.shape[1:] == (K, K):
                 param_stack["transition_logits"] = vals - torch.logsumexp(vals, dim=-1, keepdim=True)
-
         if "duration_logits" in param_stack:
             vals = param_stack["duration_logits"]
             if vals.ndim == 3 and vals.shape[1:] == (K, Dmax):
@@ -1266,18 +1204,17 @@ class NeuralHSMM(HSMM):
         if pdf is None or not hasattr(pdf, "log_prob"):
             raise RuntimeError("Emission PDF must be initialized for batched tuning.")
 
-        seq_tensor = torch.cat(obs_X.sequence, dim=0).to(dtype=DTYPE, device=self.device)
-        seq_offsets = [0] + list(torch.cumsum(torch.tensor(obs_X.lengths, device=self.device, dtype=torch.int64), dim=0).tolist())
-
+        # --- prepare batched tensor for vectorized scoring ---
+        seq_batch, mask, _, _ = obs_X.to_batch(return_mask=True)
         try:
-            lp_base = pdf.log_prob(seq_tensor.unsqueeze(1)).to(dtype=DTYPE)
+            lp_base = pdf.log_prob(seq_batch.unsqueeze(1)).to(dtype=DTYPE)
             if lp_base.ndim > 2:
                 lp_base = lp_base.sum(dim=list(range(2, lp_base.ndim)))
             all_log_probs = lp_base.unsqueeze(0).repeat(n_configs, 1, 1)
         except Exception as e:
             raise RuntimeError(f"Emission log-prob computation failed: {e}")
 
-        # --- assign fields to model and compute scores ---
+        # --- assign parameters and compute scores ---
         with torch.no_grad():
             for i in range(n_configs):
                 last_key, last_val = None, None
@@ -1285,7 +1222,6 @@ class NeuralHSMM(HSMM):
                     for k, vals in param_stack.items():
                         last_key, last_val = k, vals[i]
                         val = last_val
-
                         if hasattr(self, k):
                             try:
                                 setattr(self, k, val)
@@ -1298,7 +1234,10 @@ class NeuralHSMM(HSMM):
                             if verbose:
                                 print(f"[Config {i}] skipping field '{k}' (unknown)")
 
-                    obs_X.log_probs = [all_log_probs[i, seq_offsets[j]:seq_offsets[j+1]] for j in range(B)]
+                    # assign log_probs for current configuration
+                    obs_X = obs_X.clone()
+                    obs_X.log_probs = [all_log_probs[i, sum(obs_X.lengths[:j]):sum(obs_X.lengths[:j+1])] for j in range(B)]
+
                     score_tensor = self._compute_log_likelihood(obs_X)
                     score = float(torch.nan_to_num(score_tensor, nan=-float("inf"), posinf=-float("inf"), neginf=-float("inf")).sum().item())
                     scores[i] = score

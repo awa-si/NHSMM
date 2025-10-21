@@ -5,28 +5,16 @@ from typing import Tuple, Optional, Union
 
 from nhsmm.defaults import DTYPE, EPS
 
-
-# -------------------------
-# Transition types
-# -------------------------
 class Transitions(Enum):
     SEMI = "semi"
     ERGODIC = "ergodic"
     LEFT_TO_RIGHT = "left-to-right"
 
-
-# -------------------------
-# Information criteria
-# -------------------------
 class InformCriteria(Enum):
     AIC = "AIC"
     BIC = "BIC"
     HQC = "HQC"
 
-
-# -------------------------
-# Covariance types
-# -------------------------
 class CovarianceType(Enum):
     FULL = "full"
     DIAG = "diag"

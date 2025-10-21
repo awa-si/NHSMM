@@ -1622,54 +1622,78 @@ class HSMM(nn.Module, ABC):
 
     def _compute_log_likelihood(self, X: utils.Observations, verbose: bool = False) -> torch.Tensor:
         """
-        Fully vectorized log-likelihood computation for HSMM sequences using padded alpha tensors.
-
-        Args:
-            X: Observations object with sequences.
-            verbose: Print debug info about shapes.
+        Universal HSMM log-likelihood computation.
+        Auto-detects whether `_forward()` returns a list of tensors or a batched tensor.
+        Stores per-sequence log-likelihoods in X.log_likelihoods.
 
         Returns:
-            Tensor of log-likelihoods, shape (batch_size,)
+            torch.Tensor of shape (B,) with per-sequence log-likelihoods.
         """
-        alpha_list = self._forward(X)
-        if not alpha_list:
-            raise RuntimeError("Forward pass returned empty results. Model may be uninitialized.")
+        alpha_out = self._forward(X)
+        if alpha_out is None:
+            raise RuntimeError("Forward pass returned None. Model may be uninitialized.")
 
-        B = len(alpha_list)
-        K, Dmax = self.n_states, self.max_duration
         dtype, device = DTYPE, self.device
+        neg_inf = torch.tensor(-float("inf"), device=device, dtype=dtype)
 
-        # --- sequence lengths and max ---
-        seq_lengths = torch.tensor([a.shape[0] for a in alpha_list], device=device, dtype=torch.long)
-        max_T = seq_lengths.max()
-        neg_inf = torch.tensor(-float('inf'), device=device, dtype=dtype)
+        # --- Case 1: Batched tensor output [B, T, K, Dmax] ---
+        if isinstance(alpha_out, torch.Tensor):
+            if alpha_out.ndim != 4:
+                raise ValueError(f"Expected batched alpha tensor [B, T, K, Dmax], got {tuple(alpha_out.shape)}.")
 
-        if max_T == 0:
-            return torch.full((B,), neg_inf, device=device, dtype=dtype)
+            B, T, K, Dmax = alpha_out.shape
+            seq_lengths = torch.as_tensor(X.lengths, device=device, dtype=torch.long)
+            if seq_lengths.numel() != B:
+                raise ValueError("Mismatch between number of sequences and alpha batch size.")
 
-        # --- pad sequences efficiently ---
-        alpha_clamped = [a.nan_to_num(nan=neg_inf, posinf=neg_inf, neginf=neg_inf) for a in alpha_list]
-        alpha_padded = torch.nn.utils.rnn.pad_sequence(alpha_clamped, batch_first=True,
-                                                       padding_value=neg_inf)  # (B, max_T, K, Dmax)
+            if seq_lengths.max().item() == 0:
+                ll = torch.full((B,), neg_inf, device=device, dtype=dtype)
+            else:
+                alpha_batch = alpha_out.nan_to_num(nan=neg_inf, posinf=neg_inf, neginf=neg_inf)
+                batch_idx = torch.arange(B, device=device)
+                last_idx = (seq_lengths - 1).clamp(min=0)
+                last_alpha = alpha_batch[batch_idx, last_idx]  # [B, K, Dmax]
+                ll = torch.logsumexp(last_alpha.view(B, -1), dim=-1)
+                ll = torch.where(seq_lengths > 0, ll, neg_inf)
 
-        if verbose:
-            print(f"[compute_ll] alpha_padded shape: {alpha_padded.shape}, seq_lengths: {seq_lengths.tolist()}")
+            X.log_likelihoods = ll.detach().clone()
 
-        # --- gather last valid timestep per sequence ---
-        batch_idx = torch.arange(B, device=device)
-        last_idx = (seq_lengths - 1).clamp(min=0)
-        last_alpha = alpha_padded[batch_idx, last_idx]  # (B, K, Dmax)
+            if verbose:
+                print(f"[compute_ll/batched] alpha_batch={alpha_out.shape}, seq_lengths={seq_lengths.tolist()}")
+                print(f"[compute_ll/batched] log-likelihoods: {ll}")
 
-        # --- logsumexp over states and durations ---
-        ll_list = torch.logsumexp(last_alpha.reshape(B, -1), dim=-1)  # (B,)
+            return ll
 
-        # --- handle zero-length sequences ---
-        ll_list = torch.where(seq_lengths > 0, ll_list, neg_inf)
+        # --- Case 2: List of tensors (variable-length per sequence) ---
+        elif isinstance(alpha_out, (list, tuple)):
+            if not alpha_out:
+                raise RuntimeError("Forward pass returned empty list of alpha tensors.")
 
-        if verbose:
-            print(f"[compute_ll] log-likelihoods: {ll_list}")
+            B = len(alpha_out)
+            seq_lengths = torch.tensor([a.shape[0] for a in alpha_out], device=device, dtype=torch.long)
+            max_T = seq_lengths.max()
 
-        return ll_list
+            if max_T == 0:
+                ll = torch.full((B,), neg_inf, device=device, dtype=dtype)
+            else:
+                alpha_clamped = [a.nan_to_num(nan=neg_inf, posinf=neg_inf, neginf=neg_inf) for a in alpha_out]
+                alpha_padded = torch.nn.utils.rnn.pad_sequence(alpha_clamped, batch_first=True, padding_value=neg_inf)
+                batch_idx = torch.arange(B, device=device)
+                last_idx = (seq_lengths - 1).clamp(min=0)
+                last_alpha = alpha_padded[batch_idx, last_idx]
+                ll = torch.logsumexp(last_alpha.view(B, -1), dim=-1)
+                ll = torch.where(seq_lengths > 0, ll, neg_inf)
+
+            X.log_likelihoods = ll.detach().clone()
+
+            if verbose:
+                print(f"[compute_ll/list] alpha_padded={alpha_padded.shape}, seq_lengths={seq_lengths.tolist()}")
+                print(f"[compute_ll/list] log-likelihoods: {ll}")
+
+            return ll
+
+        else:
+            raise TypeError(f"Unexpected alpha_out type: {type(alpha_out).__name__}")
 
     def information(
         self,
