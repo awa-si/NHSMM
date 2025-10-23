@@ -41,10 +41,38 @@ def log_normalize(matrix: torch.Tensor, dim: Union[int, Tuple[int, ...]] = -1) -
 # -------------------------
 # Dirichlet / probability sampling
 # -------------------------
-def sample_probs(prior: float, target_size: Union[Tuple[int, ...], torch.Size], dtype=DTYPE, device=None) -> torch.Tensor:
+def sample_probs(
+    prior: float,
+    target_size: Union[Tuple[int, ...], torch.Size],
+    dtype=DTYPE,
+    device=None,
+    seed: int = None
+) -> torch.Tensor:
+    """
+    Sample probability vectors from a Dirichlet distribution with optional seeding.
+    """
     prior = max(prior, EPS)
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if seed is not None:
+        # Save and restore RNG state to avoid global side effects
+        if device.type == "cuda":
+            rng_state = torch.cuda.get_rng_state()
+            torch.cuda.manual_seed(seed)
+        else:
+            rng_state = torch.get_rng_state()
+            torch.manual_seed(seed)
+
     alphas = torch.full(target_size, prior, dtype=dtype, device=device)
-    return torch.distributions.Dirichlet(alphas).sample()
+    probs = torch.distributions.Dirichlet(alphas).sample()
+
+    if seed is not None:
+        if device.type == "cuda":
+            torch.cuda.set_rng_state(rng_state)
+        else:
+            torch.set_rng_state(rng_state)
+
+    return probs.clamp_min(EPS)
 
 
 def sample_transition(
@@ -53,9 +81,23 @@ def sample_transition(
     A_type: Union[str, Transitions],
     device=None,
     dtype=DTYPE,
-    verbose: bool = False
+    verbose: bool = False,
+    seed: int = None
 ) -> torch.Tensor:
+    """
+    Sample a transition matrix with optional seeding and transition constraints.
+    """
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     t = _resolve_type(A_type, Transitions)
+
+    if seed is not None:
+        if device.type == "cuda":
+            rng_state = torch.cuda.get_rng_state()
+            torch.cuda.manual_seed(seed)
+        else:
+            rng_state = torch.get_rng_state()
+            torch.manual_seed(seed)
+
     probs = sample_probs(prior, (n_states, n_states), dtype=dtype, device=device)
 
     if t == Transitions.SEMI.value:
@@ -63,11 +105,11 @@ def sample_transition(
         probs.fill_diagonal_(0.0)
         row_sums = probs.sum(dim=-1, keepdim=True)
         zero_rows = row_sums.squeeze(-1) == 0
-        if zero_rows.any():
-            if verbose: print("[sample_transition] Zero rows detected in SEMI; replacing with uniform off-diagonal")
-            for i in torch.nonzero(zero_rows, as_tuple=False).squeeze(-1):
-                probs[i] = 1.0
-                probs[i, i] = 0.0
+        if zero_rows.any() and verbose:
+            print("[sample_transition] Zero rows detected in SEMI; replacing with uniform off-diagonal")
+        for i in torch.nonzero(zero_rows, as_tuple=False).squeeze(-1):
+            probs[i] = 1.0
+            probs[i, i] = 0.0
         probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(EPS)
 
     elif t == Transitions.LEFT_TO_RIGHT.value:
@@ -75,16 +117,23 @@ def sample_transition(
         probs = probs * mask
         row_sums = probs.sum(dim=-1, keepdim=True)
         zero_rows = row_sums.squeeze(-1) == 0
-        if zero_rows.any():
-            if verbose: print("[sample_transition] Zero rows detected in LEFT_TO_RIGHT; filling upper-triangle")
-            for i in torch.nonzero(zero_rows, as_tuple=False).squeeze(-1):
-                probs[i] = mask[i]
+        if zero_rows.any() and verbose:
+            print("[sample_transition] Zero rows detected in LEFT_TO_RIGHT; filling upper-triangle")
+        for i in torch.nonzero(zero_rows, as_tuple=False).squeeze(-1):
+            probs[i] = mask[i]
         probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(EPS)
 
     elif t == Transitions.ERGODIC.value:
         probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(EPS)
+
     else:
         raise NotImplementedError(f"Unsupported Transition type: {t}")
+
+    if seed is not None:
+        if device.type == "cuda":
+            torch.cuda.set_rng_state(rng_state)
+        else:
+            torch.set_rng_state(rng_state)
 
     return probs
 

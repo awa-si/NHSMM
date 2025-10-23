@@ -5,12 +5,18 @@ from torch.utils.data import Dataset, DataLoader
 
 import numpy as np
 import polars as pl
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Union
 
 from nhsmm.defaults import DTYPE
 
 
+# ============================================================
+# Load external dataframe
+# ============================================================
 def load_dataframe(data_dir: str, pair: str, timeframe: str) -> pl.DataFrame:
+    """
+    Load a Feather file with price or feature data, ensuring sorted timestamps.
+    """
     symbol = pair.replace("/", "_").replace(":", "_")
     filename = f"{symbol}-{timeframe}-futures.feather"
     path = os.path.join(data_dir, filename)
@@ -18,6 +24,10 @@ def load_dataframe(data_dir: str, pair: str, timeframe: str) -> pl.DataFrame:
         raise FileNotFoundError(f"Freqtrade data not found for {pair} @ {timeframe}: {path}")
     return pl.read_ipc(path, memory_map=False).sort("date")
 
+
+# ============================================================
+# Synthetic Gaussian generator (now segment-aware)
+# ============================================================
 def generate_gaussian_sequence(
     n_states: int,
     n_features: int,
@@ -28,62 +38,85 @@ def generate_gaussian_sequence(
     context_dim: Optional[int] = None,
     context_noise_scale: float = 0.05,
     normalize: bool = False,
-    dataframe: Optional[pl.DataFrame] = None
+    dataframe: Optional[pl.DataFrame] = None,
 ):
+    """
+    Generate synthetic Gaussian data for HSMMs with optional context.
+
+    Returns:
+        segments_X: list[Tensor[T_i, F]]
+        segments_states: list[Tensor[T_i]]
+        segments_C: list[Tensor[T_i, C]] or None
+    """
     rng = np.random.default_rng(seed)
     torch.manual_seed(seed)
 
-    X_list, states_list, C_list = [], [], []
+    segments_X, segments_states, segments_C = [], [], []
 
     if dataframe is not None:
+        # Use real data as one long sequence
         feature_cols = dataframe.columns[-n_features:]
         X_np = dataframe.select(feature_cols).to_numpy()
         n_samples = X_np.shape[0]
-        X_list.append(X_np)
-        states_list = np.zeros(n_samples, dtype=int)
+        X_tensor = torch.tensor(X_np, dtype=DTYPE)
+        state_seq = torch.zeros(n_samples, dtype=torch.long)
+        segments_X = [X_tensor]
+        segments_states = [state_seq]
         if context_dim:
-            C_list.append(rng.normal(scale=context_noise_scale, size=(n_samples, context_dim)))
+            C_tensor = torch.tensor(
+                rng.normal(scale=context_noise_scale, size=(n_samples, context_dim)),
+                dtype=DTYPE,
+            )
+            segments_C = [C_tensor]
     else:
+        # Pure synthetic generation
         base_means = rng.uniform(-1.0, 1.0, size=(n_states, n_features))
         for s in range(n_states):
             for _ in range(n_segments_per_state):
-                L = int(rng.integers(*seg_len_range))
-                segment = base_means[s] + rng.normal(scale=noise_scale, size=(L, n_features))
-                X_list.append(segment)
-                states_list.extend([s] * L)
+                L = int(rng.integers(seg_len_range[0], seg_len_range[1] + 1))
+                X_seg = base_means[s] + rng.normal(scale=noise_scale, size=(L, n_features))
+                S_seg = np.full(L, s, dtype=int)
+                segments_X.append(torch.tensor(X_seg, dtype=DTYPE))
+                segments_states.append(torch.tensor(S_seg, dtype=torch.long))
                 if context_dim:
-                    C_list.append(rng.normal(scale=context_noise_scale, size=(L, context_dim)))
+                    C_seg = rng.normal(scale=context_noise_scale, size=(L, context_dim))
+                    segments_C.append(torch.tensor(C_seg, dtype=DTYPE))
 
-    X = np.vstack(X_list)
-    states = np.array(states_list, dtype=int)
-    C = np.vstack(C_list) if C_list else None
-
+    # Optional normalization
     if normalize:
-        X = (X - X.mean(0)) / (X.std(0) + 1e-8)
+        all_X = torch.cat(segments_X, dim=0)
+        mean, std = all_X.mean(0, keepdim=True), all_X.std(0, keepdim=True) + 1e-8
+        segments_X = [(x - mean) / std for x in segments_X]
 
-    X_tensor = torch.tensor(X, dtype=DTYPE)
-    C_tensor = torch.tensor(C, dtype=DTYPE) if C is not None else None
-
-    return states, X_tensor, C_tensor
+    return segments_X, segments_states, segments_C if segments_C else None
 
 
+# ============================================================
+# Sequence Dataset
+# ============================================================
 class SequenceDataset(Dataset):
+    """
+    Dataset for training/decoding variable-length sequences in HSMMs.
+    Supports both synthetic Gaussian sequences and external dataframe inputs.
+    """
+
     def __init__(
         self,
         n_states: int,
         n_features: int,
         seed: int = 42,
-        seg_len_range: Tuple[int, int] = (5, 20),
         n_segments_per_state: int = 3,
-        noise_scale: float = 0.05,
+        seg_len_range: Tuple[int, int] = (5, 20),
         context_dim: Optional[int] = None,
         context_noise_scale: float = 0.05,
+        variable_length: bool = False,
+        noise_scale: float = 0.05,
         normalize: bool = False,
         dataframe: Optional[pl.DataFrame] = None,
-        variable_length: bool = False
     ):
         self.variable_length = variable_length
-        self.states, X, C = generate_gaussian_sequence(
+
+        seg_X, seg_states, seg_C = generate_gaussian_sequence(
             n_states=n_states,
             n_features=n_features,
             seed=seed,
@@ -93,21 +126,19 @@ class SequenceDataset(Dataset):
             context_dim=context_dim,
             context_noise_scale=context_noise_scale,
             normalize=normalize,
-            dataframe=dataframe
+            dataframe=dataframe,
         )
 
-        # Convert to tensor
-        self.X = X if isinstance(X, torch.Tensor) else torch.tensor(X, dtype=DTYPE)
-        self.C = C if isinstance(C, torch.Tensor) or C is None else torch.tensor(C, dtype=DTYPE)
-        self.states = torch.tensor(self.states, dtype=torch.long)
-
-        # Split into sequences if variable_length
-        if self.variable_length:
-            self.seq_lengths = [len(self.X)] if dataframe is not None else [len(seg) for seg in X] if isinstance(X, list) else [len(X)]
-            if isinstance(X, torch.Tensor) and not isinstance(X, list):
-                self.X = [self.X]  # wrap in list for uniform processing
-                if self.C is not None:
-                    self.C = [self.C]
+        # Store as list of sequences for variable-length mode
+        if variable_length:
+            self.X = seg_X
+            self.states = seg_states
+            self.C = seg_C
+        else:
+            # Flatten all segments into one big sequence
+            self.X = torch.cat(seg_X, dim=0)
+            self.states = torch.cat(seg_states, dim=0)
+            self.C = torch.cat(seg_C, dim=0) if seg_C else None
 
     def __len__(self):
         return len(self.X) if self.variable_length else self.X.shape[0]
@@ -124,11 +155,17 @@ class SequenceDataset(Dataset):
             else:
                 return self.X[idx], self.states[idx]
 
+    # ========================================================
+    # Collation and loader
+    # ========================================================
     def collate_fn(self, batch):
-        # batch: list of tuples (X_seq, C_seq, state_seq) or (X_seq, state_seq)
+        """
+        Pads variable-length sequences into uniform tensors.
+        """
         X_list = [b[0] for b in batch]
         lengths = torch.tensor([len(x) for x in X_list], dtype=torch.long)
         X_padded = torch.nn.utils.rnn.pad_sequence(X_list, batch_first=True)
+
         if self.C is not None:
             C_list = [b[1] for b in batch]
             C_padded = torch.nn.utils.rnn.pad_sequence(C_list, batch_first=True)
@@ -141,4 +178,12 @@ class SequenceDataset(Dataset):
             return X_padded, states_padded, lengths
 
     def loader(self, batch_size=64, shuffle=True):
-        return DataLoader(self, batch_size=batch_size, shuffle=shuffle, collate_fn=self.collate_fn if self.variable_length else None)
+        """
+        Build DataLoader with correct collation.
+        """
+        return DataLoader(
+            self,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            collate_fn=self.collate_fn if self.variable_length else None,
+        )
