@@ -127,7 +127,7 @@ if __name__ == "__main__":
     # -------------------------
     # Initialization
     # -------------------------
-    model.initialize_emissions(X_batch.to(device), method="kmeans")
+    # model.initialize_emissions(X_batch.to(device), method="kmeans")
     with torch.no_grad():
         theta = model.encode_observations(X_batch.to(device))
         pdf = model._contextual_emission_pdf(X_batch.to(device), theta)
