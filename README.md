@@ -25,7 +25,7 @@ It extends classical HSMM's with learnable **emission**, **duration**, and **tra
 ### From source (recommended for development)
 
 ```bash
-git clone https://github.com/awwea/NeuralHSMM.git
+git clone https://github.com/awa-si/NHSMM.git
 cd NeuralHSMM
 pip install -e .
 ```
