@@ -10,7 +10,7 @@ from nhsmm.defaults import DTYPE
 from nhsmm.models.hsmm import HSMM
 
 
-class GaussianHSMM(HSMM, nn.Module):
+class GaussianHSMM(HSMM):
     """
     Gaussian Hidden Semi-Markov Model (HSMM) with multivariate normal emissions.
 
@@ -60,9 +60,6 @@ class GaussianHSMM(HSMM, nn.Module):
         cov_dof = K * F * (F + 1) // 2
         return int(trans_dof + mean_dof + cov_dof)
 
-    # -------------------------
-    # --- EMISSION PDF METHODS
-    # -------------------------
     def sample_emission_pdf(self, X: Optional[torch.Tensor] = None, theta: Optional[dict] = None) -> MultivariateNormal:
         dev = 'cpu'
         if hasattr(self, "_emission_means"):
@@ -120,9 +117,6 @@ class GaussianHSMM(HSMM, nn.Module):
 
         return MultivariateNormal(loc=self._emission_means, covariance_matrix=self._emission_covs)
 
-    # -------------------------
-    # --- HELPER METHODS
-    # -------------------------
     def _compute_means(self, X: torch.Tensor, posterior: torch.Tensor) -> torch.Tensor:
         weighted_sum = posterior.T @ X
         norm = posterior.sum(dim=0, keepdim=True).T.clamp_min(1e-12)
@@ -192,9 +186,6 @@ class GaussianHSMM(HSMM, nn.Module):
             return pdf
         return None
 
-    # -------------------------
-    # --- INITIALIZATION
-    # -------------------------
     def initialize_emissions(
         self,
         X: torch.Tensor,
@@ -244,7 +235,7 @@ class GaussianHSMM(HSMM, nn.Module):
         # Warm-start pi, A, D
         pi_counts = torch.bincount(labels[:1], minlength=K).to(dtype=DTYPE)
         pi = (pi_counts + 1e-6) / (pi_counts.sum() + 1e-6 * K)
-        self._pi_logits.copy_(pi.log().to(self._pi_logits.device))
+        self.init_logits.copy_(pi.log().to(self.init_logits.device))
 
         lbls = labels.cpu().numpy()
         segments = []
@@ -258,22 +249,19 @@ class GaussianHSMM(HSMM, nn.Module):
                     cur, length = v, 1
             segments.append((cur, length))
 
-        A_counts = torch.full((K, K), smooth_transition, dtype=DTYPE, device=self._A_logits.device)
+        A_counts = torch.full((K, K), smooth_transition, dtype=DTYPE, device=self.transition_logits.device)
         prev = None
         for s, _ in segments:
             if prev is not None:
                 A_counts[prev, s] += 1.0
             prev = s
-        self._A_logits.copy_((A_counts / A_counts.sum(dim=1, keepdim=True)).log().to(self._A_logits.device))
+        self.transition_logits.copy_((A_counts / A_counts.sum(dim=1, keepdim=True)).log().to(self.transition_logits.device))
 
-        D_counts = torch.full((K, self.max_duration), smooth_duration, dtype=DTYPE, device=self._D_logits.device)
+        D_counts = torch.full((K, self.max_duration), smooth_duration, dtype=DTYPE, device=self.duration_logits.device)
         for s, l in segments:
             D_counts[s, min(l, self.max_duration) - 1] += 1.0
-        self._D_logits.copy_((D_counts / D_counts.sum(dim=1, keepdim=True)).log().to(self._D_logits.device))
+        self.duration_logits.copy_((D_counts / D_counts.sum(dim=1, keepdim=True)).log().to(self.duration_logits.device))
 
-    # -------------------------
-    # --- DECODING
-    # -------------------------
     def decode(
         self,
         X: torch.Tensor,
