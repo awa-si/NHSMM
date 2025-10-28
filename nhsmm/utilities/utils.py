@@ -3,6 +3,9 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 
+# -----------------------------
+# Observations
+# -----------------------------
 @dataclass(frozen=False)
 class Observations:
     sequence: List[torch.Tensor]
@@ -19,11 +22,13 @@ class Observations:
         if any(s.shape[0] != l for s, l in zip(self.sequence, seq_lengths)):
             raise ValueError("Mismatch between sequence lengths and `lengths`.")
         object.__setattr__(self, "lengths", seq_lengths)
+
         if self.log_probs is not None:
             if len(self.log_probs) != len(self.sequence):
                 raise ValueError("`log_probs` length must match `sequence` length.")
             if not all(isinstance(lp, torch.Tensor) for lp in self.log_probs):
                 raise TypeError("All elements in `log_probs` must be torch.Tensor.")
+
         if self.context is not None:
             if len(self.context) != len(self.sequence):
                 raise ValueError("`context` length must match `sequence` length.")
@@ -92,6 +97,9 @@ class Observations:
         normed = [(s - mean) / std for s in self.sequence]
         return Observations(normed, self.lengths, self.context, self.log_probs)
 
+    # -----------------------------
+    # Vectorized batching
+    # -----------------------------
     def to_batch(
         self,
         pad_value: float = 0.0,
@@ -105,18 +113,19 @@ class Observations:
 
         seq_batch = torch.full((B, T, D), pad_value, dtype=dtype, device=device)
         mask = torch.zeros((B, T), dtype=torch.bool, device=device)
-        for i, seq in enumerate(self.sequence):
-            if seq.numel() > 0:
-                L = seq.shape[0]
-                seq_batch[i, :L] = seq
-                mask[i, :L] = True
+
+        lengths_tensor = torch.tensor(self.lengths, device=device)
+        for i, s in enumerate(self.sequence):
+            L = s.shape[0]
+            seq_batch[i, :L] = s
+            mask[i, :L] = True
 
         log_batch = None
         if include_log_probs and self.log_probs:
-            K = self.log_probs[0].shape[1]
+            K = self.log_probs[0].shape[-1]
             log_batch = torch.full((B, T, K), log_pad_value, dtype=dtype, device=device)
             for i, lp in enumerate(self.log_probs):
-                if lp is not None and lp.numel() > 0:
+                if lp is not None:
                     log_batch[i, :lp.shape[0]] = lp
 
         ctx_batch = None
@@ -133,31 +142,13 @@ class Observations:
             return seq_batch, mask, log_batch, ctx_batch
         return (seq_batch, log_batch, ctx_batch) if log_batch is not None else seq_batch
 
-    # -----------------------------
-    # New method: packed sequences
-    # -----------------------------
     def pad_sequences(self, pad_value: float = 0.0) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
-        """
-        Return padded sequences for RNN/HSMM input:
-        - padded_seq: [B, T, D]
-        - mask: [B, T] boolean
-        - lengths: original lengths
-        """
-        B, T, D = self.n_sequences, max(self.lengths), self.feature_dim
-        device, dtype = self.device, self.dtype
-
-        padded_seq = torch.full((B, T, D), pad_value, dtype=dtype, device=device)
-        mask = torch.zeros((B, T), dtype=torch.bool, device=device)
-
-        for i, seq in enumerate(self.sequence):
-            if seq.numel() > 0:
-                L = seq.shape[0]
-                padded_seq[i, :L] = seq
-                mask[i, :L] = True
-
-        return padded_seq, mask, self.lengths
+        return self.to_batch(pad_value=pad_value, return_mask=True, include_log_probs=False, include_context=False)[:3]
 
 
+# -----------------------------
+# ContextualVariables
+# -----------------------------
 @dataclass(frozen=False)
 class ContextualVariables:
 
@@ -231,22 +222,27 @@ class ContextualVariables:
             return ContextualVariables(self.n_context, self.X[idx], self.time_dependent, self.names)
         return self.X[idx]
 
+    # Vectorized padding
     def pad_batch(self, pad_value: float = 0.0, return_mask: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if self.time_dependent:
-            B = 1 if self.X[0].ndim == 2 else self.X[0].shape[0]
-            max_len = max(x.shape[1] if x.ndim == 3 else x.shape[0] for x in self.X)
-            padded_list, mask = [], torch.zeros((B, max_len), dtype=torch.bool, device=self.device)
-            for x in self.X:
-                x_pad = x.unsqueeze(0) if x.ndim == 2 else x
-                Bx, Tx, Fx = x_pad.shape
-                pad_tensor = torch.full((Bx, max_len, Fx), pad_value, dtype=x.dtype, device=x.device)
-                pad_tensor[:, :Tx, :] = x_pad
-                padded_list.append(pad_tensor)
-                mask[:, :Tx] |= True
-            batch_tensor = torch.cat(padded_list, dim=-1)
-            return (batch_tensor, mask) if return_mask else batch_tensor
-        else:
+        if not self.time_dependent:
             return torch.stack(self.X, dim=0)
+
+        B = 1 if self.X[0].ndim == 2 else self.X[0].shape[0]
+        max_len = max(x.shape[1] if x.ndim == 3 else x.shape[0] for x in self.X)
+        H = sum(x.shape[-1] for x in self.X)
+        padded = torch.full((B, max_len, H), pad_value, dtype=self.dtype, device=self.device)
+        mask = torch.zeros((B, max_len), dtype=torch.bool, device=self.device)
+
+        offset = 0
+        for x in self.X:
+            x_pad = x.unsqueeze(0) if x.ndim == 2 else x
+            L = x_pad.shape[1]
+            F = x_pad.shape[2]
+            padded[:, :L, offset:offset+F] = x_pad
+            mask[:, :L] = True
+            offset += F
+
+        return (padded, mask) if return_mask else padded
 
     def summary(self) -> str:
         dep = "time-dependent" if self.time_dependent else "static"

@@ -27,17 +27,15 @@ class HSMMError(ValueError):
     """Custom error class for HSMM module."""
     pass
 
-
 class Contextual(nn.Module):
     """
-    Unified context-modulated parameter adapter.
+    Context-modulated parameter adapter for HSMM modules.
 
-    Key features:
-    - Dynamically adapts to mismatched context dimensions (learnable projection).
-    - Supports both temporal (Conv1d) and spatial (Linear) adapters.
-    - Works symmetrically for Emission, Transition, and Duration modules.
-    - Aggregates context embeddings (mean/sum/max) if enabled.
-    - Fully device/dtype-safe and drop-in compatible.
+    Features:
+    - Handles mismatched context dimensions via learnable projection.
+    - Supports temporal (Conv1d) and spatial (Linear) adapters.
+    - Aggregates context embeddings (mean/sum/max).
+    - Fully device/dtype safe.
     """
 
     def __init__(
@@ -65,10 +63,11 @@ class Contextual(nn.Module):
         self.final_activation_name = final_activation
         self.allow_projection = allow_projection
 
-        # Core context encoder
-        self.context_net = None
+        hidden_dim = hidden_dim or max(16, target_dim // 2, context_dim or target_dim)
+
+        # Context encoder
+        self.context_net: Optional[nn.Module] = None
         if context_dim is not None:
-            hidden_dim = hidden_dim or max(context_dim, target_dim)
             self.context_net = nn.Sequential(
                 nn.Linear(context_dim, hidden_dim, device=self.device, dtype=DTYPE),
                 nn.LayerNorm(hidden_dim, device=self.device, dtype=DTYPE),
@@ -77,7 +76,7 @@ class Contextual(nn.Module):
             )
             self._init_weights(self.context_net)
 
-        # Adapters
+        # Temporal & Spatial adapters
         self.temporal_adapter = (
             nn.Conv1d(target_dim, target_dim, kernel_size=3, padding=1, bias=False).to(self.device, DTYPE)
             if temporal_adapter else None
@@ -91,10 +90,9 @@ class Contextual(nn.Module):
         if self.spatial_adapter:
             nn.init.xavier_uniform_(self.spatial_adapter.weight)
 
-        # Dynamic projection if incoming context doesn't match expected size
-        self._proj = None
+        self._proj: Optional[nn.Linear] = None
 
-    # ---------- Internal helpers ----------
+    # ---------- Internal Helpers ----------
 
     def _get_activation(self, name: str) -> nn.Module:
         acts = {
@@ -110,19 +108,19 @@ class Contextual(nn.Module):
         return acts[name.lower()]
 
     def _init_weights(self, module: nn.Module) -> None:
-        for m in module:
+        for m in module.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
-                nn.init.zeros_(m.bias)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def _ensure_projection(self, in_dim: int) -> None:
-        """Ensure projection exists if context dim mismatches."""
         if not self.allow_projection:
             raise ValueError(f"Context last dimension must be {self.context_dim}, got {in_dim}")
         if self._proj is None:
             out_dim = self.context_dim or self.target_dim
             self._proj = nn.Linear(in_dim, out_dim, device=self.device, dtype=DTYPE)
-            nn.init.normal_(self._proj.weight, 0.0, 1e-3)
+            nn.init.normal_(self._proj.weight, mean=0.0, std=1e-3)
             nn.init.zeros_(self._proj.bias)
             if self.debug:
                 print(f"[Contextual] Added projection {in_dim} → {out_dim}")
@@ -134,20 +132,14 @@ class Contextual(nn.Module):
         if context.ndim == 1:
             context = context.unsqueeze(0)
         in_dim = context.shape[-1]
-
-        # Infer context_dim if not set yet
         if self.context_dim is None:
             self.context_dim = in_dim
             if self.debug:
                 print(f"[Contextual] Inferred context_dim = {self.context_dim}")
-
-        # Auto-project mismatched contexts
         if in_dim != self.context_dim:
             self._ensure_projection(in_dim)
             context = self._proj(context)
         return context
-
-    # ---------- Core operations ----------
 
     def _prepare_delta(
         self,
@@ -157,8 +149,6 @@ class Contextual(nn.Module):
         grad_scale: Optional[float] = None
     ) -> torch.Tensor:
         delta = delta.to(self.device, DTYPE)
-
-        # Apply adapters
         if self.temporal_adapter:
             if delta.ndim == 2:
                 delta = delta.unsqueeze(1)
@@ -168,7 +158,6 @@ class Contextual(nn.Module):
         if self.spatial_adapter:
             delta = self.spatial_adapter(delta)
 
-        # Aggregate across batch
         if self.aggregate_context and delta.ndim > 1:
             if self.aggregate_method == "mean":
                 delta = delta.mean(dim=0, keepdim=True)
@@ -179,11 +168,9 @@ class Contextual(nn.Module):
             else:
                 raise ValueError(f"Unsupported aggregate_method: {self.aggregate_method}")
 
-        # Apply final activation and scaling
         delta = self._get_activation(self.final_activation_name)(delta) * scale
         if grad_scale is not None:
             delta = delta * grad_scale
-
         return delta.expand_as(torch.zeros(base_shape, device=self.device, dtype=DTYPE))
 
     def _apply_context(
@@ -193,27 +180,16 @@ class Contextual(nn.Module):
         scale: float = 0.1,
         grad_scale: Optional[float] = None
     ) -> torch.Tensor:
-        """Apply context modulation to a base tensor."""
         if context is None:
             return base
-
         context = self._validate_context(context)
-        if self.context_net:
-            delta = self.context_net(context)
-        else:
-            if self._proj is None:
-                self._ensure_projection(context.shape[-1])
-            delta = self._proj(context)
-
+        delta = self.context_net(context) if self.context_net else self._proj(context)
         delta = self._prepare_delta(delta, base.shape, scale=scale, grad_scale=grad_scale)
         result = base + torch.where(torch.isfinite(delta), delta, torch.zeros_like(delta))
-
         if self.debug:
             print(f"[Contextual] base={tuple(base.shape)} ctx={tuple(context.shape)} "
                   f"delta={tuple(delta.shape)} → result={tuple(result.shape)}")
         return result
-
-    # ---------- Utilities ----------
 
     def get_config(self) -> Dict[str, Any]:
         return dict(
@@ -232,32 +208,63 @@ class Contextual(nn.Module):
     def to(self, device, **kwargs) -> "Contextual":
         self.device = torch.device(device)
         super().to(device, **kwargs)
-        if self.context_net:
-            self.context_net.to(device, **kwargs)
-        if self.temporal_adapter:
-            self.temporal_adapter.to(device, **kwargs)
-        if self.spatial_adapter:
-            self.spatial_adapter.to(device, **kwargs)
-        if self._proj:
-            self._proj.to(device, **kwargs)
+        for m in [self.context_net, self.temporal_adapter, self.spatial_adapter, self._proj]:
+            if m is not None:
+                m.to(device, **kwargs)
         return self
 
+# -------------------- Emission --------------------
 
 class Emission(Contextual):
-    """Contextual emission distribution: Gaussian, Categorical, or Bernoulli."""
+    """Contextual emission distribution: Gaussian, Categorical, Bernoulli with per-state gating."""
 
-    def __init__(self, n_states, n_features, min_covar=1e-3, context_dim=None,
-                 hidden_dim=None, emission_type="gaussian", aggregate_context=True,
-                 aggregate_method="mean", device=None, scale=0.1, modulate_var=False,
-                 debug=False):
-        super().__init__(context_dim, n_states * n_features, aggregate_context, aggregate_method,
-                         hidden_dim, "tanh", device, debug)
+    def __init__(
+        self,
+        n_states: int,
+        n_features: int,
+        min_covar: float = 1e-3,
+        context_dim: Optional[int] = None,
+        hidden_dim: Optional[int] = None,
+        emission_type: str = "gaussian",
+        aggregate_context: bool = True,
+        aggregate_method: str = "mean",
+        device: Optional[torch.device] = None,
+        scale: float = 0.05,
+        modulate_var: bool = False,
+        temporal_adapter: bool = False,
+        spatial_adapter: bool = False,
+        allow_projection: bool = True,
+        adaptive_scale: bool = True,
+        debug: bool = False
+    ):
+        super().__init__(
+            context_dim=context_dim,
+            target_dim=n_states * n_features,
+            aggregate_context=aggregate_context,
+            aggregate_method=aggregate_method,
+            hidden_dim=hidden_dim,
+            device=device,
+            debug=debug,
+            temporal_adapter=temporal_adapter,
+            spatial_adapter=spatial_adapter,
+            allow_projection=allow_projection
+        )
         self.n_states = n_states
         self.n_features = n_features
         self.min_covar = min_covar
         self.scale = scale
         self.modulate_var = modulate_var
+        self.adaptive_scale = adaptive_scale
         self.emission_type = emission_type.lower()
+
+        # Optional per-state gating
+        self.state_gate = None
+        if context_dim is not None:
+            self.state_gate = nn.Sequential(
+                nn.Linear(context_dim, n_states, device=self.device, dtype=DTYPE),
+                nn.Sigmoid()
+            )
+
         self._init_parameters()
 
     def _init_parameters(self):
@@ -269,48 +276,82 @@ class Emission(Contextual):
         else:
             raise HSMMError(f"Unsupported emission_type: {self.emission_type}")
 
-    def forward(self, context=None, return_dist=False):
+    def _modulate_per_state(self, base: torch.Tensor, context: Optional[torch.Tensor]) -> torch.Tensor:
+        if context is None or self.state_gate is None:
+            return base
+        gate = self.state_gate(context)
+        if self.adaptive_scale:
+            ctx_norm = context.norm(dim=-1, keepdim=True)
+            adaptive_factor = self.scale / (ctx_norm + 1e-6)
+            gate = gate * adaptive_factor
+        while gate.ndim < base.ndim:
+            gate = gate.unsqueeze(-1)
+        return base * gate
+
+    def forward(self, context: Optional[torch.Tensor] = None, return_dist: bool = False):
         if self.emission_type == "gaussian":
             mu = self._apply_context(self.mu, context, self.scale)
+            mu = self._modulate_per_state(mu, context)
             var = torch.clamp(F.softplus(self.log_var), min=self.min_covar)
             if self.modulate_var:
-                var = self._apply_context(var, context, self.scale).abs() + self.min_covar
+                delta_var = self._apply_context(var, context, self.scale).abs()
+                delta_var = self._modulate_per_state(delta_var, context)
+                var = torch.clamp(var + delta_var, min=self.min_covar)
             if return_dist:
                 return Independent(Normal(mu, var.sqrt()), 1)
             return mu, var
 
         logits = self._apply_context(self.logits, context, self.scale)
+        logits = self._modulate_per_state(logits, context)
         if return_dist:
             return Categorical(logits=logits) if self.emission_type == "categorical" else Independent(Bernoulli(logits=logits), 1)
         return logits
 
-    def log_prob(self, x, context=None):
+    def log_prob(self, x: torch.Tensor, context: Optional[torch.Tensor] = None):
         dist = self.forward(context=context, return_dist=True)
         return dist.log_prob(x.to(self.device, DTYPE))
 
-    def sample(self, n_samples=1, context=None, state_indices=None):
+    def sample(self, n_samples: int = 1, context: Optional[torch.Tensor] = None, state_indices: Optional[torch.Tensor] = None):
         dist = self.forward(context=context, return_dist=True)
         samples = dist.rsample((n_samples,)) if self.emission_type == "gaussian" else dist.sample((n_samples,))
         if state_indices is not None:
             samples = samples[state_indices]
         return samples.to(self.device, DTYPE)
 
+# -------------------- Duration --------------------
 
 class Duration(Contextual):
     """Contextual duration distribution (categorical)."""
 
-    def __init__(self, n_states, max_duration=20, context_dim=None,
-                 aggregate_context=True, aggregate_method="mean", hidden_dim=None,
-                 device=None, temperature=1.0, scale=0.1, debug=False):
-        super().__init__(context_dim, n_states*max_duration, aggregate_context, aggregate_method,
-                         hidden_dim, "tanh", device, debug)
+    def __init__(
+        self,
+        n_states: int,
+        max_duration: int = 20,
+        context_dim: Optional[int] = None,
+        hidden_dim: Optional[int] = None,
+        aggregate_context: bool = True,
+        aggregate_method: str = "mean",
+        device: Optional[torch.device] = None,
+        temperature: float = 0.1,
+        scale: float = 1.0,
+        debug: bool = False,
+    ):
+        super().__init__(context_dim=context_dim,
+                         target_dim=n_states * max_duration,
+                         aggregate_context=aggregate_context,
+                         aggregate_method=aggregate_method,
+                         hidden_dim=hidden_dim,
+                         activation="tanh",
+                         final_activation="tanh",
+                         device=device,
+                         debug=debug)
         self.n_states = n_states
         self.max_duration = max_duration
         self.temperature = max(temperature, 1e-6)
         self.scale = scale
-        self.logits = nn.Parameter(torch.randn(n_states, max_duration, device=self.device, dtype=DTYPE)*0.1)
+        self.logits = nn.Parameter(torch.randn(n_states, max_duration, device=self.device, dtype=DTYPE) * 0.1)
 
-    def forward(self, context=None, log=False, return_dist=False):
+    def forward(self, context=None, log: bool = False, return_dist: bool = False):
         logits = self._apply_context(self.logits, context, self.scale) / self.temperature
         logits = torch.clamp(logits, -MAX_LOGITS, MAX_LOGITS)
         if return_dist:
@@ -318,35 +359,53 @@ class Duration(Contextual):
         return F.log_softmax(logits, dim=-1) if log else F.softmax(logits, dim=-1)
 
     def log_prob(self, x, context=None):
-        return self.forward(context=context, return_dist=True).log_prob(x.to(self.device, DTYPE))
+        dist = self.forward(context=context, return_dist=True)
+        return dist.log_prob(x.to(self.device, DTYPE))
 
     def expected_duration(self, context=None):
         probs = self.forward(context=context, log=False, return_dist=False)
         durations = torch.arange(1, self.max_duration + 1, device=self.device, dtype=DTYPE)
         return (probs * durations).sum(dim=-1)
 
-    def sample(self, n_samples=1, context=None, state_indices=None):
+    def sample(self, n_samples: int = 1, context=None, state_indices: Optional[torch.Tensor] = None):
         dist = self.forward(context=context, return_dist=True)
-        samples = dist.sample((n_samples,)).transpose(0,1)
+        samples = dist.sample((n_samples,)).transpose(0, 1)
         if state_indices is not None:
             samples = samples[state_indices, ...]
-        return samples
+        return samples.to(self.device, DTYPE)
 
+# -------------------- Transition --------------------
 
 class Transition(Contextual):
-    """Contextual transition distribution (categorical)."""
+    """Contextual transition distribution (categorical) per state."""
 
-    def __init__(self, n_states, context_dim=None, hidden_dim=None,
-                 aggregate_context=True, aggregate_method="mean", device=None,
-                 temperature=1.0, scale=0.1, debug=False):
-        super().__init__(context_dim, n_states*n_states, aggregate_context, aggregate_method,
-                         hidden_dim, "tanh", device, debug)
+    def __init__(
+        self,
+        n_states: int,
+        context_dim: Optional[int] = None,
+        hidden_dim: Optional[int] = None,
+        aggregate_context: bool = True,
+        aggregate_method: str = "mean",
+        device: Optional[torch.device] = None,
+        temperature: float = 0.1,
+        scale: float = 1.0,
+        debug: bool = False,
+    ):
+        super().__init__(context_dim=context_dim,
+                         target_dim=n_states * n_states,
+                         aggregate_context=aggregate_context,
+                         aggregate_method=aggregate_method,
+                         hidden_dim=hidden_dim,
+                         activation="tanh",
+                         final_activation="tanh",
+                         device=device,
+                         debug=debug)
         self.n_states = n_states
         self.temperature = max(temperature, 1e-6)
         self.scale = scale
-        self.logits = nn.Parameter(torch.randn(n_states, n_states, device=self.device, dtype=DTYPE)*0.1)
+        self.logits = nn.Parameter(torch.randn(n_states, n_states, device=self.device, dtype=DTYPE) * 0.1)
 
-    def forward(self, context=None, log=False, return_dist=False):
+    def forward(self, context=None, log: bool = False, return_dist: bool = False):
         logits = self._apply_context(self.logits, context, self.scale) / self.temperature
         logits = torch.clamp(logits, -MAX_LOGITS, MAX_LOGITS)
         if return_dist:
@@ -354,14 +413,15 @@ class Transition(Contextual):
         return F.log_softmax(logits, dim=-1) if log else F.softmax(logits, dim=-1)
 
     def log_prob(self, x, context=None):
-        return self.forward(context=context, return_dist=True).log_prob(x.to(self.device, DTYPE))
+        dist = self.forward(context=context, return_dist=True)
+        return dist.log_prob(x.to(self.device, DTYPE))
 
     def expected_transitions(self, context=None):
         return self.forward(context=context, log=False, return_dist=False)
 
-    def sample(self, n_samples=1, context=None, state_indices=None):
+    def sample(self, n_samples: int = 1, context=None, state_indices=None):
         dist = self.forward(context=context, return_dist=True)
-        samples = dist.sample((n_samples,)).transpose(0,1)
+        samples = dist.sample((n_samples,)).transpose(0, 1)
         if state_indices is not None:
             samples = samples[state_indices, ...]
-        return samples
+        return samples.to(self.device, DTYPE)
