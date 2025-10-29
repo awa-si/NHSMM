@@ -2,9 +2,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Categorical, Normal, Bernoulli, Independent
+from torch.distributions import Categorical, Normal, Bernoulli, Independent, MultivariateNormal
 
 import logging
+from sklearn.cluster import KMeans
 from typing import Optional, Union, Literal, Tuple, Dict, Any
 
 EPS = 1e-12
@@ -29,35 +30,160 @@ class HSMMError(ValueError):
     pass
 
 
+class EmissionSample(nn.Module):
+    """
+    Self-contained Gaussian emission handler for HSMM.
+
+    Args:
+        n_states: Number of hidden states
+        n_features: Observation dimensionality
+        min_covar: Covariance regularization term
+        k_means: Whether to use k-means initialization
+        seed: Random seed for reproducibility
+        init_spread: Std of initial random mean offsets (when data unavailable)
+    """
+
+    def __init__(
+        self,
+        n_states: int,
+        n_features: int,
+        k_means: bool = True,
+        min_covar: float = 1e-6,
+        init_spread: float = 1.0,
+        device: Optional[torch.device] = None,
+        seed: int = 0,
+    ):
+        super().__init__()
+
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.init_spread = float(init_spread)
+        self.min_covar = float(min_covar)
+        self.n_features = n_features
+        self.k_means = bool(k_means)
+        self.n_states = n_states
+        self.seed = int(seed)
+
+        if not hasattr(self, "_emission_means"):
+            self.register_buffer(
+                "_emission_means",
+                torch.zeros(self.n_states, self.n_features, dtype=DTYPE, device=self.device)
+            )
+        if not hasattr(self, "_emission_covs"):
+            eye = torch.eye(self.n_features, dtype=DTYPE, device=self.device)
+            self.register_buffer("_emission_covs", eye.unsqueeze(0).repeat(self.n_states, 1, 1))
+
+
+    @torch.no_grad()
+    def _spread_means(self, means: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+        """Ensure states start sufficiently apart."""
+        jitter = scale * torch.randn_like(means)
+        for _ in range(3):  # up to 3 small perturbations to reduce pairwise collapse
+            dists = torch.cdist(means + jitter, means + jitter)
+            mask = dists < 1e-3
+            if mask.sum() == 0:
+                break
+            jitter += scale * 0.1 * torch.randn_like(jitter)
+        return means + jitter
+
+    def initialize(
+        self,
+        X: torch.Tensor | None = None,
+        posterior: torch.Tensor | None = None,
+        theta: dict | None = None,
+        theta_scale: float = 0.1,
+    ) -> MultivariateNormal:
+
+        K, F = self.n_states, self.n_features
+        device = self.device
+
+        # --- Compute means ---
+        if X is not None:
+            X = X.to(dtype=DTYPE, device=device)
+
+            if posterior is not None:
+                norm = posterior.sum(dim=0, keepdim=True).T.clamp_min(EPS)
+                means = (posterior.T @ X) / norm
+                means = torch.where(torch.isfinite(means), means, X.mean(dim=0).expand_as(means))
+            else:
+                if self.k_means:
+                    X_np = X.detach().cpu().numpy()
+                    n_samples = X_np.shape[0]
+                    if n_samples < K:
+                        pad = K - n_samples
+                        X_np = np.concatenate([X_np, X_np[np.random.choice(n_samples, pad, replace=True)]], axis=0)
+                    km = KMeans(n_clusters=K, n_init=10, random_state=self.seed)
+                    km.fit(X_np)
+                    means = torch.from_numpy(km.cluster_centers_).to(dtype=DTYPE, device=device)
+                    means = self._spread_means(means, scale=1e-3)
+                else:
+                    means = X.mean(dim=0, keepdim=True).expand(K, -1)
+                    means = self._spread_means(means, scale=self.init_spread)
+
+            if theta is not None:
+                theta_tensor = torch.as_tensor(list(theta.values()), dtype=DTYPE, device=device).mean(dim=0, keepdim=True)
+                means = means + theta_scale * theta_tensor.expand(K, -1)
+        else:
+            means = self._spread_means(self._emission_means.clone(), scale=self.init_spread)
+
+        # --- Compute covariances, fully vectorized ---
+        if X is not None:
+            if posterior is not None:
+                # [T, K, F] differences weighted by posterior
+                diff = X.unsqueeze(1) - means.unsqueeze(0)  # [T, K, F]
+                w = posterior.clamp_min(EPS).unsqueeze(-1)  # [T, K, 1]
+                weighted_diff = diff * w  # [T, K, F]
+                covs = (weighted_diff.transpose(1, 2) @ diff) / w.sum(dim=0).clamp_min(EPS).unsqueeze(1)  # [K, F, F]
+                covs = 0.5 * (covs + covs.transpose(-1, -2))
+                trace = torch.trace(covs)
+                covs += self.min_covar * torch.eye(F, dtype=DTYPE, device=device).unsqueeze(0)
+            else:
+                centered = X - X.mean(dim=0, keepdim=True)
+                cov_base = (centered.T @ centered) / max(X.shape[0] - 1, 1)
+                covs = cov_base.unsqueeze(0).expand(K, -1, -1).clone()
+        else:
+            covs = self._emission_covs.clone()
+
+        # --- Regularize covariances ---
+        eps_eye = self.min_covar * torch.eye(F, dtype=DTYPE, device=device).unsqueeze(0)
+        covs = 0.5 * (covs + covs.transpose(-1, -2)) + eps_eye
+
+        # --- Update buffers ---
+        self._emission_means.copy_(means)
+        self._emission_covs.copy_(covs)
+
+        return MultivariateNormal(loc=self._emission_means, covariance_matrix=self._emission_covs)
+
+
 class Contextual(nn.Module):
     """Context-modulated parameter adapter with safe delta handling."""
 
     def __init__(
         self,
-        context_dim: Optional[int],
         target_dim: int,
+        context_dim: Optional[int],
         aggregate_context: bool = True,
-        aggregate_method: str = "mean",
         hidden_dim: Optional[int] = None,
-        activation: str = "tanh",
+        aggregate_method: str = "mean",
         final_activation: str = "tanh",
+        activation: str = "tanh",
         device: Optional[torch.device] = None,
-        debug: bool = False,
+        max_delta: Optional[float] = 0.5,
         temporal_adapter: bool = False,
         spatial_adapter: bool = False,
         allow_projection: bool = True,
-        max_delta: Optional[float] = 0.5,
+        debug: bool = False,
     ):
         super().__init__()
+
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.final_activation_name = final_activation
+        self.aggregate_context = aggregate_context
+        self.aggregate_method = aggregate_method
+        self.allow_projection = allow_projection
         self.context_dim = context_dim
         self.target_dim = target_dim
-        self.aggregate_context = aggregate_context
-        self.aggregate_method = aggregate_method.lower()
-        self.debug = debug
-        self.final_activation_name = final_activation
-        self.allow_projection = allow_projection
         self.max_delta = max_delta
+        self.debug = debug
 
         hidden_dim = hidden_dim or max(16, target_dim // 2, context_dim or target_dim)
 
