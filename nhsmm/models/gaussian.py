@@ -2,23 +2,23 @@
 import torch
 import torch.nn as nn
 from torch.distributions import MultivariateNormal
-
 from sklearn.cluster import KMeans
 from typing import Optional, Literal
 import numpy as np
 
-from nhsmm.defaults import DTYPE
+from nhsmm.defaults import DTYPE, EPS, HSMMError
 from nhsmm.models.hsmm import HSMM
 
 
-class GaussianHSMM(HSMM, nn.Module):
+class GaussianHSMM(HSMM):
     """
-    Pure Gaussian Hidden Semi-Markov Model (HSMM) with multivariate normal emissions.
-    Enhancements:
-      - initialize_emissions(X, method='kmeans'|'moment') to initialize means/covs and pi/A/D
-      - data-driven warm-start for duration and transition logits
-      - numeric/device/dtype safety and small-sample guards
-      - convenience decode() wrapper using _viterbi or predict
+    Gaussian Hidden Semi-Markov Model (HSMM) with multivariate normal emissions.
+
+    Features:
+        - Robust emission initialization (k-means or moments)
+        - Data-driven warm-start for pi, A, D
+        - Device/dtype safe, with regularization and small-sample guards
+        - decode() wrapper for convenience
     """
 
     def __init__(
@@ -30,12 +30,14 @@ class GaussianHSMM(HSMM, nn.Module):
         min_covar: float = 1e-3,
         alpha: float = 1.0,
         seed: Optional[int] = None,
+        device: Optional[torch.device] = None,
     ):
-        self.n_features = n_features
+        self.device = device if device is not None else torch.device('cpu')
         self.min_covar = float(min_covar)
+        self.n_features = n_features
         self.k_means = k_means
 
-        # Call base HSMM init
+
         super().__init__(
             n_states=n_states,
             n_features=n_features,
@@ -45,277 +47,219 @@ class GaussianHSMM(HSMM, nn.Module):
             seed=seed,
         )
 
-        # Register emission buffers (mean and covariance per state)
-        means_buf = torch.zeros(n_states, n_features, dtype=DTYPE)
-        covs_buf = torch.stack([torch.eye(n_features, dtype=DTYPE) for _ in range(n_states)])
+        # Initialize emission buffers
+        means_buf = torch.zeros(n_states, n_features, dtype=DTYPE, device=self.device)
+        covs_buf = torch.stack([torch.eye(n_features, dtype=DTYPE, device=self.device) for _ in range(n_states)])
         self.register_buffer("_emission_means", means_buf)
         self.register_buffer("_emission_covs", covs_buf)
 
-        # Ensure base emission pdf points to a valid object
-        self._params['emission_pdf'] = self.sample_emission_pdf(None)
-
-    @property
-    def dof(self) -> int:
-        """
-        Total degrees of freedom for the model:
-          - Transition matrix (A): n_states² - 1 (stochastic constraints)
-          - Emission means: n_states × n_features
-          - Emission covariances: depends on covariance structure (full/diag)
-        """
-        K, F = self.n_states, self.n_features
-
-        # Transition degrees (subtract one due to normalization)
-        trans_dof = K * K - 1
-
-        # Emission means
-        mean_dof = K * F
-
-        # Emission covariances (assuming full covariance)
-        cov_dof = K * F * (F + 1) // 2  # symmetric matrices
-
-        return int(trans_dof + mean_dof + cov_dof)
-
-    # -------------------------
-    # --- EMISSION INITIALIZATION
-    # -------------------------
-    def sample_emission_pdf(self, X: Optional[torch.Tensor] = None) -> MultivariateNormal:
-        """
-        Construct or re-sample the emission distribution.
-
-        If X is provided:
-          - Initialize means via k-means (if enabled) or global mean.
-          - Initialize covariances from sample covariance of X.
-        If X is None:
-          - Reuse current emission buffers (_emission_means / _emission_covs).
-        """
-        dev = getattr(self, "_emission_means", torch.tensor(0.)).device if hasattr(self, "_emission_means") else "cpu"
-        F = self.n_features
-        K = self.n_states
-
-        # Fallback if buffers are not yet registered
-        if not hasattr(self, "_emission_means") or not hasattr(self, "_emission_covs"):
-            means = torch.zeros(K, F, dtype=DTYPE, device=dev)
-            covs = torch.eye(F, dtype=DTYPE, device=dev).unsqueeze(0).repeat(K, 1, 1)
-            return MultivariateNormal(means, covs)
-
-        if X is not None:
-            X = X.to(dtype=DTYPE, device=dev)
-            means = (
-                self._sample_kmeans(X)
-                if self.k_means
-                else X.mean(dim=0, keepdim=True).expand(K, -1)
-            )
-
-            # unbiased covariance estimate
-            centered = X - X.mean(dim=0, keepdim=True)
-            denom = max(X.shape[0] - 1, 1)
-            base_cov = (centered.T @ centered) / denom
-            base_cov = 0.5 * (base_cov + base_cov.T)  # ensure symmetry
-
-            covs = base_cov.unsqueeze(0).expand(K, -1, -1).clone()
-        else:
-            means = self._emission_means.clone().to(dev)
-            covs = self._emission_covs.clone().to(dev)
-
-        # Regularize and enforce symmetry
-        eps_eye = self.min_covar * torch.eye(F, dtype=DTYPE, device=dev).unsqueeze(0)
-        covs = 0.5 * (covs + covs.transpose(-1, -2)) + eps_eye
-
-        # Copy back to buffers to keep internal state consistent
-        self._emission_means.copy_(means)
-        self._emission_covs.copy_(covs)
-
-        return MultivariateNormal(loc=self._emission_means, covariance_matrix=self._emission_covs)
-
-    # -------------------------
-    # --- EMISSION UPDATE
-    # -------------------------
-    def _estimate_emission_pdf(self, X: torch.Tensor, posterior: torch.Tensor, theta=None) -> MultivariateNormal:
-        """
-        Update Gaussian emission parameters given data and posterior responsibilities.
-
-        Args:
-            X: (N, F) observation tensor
-            posterior: (N, K) state posterior probabilities
-            theta: optional context (unused here)
-        Returns:
-            Updated MultivariateNormal distribution over states
-        """
-        assert X.ndim == 2 and posterior.ndim == 2, "X and posterior must be 2D (N,F) and (N,K)"
-        assert posterior.shape[0] == X.shape[0], "Mismatched sample count between X and posterior"
-        assert posterior.shape[1] == self.n_states, "Posterior K must match n_states"
-
-        dev = self._emission_means.device
-        X = X.to(dtype=DTYPE, device=dev)
-        posterior = posterior.to(dtype=DTYPE, device=dev)
-
-        # Recompute weighted means and covariances
-        means = self._compute_means(X, posterior)
-        covs = self._compute_covs(X, posterior, means)
-
-        # Symmetrize and regularize covariance matrices
-        covs = 0.5 * (covs + covs.transpose(-1, -2))
-        covs += self.min_covar * torch.eye(self.n_features, dtype=DTYPE, device=dev).unsqueeze(0)
-
-        # Update internal buffers safely (no autograd tracking)
-        with torch.no_grad():
-            self._emission_means.copy_(means)
-            self._emission_covs.copy_(covs)
-
-        # Return fresh MultivariateNormal tied to buffers
-        return MultivariateNormal(
+        # Initialize base emission PDF
+        self._params['emission_pdf'] = MultivariateNormal(
             loc=self._emission_means,
             covariance_matrix=self._emission_covs
         )
 
-    # -------------------------
-    # --- HELPERS
-    # -------------------------
-    def _compute_means(self, X: torch.Tensor, posterior: torch.Tensor) -> torch.Tensor:
+    @property
+    def dof(self) -> int:
+        K, F = self.n_states, self.n_features
+        trans_dof = K * (K - 1)
+        mean_dof = K * F
+        cov_dof = K * F * (F + 1) // 2
+        return trans_dof + mean_dof + cov_dof
+
+    def sample_emission_pdf(
+        self,
+        X: Optional[torch.Tensor] = None,
+        posterior: Optional[torch.Tensor] = None,
+        theta: Optional[dict] = None,
+        theta_scale: float = 0.1
+    ) -> MultivariateNormal:
         """
-        Compute per-state weighted means.
+        Self-contained emission PDF sampler for Gaussian HSMM.
+        Supports:
+            - Optional observations X
+            - Optional posterior weights per state
+            - Optional context/hyperparameter theta
+            - Safe per-state means and covariance regularization
+        """
+        device = getattr(self, "_emission_means", torch.zeros(1)).device if hasattr(self, "_emission_means") else "cpu"
+        K, F = self.n_states, self.n_features
+        eps = 1e-12
+
+        # --- Initialize buffers if missing ---
+        if not hasattr(self, "_emission_means") or not hasattr(self, "_emission_covs"):
+            means = torch.zeros(K, F, dtype=DTYPE, device=device)
+            covs = torch.stack([torch.eye(F, dtype=DTYPE, device=device) for _ in range(K)])
+            self.register_buffer("_emission_means", means)
+            self.register_buffer("_emission_covs", covs)
+            return torch.distributions.MultivariateNormal(means, covs)
+
+        # --- Compute means ---
+        if X is not None:
+            X = X.to(dtype=DTYPE, device=device)
+
+            if posterior is not None:
+                weighted_sum = posterior.T @ X
+                norm = posterior.sum(dim=0, keepdim=True).T.clamp_min(eps)
+                means = weighted_sum / norm
+                means = torch.where(
+                    torch.isnan(means) | torch.isinf(means),
+                    X.mean(dim=0).expand_as(means),
+                    means
+                )
+            else:
+                if getattr(self, "k_means", False):
+                    X_np = X.detach().cpu().numpy()
+                    n_samples = X_np.shape[0]
+                    if n_samples < K:
+                        pad = K - n_samples
+                        X_np = np.concatenate([X_np, X_np[np.random.choice(n_samples, pad, replace=True)]], axis=0)
+                    from sklearn.cluster import KMeans
+                    km = KMeans(n_clusters=K, n_init=10, random_state=getattr(self, "seed", 0))
+                    km.fit(X_np)
+                    means = torch.from_numpy(km.cluster_centers_).to(dtype=DTYPE, device=device)
+                    if torch.linalg.norm(means - means.mean(dim=0, keepdim=True)) < 1e-8:
+                        means += 1e-3 * torch.randn_like(means)
+                else:
+                    means = X.mean(dim=0, keepdim=True).expand(K, -1)
+
+            if theta is not None:
+                theta_tensor = torch.as_tensor(list(theta.values()), dtype=DTYPE, device=device).mean(dim=0, keepdim=True)
+                means = means + theta_scale * theta_tensor.expand(K, -1)
+        else:
+            means = self._emission_means.clone()
+
+        # Add tiny perturbation to avoid exact duplicates
+        means += 1e-6 * torch.randn_like(means)
+
+        # --- Compute covariances ---
+        if X is not None:
+            if posterior is not None:
+                covs = torch.zeros(K, F, F, dtype=DTYPE, device=device)
+                eye_F = torch.eye(F, dtype=DTYPE, device=device)
+                for s in range(K):
+                    w = posterior[:, s].clamp_min(eps).unsqueeze(-1)
+                    diff = X - means[s]
+                    denom = w.sum()
+                    if denom < eps:
+                        covs[s] = eye_F * self.min_covar
+                        continue
+                    C = (w * diff).T @ diff / denom
+                    C = 0.5 * (C + C.T)
+                    trace = torch.trace(C)
+                    if not torch.isfinite(trace) or trace <= 0:
+                        C = eye_F * self.min_covar
+                    else:
+                        C += self.min_covar * (1.0 + trace / F) * eye_F
+                    covs[s] = C
+            else:
+                centered = X - X.mean(dim=0, keepdim=True)
+                cov_base = (centered.T @ centered) / max(X.shape[0] - 1, 1)
+                cov_base = 0.5 * (cov_base + cov_base.T)
+                covs = cov_base.unsqueeze(0).expand(K, -1, -1).clone()
+        else:
+            covs = self._emission_covs.clone()
+
+        # --- Regularize covariances ---
+        eps_eye = self.min_covar * torch.eye(F, dtype=DTYPE, device=device).unsqueeze(0)
+        covs = 0.5 * (covs + covs.transpose(-1, -2)) + eps_eye
+
+        # --- Update buffers ---
+        with torch.no_grad():
+            self._emission_means.copy_(means)
+            self._emission_covs.copy_(covs)
+
+        return torch.distributions.MultivariateNormal(loc=self._emission_means, covariance_matrix=self._emission_covs)
+
+
+    def _estimate_emission_pdf(
+        self,
+        X: torch.Tensor,
+        posterior: torch.Tensor,
+        theta: Optional[dict] = None,
+        theta_scale: float = 0.1
+    ) -> torch.distributions.MultivariateNormal:
+        """
+        Estimate Gaussian emission PDF for HSMM from weighted observations.
 
         Args:
-            X: (N, F) observation matrix
-            posterior: (N, K) posterior responsibilities
-        Returns:
-            means: (K, F) tensor of state means
-        """
-        assert X.ndim == 2 and posterior.ndim == 2, "Expected X:(N,F), posterior:(N,K)"
-        assert posterior.shape[0] == X.shape[0], "Mismatched sample count"
-        assert posterior.shape[1] == self.n_states, f"posterior K={posterior.shape[1]} != n_states={self.n_states}"
-
-        dev = self._emission_means.device
-        X = X.to(dtype=DTYPE, device=dev)
-        posterior = posterior.to(dtype=DTYPE, device=dev)
-
-        # Weighted mean per state
-        weighted_sum = posterior.T @ X  # (K,F)
-        norm = posterior.sum(dim=0, keepdim=True).T.clamp_min(1e-12)  # (K,1)
-        means = weighted_sum / norm
-
-        # Replace potential NaNs (degenerate states) with global mean
-        global_mean = X.mean(dim=0, keepdim=True)
-        mask = torch.isnan(means) | torch.isinf(means)
-        if mask.any():
-            means = torch.where(mask, global_mean.expand_as(means), means)
-
-        return means
-
-    def _compute_covs(self, X: torch.Tensor, posterior: torch.Tensor, means: torch.Tensor) -> torch.Tensor:
-        """
-        Compute per-state covariance matrices under posterior responsibilities.
-
-        Args:
-            X: (N, F) observations
-            posterior: (N, K) state responsibilities
-            means: (K, F) state means
+            X: Observations [T, F]
+            posterior: State responsibilities [T, K]
+            theta: Optional context modulation
+            theta_scale: Scaling for context adjustment
 
         Returns:
-            covs: (K, F, F) covariance matrices
+            MultivariateNormal distribution with updated means and covariances
         """
-        N, F = X.shape
-        dev = self._emission_covs.device
-        X = X.to(dtype=DTYPE, device=dev)
-        posterior = posterior.to(dtype=DTYPE, device=dev)
-        means = means.to(dtype=DTYPE, device=dev)
+        device = self._emission_means.device
+        T, F = X.shape
+        K = self.n_states
+        eps = 1e-12
 
-        covs = torch.zeros(self.n_states, F, F, dtype=DTYPE, device=dev)
-        eye_F = torch.eye(F, dtype=DTYPE, device=dev)
+        X = X.to(dtype=DTYPE, device=device)
+        posterior = posterior.to(dtype=DTYPE, device=device)
 
-        for s in range(self.n_states):
-            w = posterior[:, s].clamp_min(1e-12).unsqueeze(-1)  # (N,1)
-            diff = X - means[s]                                 # (N,F)
+        # --- Weighted means ---
+        weights_sum = posterior.sum(dim=0, keepdim=True).clamp_min(eps)  # [1, K]
+        means = (posterior.T @ X) / weights_sum.T  # [K, F]
+
+        # --- Context modulation ---
+        if theta is not None and len(theta) > 0:
+            theta_tensor = torch.as_tensor(list(theta.values()), dtype=DTYPE, device=device)
+            if theta_tensor.ndim > 1:
+                theta_tensor = theta_tensor.mean(dim=0, keepdim=True)  # collapse time dimension
+            means = means + theta_scale * theta_tensor.expand(K, -1)
+
+        # --- Handle NaNs/Infs in means ---
+        nan_mask = ~torch.isfinite(means)
+        if nan_mask.any():
+            fallback = X.mean(dim=0).expand(K, -1)
+            means = torch.where(nan_mask, fallback, means)
+
+        # --- Tiny jitter to prevent collapse ---
+        means += 1e-6 * torch.randn_like(means)
+
+        # --- Weighted covariances ---
+        covs = torch.zeros(K, F, F, dtype=DTYPE, device=device)
+        eye_F = torch.eye(F, dtype=DTYPE, device=device)
+
+        for s in range(K):
+            w = posterior[:, s].clamp_min(eps).unsqueeze(-1)
+            diff = X - means[s]
             denom = w.sum()
-
-            if denom < 1e-8:  # Empty or near-empty state
+            if denom < eps:
                 covs[s] = eye_F * self.min_covar
                 continue
 
-            # Weighted covariance
             C = (w * diff).T @ diff / denom
-            C = 0.5 * (C + C.T)  # enforce symmetry
+            C = 0.5 * (C + C.T)  # symmetrize
 
-            # Regularize to ensure positive-definiteness
+            # Regularize covariances
             trace = torch.trace(C)
             if not torch.isfinite(trace) or trace <= 0:
                 C = eye_F * self.min_covar
             else:
-                reg = self.min_covar * (1.0 + trace / F)
-                C += reg * eye_F
-
+                C += self.min_covar * (1.0 + trace / F) * eye_F
             covs[s] = C
 
-        return covs
+        covs = 0.5 * (covs + covs.transpose(-1, -2))  # ensure symmetry
+        covs += self.min_covar * eye_F.unsqueeze(0)
 
-    def _sample_kmeans(self, X: torch.Tensor, seed: Optional[int] = None) -> torch.Tensor:
-        """
-        Run KMeans clustering on CPU to initialize emission means.
-        Handles degenerate data gracefully and ensures numeric stability.
+        # --- Update internal buffers ---
+        with torch.no_grad():
+            self._emission_means.copy_(means)
+            self._emission_covs.copy_(covs)
 
-        Args:
-            X: (N, F) observation tensor
-            seed: optional random seed override
-
-        Returns:
-            centers: (K, F) tensor of cluster centers
-        """
-        if X.numel() == 0:
-            raise ValueError("Cannot run KMeans on empty input tensor.")
-
-        X_np = X.detach().cpu().numpy()
-        K = self.n_states
-        rng_seed = int(seed or getattr(self, "seed", None) or 0)
-
-        # Guard against fewer samples than clusters
-        n_samples = X_np.shape[0]
-        if n_samples < K:
-            # fall back to random subset + padding
-            pad = K - n_samples
-            sampled = np.concatenate([X_np, X_np[np.random.choice(n_samples, pad, replace=True)]], axis=0)
-            X_np = sampled
-
-        km = KMeans(
-            n_clusters=K,
-            n_init=10,
-            random_state=rng_seed,
-            algorithm="lloyd",
-            max_iter=300,
+        return torch.distributions.MultivariateNormal(
+            loc=self._emission_means,
+            covariance_matrix=self._emission_covs
         )
 
-        try:
-            km.fit(X_np)
-            centers = torch.from_numpy(km.cluster_centers_).to(dtype=DTYPE)
-        except Exception as e:
-            # fallback to random Gaussian means if clustering fails
-            centers = torch.randn(K, X.shape[1], dtype=DTYPE) * 0.01 + X.mean(dim=0)
-            print(f"[GaussianHSMM._sample_kmeans] Warning: KMeans failed ({e}). Using random init.")
-
-        # Add tiny jitter if duplicate centers exist
-        diffs = centers - centers.mean(dim=0, keepdim=True)
-        if torch.linalg.norm(diffs) < 1e-8:
-            centers += 1e-3 * torch.randn_like(centers)
-
-        return centers.to(device=self._emission_means.device, dtype=DTYPE)
 
     def _contextual_emission_pdf(self, X: Optional[torch.Tensor] = None, theta: Optional[dict] = None) -> Optional[MultivariateNormal]:
-        """
-        Return the current emission PDF, optionally modulated by context (theta).
-        For standard Gaussian HSMMs, no contextual modulation is applied.
-
-        Args:
-            X: optional input tensor (unused here)
-            theta: optional context or hyperparameter dict
-
-        Returns:
-            MultivariateNormal instance if available, otherwise None.
-        """
         pdf = getattr(self, "_params", {}).get("emission_pdf", None)
         if isinstance(pdf, MultivariateNormal):
             return pdf
-        if pdf is not None:
-            # Defensive: handle stale or malformed entries
-            print("[GaussianHSMM._contextual_emission_pdf] Warning: emission_pdf not a MultivariateNormal.")
         return None
 
     def initialize_emissions(
@@ -325,64 +269,52 @@ class GaussianHSMM(HSMM, nn.Module):
         smooth_transition: float = 1e-2,
         smooth_duration: float = 1e-2,
     ):
-        """
-        Initialize emission parameters and warm-start π, A, D using simple clustering or moments.
-
-        Args:
-            X: (T, F) tensor of observations (single concatenated sequence)
-            method: 'kmeans' for cluster-based init, 'moment' for global mean/var
-            smooth_transition: Laplace smoothing for transition counts
-            smooth_duration: Laplace smoothing for duration counts
-        """
         if not isinstance(X, torch.Tensor):
             X = torch.as_tensor(X, dtype=DTYPE)
         X = X.to(dtype=DTYPE, device=self._emission_means.device)
         T, F = X.shape
         K = self.n_states
+        eps = 1e-12
 
-        # --- moment init ---
+        # --- Initialize emission parameters ---
         if method == "moment":
             mu = X.mean(dim=0, keepdim=True).repeat(K, 1)
             var = X.var(dim=0, unbiased=False, keepdim=True).clamp_min(self.min_covar)
             covs = torch.diag_embed(var.expand(K, F))
-            self._emission_means.copy_(mu)
-            self._emission_covs.copy_(covs)
-            self._params["emission_pdf"] = MultivariateNormal(mu, covs)
-            return
+        else:
+            labels = torch.as_tensor(
+                KMeans(n_clusters=K, n_init=10, random_state=getattr(self, "seed", 0))
+                .fit_predict(X.cpu().numpy()),
+                device=X.device,
+            )
+            mu = torch.zeros(K, F, dtype=DTYPE, device=X.device)
+            covs = torch.zeros(K, F, F, dtype=DTYPE, device=X.device)
+            for k in range(K):
+                mask = labels == k
+                Nk = mask.sum().item()
+                if Nk == 0:
+                    # Fallback: pick a random point from X
+                    Xk = X[torch.randint(0, T, (1,))]
+                else:
+                    Xk = X[mask]
+                mu[k] = Xk.mean(dim=0)
+                diff = Xk - mu[k]
+                C = (diff.T @ diff) / max(Nk - 1, 1)
+                # Symmetrize and regularize
+                covs[k] = 0.5 * (C + C.T) + self.min_covar * torch.eye(F, device=X.device)
+                # Optional shrinkage for tiny clusters
+                covs[k] = 0.05 * torch.eye(F, device=X.device) + 0.95 * covs[k]
 
-        # --- kmeans init ---
-        km_seed = int(getattr(self, "seed", 0))
-        km = KMeans(n_clusters=K, n_init=10, random_state=km_seed)
-        labels = torch.as_tensor(km.fit_predict(X.cpu().numpy()), device=X.device)
-        mus = torch.zeros(K, F, dtype=DTYPE, device=self._emission_means.device)
-        covs = torch.zeros(K, F, F, dtype=DTYPE, device=self._emission_covs.device)
-
-        for k in range(K):
-            mask = labels == k
-            Nk = mask.sum().item()
-            if Nk == 0:
-                # empty cluster fallback
-                mus[k] = X.mean(dim=0)
-                covs[k] = torch.eye(F, dtype=DTYPE, device=X.device) * self.min_covar
-                continue
-            Xk = X[mask]
-            mus[k] = Xk.mean(dim=0)
-            diff = Xk - mus[k]
-            denom = max(Nk - 1, 1)
-            C = (diff.T @ diff) / denom
-            C = 0.5 * (C + C.T)
-            C += self.min_covar * torch.eye(F, dtype=DTYPE, device=X.device)
-            covs[k] = C
-
-        self._emission_means.copy_(mus)
+        self._emission_means.copy_(mu)
         self._emission_covs.copy_(covs)
+        self._params["emission_pdf"] = MultivariateNormal(mu.clone(), covs.clone())
 
-        # --- warm-start π, A, D ---
-        pi_counts = torch.bincount(labels[:1], minlength=K).to(dtype=DTYPE)
+        # --- Warm-start initial state probabilities (pi) ---
+        pi_counts = torch.bincount(labels[:min(5, T)], minlength=K).to(dtype=DTYPE)
         pi = (pi_counts + 1e-6) / (pi_counts.sum() + 1e-6 * K)
-        self._pi_logits.copy_(pi.log().to(self._pi_logits.device))
+        self.init_logits.copy_(pi.log().to(self.init_logits.device))
 
-        # build label segments (for A and D)
+        # --- Warm-start transitions ---
         lbls = labels.cpu().numpy()
         segments = []
         if T > 0:
@@ -395,53 +327,28 @@ class GaussianHSMM(HSMM, nn.Module):
                     cur, length = v, 1
             segments.append((cur, length))
 
-        # transitions
-        A_counts = torch.full((K, K), smooth_transition, dtype=DTYPE, device=self._A_logits.device)
+        A_counts = torch.full((K, K), smooth_transition, dtype=DTYPE, device=self.transition_logits.device)
         prev = None
         for s, _ in segments:
             if prev is not None:
                 A_counts[prev, s] += 1.0
             prev = s
-        A_probs = A_counts / A_counts.sum(dim=1, keepdim=True)
-        self._A_logits.copy_(A_probs.log().to(self._A_logits.device))
+        row_sums = A_counts.sum(dim=1, keepdim=True).clamp_min(eps)
+        self.transition_logits.copy_((A_counts / row_sums).log())
 
-        # durations
-        D_counts = torch.full((K, self.max_duration), smooth_duration, dtype=DTYPE, device=self._D_logits.device)
+        # --- Warm-start durations ---
+        D_counts = torch.full((K, self.max_duration), smooth_duration, dtype=DTYPE, device=self.duration_logits.device)
         for s, l in segments:
-            D_counts[s, min(l, self.max_duration) - 1] += 1.0
-        D_probs = D_counts / D_counts.sum(dim=1, keepdim=True)
-        self._D_logits.copy_(D_probs.log().to(self._D_logits.device))
+            D_counts[s, min(l - 1, self.max_duration - 1)] += 1.0
+        row_sums = D_counts.sum(dim=1, keepdim=True).clamp_min(eps)
+        self.duration_logits.copy_((D_counts / row_sums).log())
 
-        # --- finalize emission PDF ---
-        self._params["emission_pdf"] = MultivariateNormal(self._emission_means, self._emission_covs)
-
-    def decode(
-        self,
-        X: torch.Tensor,
-        algorithm: Literal["viterbi", "map"] = "viterbi",
-        duration_weight: float = 0.0
-    ) -> np.ndarray:
-        """
-        Decode a single observation sequence X and return predicted state labels as a NumPy array.
-
-        Args:
-            X: (T, F) observation tensor.
-            algorithm: decoding strategy, "viterbi" or "map".
-            duration_weight: optional weight for duration modeling (currently ignored if predict doesn't use it).
-
-        Returns:
-            np.ndarray of predicted state indices, shape (T,)
-        """
+    def decode(self, X: torch.Tensor, algorithm: Literal["viterbi", "map"] = "viterbi") -> np.ndarray:
         if not isinstance(X, torch.Tensor):
             X = torch.as_tensor(X, dtype=DTYPE)
-
-        # Predict may return tensor, list of tensors, or other structures
         preds = self.predict(X, algorithm=algorithm, context=None)
-
-        # Normalize output to single tensor
         if isinstance(preds, list):
-            preds = preds[0] if len(preds) > 0 else torch.empty(0, dtype=torch.long)
+            preds = preds[0] if preds else torch.empty(0, dtype=torch.long)
         elif not torch.is_tensor(preds):
             preds = torch.as_tensor(preds, dtype=torch.long)
-
         return preds.cpu().numpy()

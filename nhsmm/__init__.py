@@ -1,9 +1,8 @@
-from .utilities import ContextEncoder, constraints, ConvergenceHandler, SeedGenerator, utils
+from .utilities import constraints, ConvergenceMonitor, SeedGenerator, utils
 
 __all__ = [
-    'constraints',
-    'ContextEncoder'
-    'ConvergenceHandler'
+    'ConvergenceMonitor'
     'SeedGenerator',
+    'constraints',
     'utils',
 ]
