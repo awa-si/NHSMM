@@ -71,7 +71,7 @@ if __name__ == "__main__":
 
     n_states = 3
     n_features = X.shape[1]
-    max_duration = 40  # slightly higher to accommodate long segments
+    max_duration = 60  # slightly higher to accommodate long segments
 
     print(f"\nConfig: n_states={n_states}, max_duration={max_duration}, n_features={n_features}")
 
@@ -84,13 +84,11 @@ if __name__ == "__main__":
         alpha=1.0,
         seed=0
     )
-
-    # Initialize emissions with mild smoothing
-    model.initialize_emissions(
-        X_torch,
-        method="kmeans",
-        smooth_transition=0.05,
-        smooth_duration=0.05
+    model.emission_module.initialize(
+        X=X_torch,
+        theta=None,
+        posterior=None,
+        theta_scale=0.1
     )
 
     # Fit EM

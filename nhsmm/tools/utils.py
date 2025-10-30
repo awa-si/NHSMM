@@ -76,17 +76,15 @@ class Observations:
         ctxs = [c.clone() if c is not None else None for c in self.context]
         return Observations(seqs, self.lengths, logs, ctxs)
 
-    def __getitem__(self, idx: Union[int, slice]) -> "Observations":
-        seqs = self.sequence[idx] if isinstance(idx, slice) else [self.sequence[idx]]
-        logs = self.log_probs[idx] if self.log_probs and isinstance(idx, slice) else \
-               ([self.log_probs[idx]] if self.log_probs else None)
-        lens = self.lengths[idx] if isinstance(idx, slice) else [self.lengths[idx]]
-        ctxs = self.context[idx] if self.context and isinstance(idx, slice) else \
-               ([self.context[idx]] if self.context else None)
+    def __getitem__(self, idx: int) -> "Observations":
+        # single-sample only: always returns an Observations with one sequence
+        seqs = [self.sequence[idx]]
+        lens = [self.lengths[idx]]
+        logs = [self.log_probs[idx]] if self.log_probs else None
+        ctxs = [self.context[idx]] if self.context else None
         return Observations(seqs, lens, logs, ctxs)
 
     def normalize(self, eps: float = 1e-6) -> "Observations":
-        # Normalize each sequence independently
         normed = []
         for s in self.sequence:
             mean, std = s.mean(0, keepdim=True), s.std(0, keepdim=True).clamp_min(eps)
@@ -161,7 +159,6 @@ class ContextualVariables:
             normed.append((x - mean) / std)
         return ContextualVariables(self.n_context, normed, self.time_dependent, self.names)
 
-    def __getitem__(self, idx: Union[int, slice]) -> Union[torch.Tensor, "ContextualVariables"]:
-        if isinstance(idx, slice):
-            return ContextualVariables(self.n_context, self.X[idx], self.time_dependent, self.names)
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        # single-sample only: returns one context tensor
         return self.X[idx]
