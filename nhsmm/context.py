@@ -1,14 +1,24 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Literal, Union
+from typing import Optional, Literal, Union, Tuple
 
 from nhsmm.defaults import DTYPE, logger
 
 
 class ContextEncoder(nn.Module):
-    """Sequence encoder wrapper for HSMM/HMM/CRF with pooling, attention, dropout, layer norm, and cached context."""
+    """
+    Sequence encoder wrapper for HSMM/HMM/CRF with pooling, attention, dropout, layer norm, and cached context.
 
+    Args:
+        encoder: nn.Module that outputs sequences [batch, T, F] or [T, F].
+        n_heads: Number of heads for multihead attention pooling.
+        pool: Pooling method: "mean", "last", "max", "attn", "mha".
+        device: torch.device to place module and buffers.
+        layer_norm: Apply layer normalization to pooled context.
+        dropout: Dropout rate applied to pooled context.
+        debug: Enable debug logging.
+    """
     def __init__(
         self,
         encoder: nn.Module,
@@ -29,7 +39,9 @@ class ContextEncoder(nn.Module):
         self._context: Optional[torch.Tensor] = None
 
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self._attn_vector: Optional[nn.Parameter] = None
+
+        # Attention parameters
+        self._attn_vector = nn.Parameter(torch.empty(0, device=self.device, dtype=DTYPE))
         self._mha: Optional[nn.MultiheadAttention] = None
 
         self.encoder.to(device=self.device, dtype=DTYPE)
@@ -47,23 +59,22 @@ class ContextEncoder(nn.Module):
         mask: Optional[torch.Tensor] = None,
         return_context: bool = False,
         return_attn_weights: bool = False
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        # Ensure x is [T, F] -> [1, T, F] for compatibility
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
         x = x.to(self.device, dtype=DTYPE)
         if x.ndim == 2:
-            x = x.unsqueeze(0)
+            x = x.unsqueeze(0)  # [1, T, F]
+        batch_size, T, F = x.shape
+
         if mask is not None:
             mask = mask.to(self.device, dtype=torch.bool)
+            if mask.ndim == 1:
+                mask = mask.unsqueeze(0).expand(batch_size, -1)
 
         out = self.encoder(x)
         if isinstance(out, (tuple, list)):
-            out = out[0]
+            out = out[0]  # assume first element is sequence
 
-        theta = out  # [1, T, F]
-        if theta.ndim == 1:
-            theta = theta.unsqueeze(0).unsqueeze(1)
-        elif theta.ndim == 2:
-            theta = theta.unsqueeze(0)
+        theta = out  # [B, T, F]
 
         if mask is not None:
             theta = theta * mask.unsqueeze(-1)
@@ -80,26 +91,40 @@ class ContextEncoder(nn.Module):
 
     # ---------------- Pooling ----------------
     def _pool_context(self, theta: torch.Tensor, mask: Optional[torch.Tensor], return_attn: bool = False):
-        T, F = theta.shape[1], theta.shape[2]
+        B, T, F = theta.shape
         attn_weights = None
 
         if T == 0:
-            context = torch.zeros((F,), device=self.device, dtype=DTYPE)
+            context = torch.zeros((B, F), device=self.device, dtype=DTYPE)
         elif self.pool == "last":
             if mask is not None:
-                idx = mask.sum().clamp_min(1) - 1
-                context = theta[0, idx, :]
+                lengths = mask.sum(dim=1).clamp_min(1)
+                idx = (lengths - 1).unsqueeze(-1).expand(-1, F)
+                context = theta.gather(1, idx.unsqueeze(1)).squeeze(1)
             else:
-                context = theta[0, -1, :]
+                context = theta[:, -1, :]
         elif self.pool == "mean":
-            context = (theta[0] if mask is None else (theta[0] * mask.unsqueeze(-1)).sum(dim=0) / mask.sum().clamp_min(1))
+            if mask is not None:
+                context = (theta * mask.unsqueeze(-1)).sum(dim=1) / mask.sum(dim=1, keepdim=True).clamp_min(1)
+            else:
+                context = theta.mean(dim=1)
         elif self.pool == "max":
-            masked = theta[0] if mask is None else theta[0].masked_fill(~mask.unsqueeze(-1), float('-inf'))
-            context = masked.max(dim=0).values
+            if mask is not None:
+                masked = theta.masked_fill(~mask.unsqueeze(-1), float('-inf'))
+                context = masked.max(dim=1).values
+            else:
+                context = theta.max(dim=1).values
         elif self.pool == "attn":
-            context, attn_weights = self._attention_context(theta[0], mask, True)
+            context_list = []
+            attn_list = []
+            for b in range(B):
+                ctx, attn = self._attention_context(theta[b], mask[b] if mask is not None else None, True)
+                context_list.append(ctx)
+                attn_list.append(attn)
+            context = torch.stack(context_list)
+            attn_weights = torch.stack(attn_list) if return_attn else None
         elif self.pool == "mha":
-            context, attn_weights = self._multihead_context(theta[0].unsqueeze(0), mask, True)
+            context, attn_weights = self._multihead_context(theta, mask, True)
         else:
             raise ValueError(f"Unsupported pooling mode: {self.pool}")
 
@@ -107,8 +132,9 @@ class ContextEncoder(nn.Module):
 
     # ---------------- Attention ----------------
     def _attention_context(self, theta: torch.Tensor, mask: Optional[torch.Tensor], return_attn: bool = False):
-        F = theta.shape[-1]
-        if self._attn_vector is None or self._attn_vector.shape[-1] != F:
+        T, F = theta.shape
+        if self._attn_vector.numel() != F:
+            nn.init.normal_(self._attn_vector, mean=0.0, std=0.1)
             self._attn_vector = nn.Parameter(torch.randn(F, device=self.device, dtype=DTYPE))
             self._dbg(f"Initialized _attn_vector with dim {F}")
 
@@ -120,13 +146,13 @@ class ContextEncoder(nn.Module):
         return (context, attn_weights) if return_attn else context
 
     def _multihead_context(self, theta: torch.Tensor, mask: Optional[torch.Tensor], return_attn: bool = False):
-        _, T, F = theta.shape
+        B, T, F = theta.shape
         if self._mha is None:
             self._mha = nn.MultiheadAttention(embed_dim=F, num_heads=self.n_heads, batch_first=True)
             self._dbg(f"Initialized MultiheadAttention with embed_dim={F}, n_heads={self.n_heads}")
-        attn_mask = ~mask if mask is not None else None
+        attn_mask = (~mask) if mask is not None else None
         attn_output, attn_weights = self._mha(theta, theta, theta, key_padding_mask=attn_mask)
-        context = attn_output.mean(dim=1).squeeze(0)
+        context = attn_output.mean(dim=1)
         return (context, attn_weights) if return_attn else context
 
     # ---------------- Context Utilities ----------------

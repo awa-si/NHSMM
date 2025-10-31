@@ -97,7 +97,7 @@ if __name__ == "__main__":
     t0 = time.time()
     model.fit(
         X_torch,
-        max_iter=50,
+        max_iter=5,
         n_init=3,
         sample_D_from_X=True,
         verbose=True,

@@ -5,6 +5,7 @@ from typing import List, Optional, Union, Tuple
 
 @dataclass(frozen=False)
 class Observations:
+    """Container for one or more sequences, optional log-probs, and context vectors."""
 
     sequence: List[torch.Tensor]
     lengths: Optional[List[int]] = None
@@ -16,18 +17,19 @@ class Observations:
             raise ValueError("`sequence` cannot be empty.")
         if not all(isinstance(s, torch.Tensor) for s in self.sequence):
             raise TypeError("All elements in `sequence` must be torch.Tensor.")
+
         seq_lengths = self.lengths or [s.shape[0] for s in self.sequence]
         if any(s.shape[0] != l for s, l in zip(self.sequence, seq_lengths)):
             raise ValueError("Mismatch between sequence lengths and `lengths`.")
         object.__setattr__(self, "lengths", seq_lengths)
 
-        if self.log_probs is not None:
+        if self.log_probs:
             if len(self.log_probs) != len(self.sequence):
                 raise ValueError("`log_probs` length must match `sequence` length.")
             if not all(isinstance(lp, torch.Tensor) for lp in self.log_probs):
                 raise TypeError("All elements in `log_probs` must be torch.Tensor.")
 
-        if self.context is not None:
+        if self.context:
             if len(self.context) != len(self.sequence):
                 raise ValueError("`context` length must match `sequence` length.")
             if not all(c is None or isinstance(c, torch.Tensor) for c in self.context):
@@ -46,9 +48,11 @@ class Observations:
     @property
     def feature_dim(self) -> int:
         dims = {s.shape[-1] for s in self.sequence if s.ndim > 1}
+        if not dims:  # all sequences 1D
+            return 1
         if len(dims) > 1:
             raise ValueError("Inconsistent feature dimensions across sequences.")
-        return dims.pop() if dims else 1
+        return dims.pop()
 
     @property
     def device(self) -> torch.device:
@@ -59,9 +63,10 @@ class Observations:
         return self.sequence[0].dtype
 
     def to(self, device: Union[str, torch.device], dtype: Optional[torch.dtype] = None) -> "Observations":
-        seqs = [s.to(device=device, dtype=dtype or s.dtype) for s in self.sequence]
-        logs = [l.to(device=device, dtype=dtype or l.dtype) for l in self.log_probs] if self.log_probs else None
-        ctxs = [c.to(device=device, dtype=dtype or c.dtype) if c is not None else None for c in self.context]
+        dtype = dtype or self.dtype
+        seqs = [s.to(device=device, dtype=dtype) for s in self.sequence]
+        logs = [l.to(device=device, dtype=dtype) for l in self.log_probs] if self.log_probs else None
+        ctxs = [c.to(device=device, dtype=dtype) if c is not None else None for c in self.context]
         return Observations(seqs, self.lengths, logs, ctxs)
 
     def detach(self) -> "Observations":
@@ -77,23 +82,27 @@ class Observations:
         return Observations(seqs, self.lengths, logs, ctxs)
 
     def __getitem__(self, idx: int) -> "Observations":
-        # single-sample only: always returns an Observations with one sequence
+        """Return a single-sequence Observations object."""
         seqs = [self.sequence[idx]]
         lens = [self.lengths[idx]]
         logs = [self.log_probs[idx]] if self.log_probs else None
         ctxs = [self.context[idx]] if self.context else None
         return Observations(seqs, lens, logs, ctxs)
 
-    def normalize(self, eps: float = 1e-6) -> "Observations":
+    def normalize(self, mask: Optional[List[torch.Tensor]] = None, eps: float = 1e-6) -> "Observations":
+        """Normalize sequences with optional per-sequence masks."""
         normed = []
-        for s in self.sequence:
-            mean, std = s.mean(0, keepdim=True), s.std(0, keepdim=True).clamp_min(eps)
-            normed.append((s - mean) / std)
+        for i, s in enumerate(self.sequence):
+            m = mask[i].unsqueeze(-1) if mask else torch.ones_like(s)
+            mean = (s * m).sum(0) / m.sum().clamp_min(1)
+            std = ((s - mean) * m).pow(2).sum(0).sqrt() / m.sum().clamp_min(1)
+            normed.append((s - mean) / std.clamp_min(eps))
         return Observations(normed, self.lengths, self.log_probs, self.context)
 
 
 @dataclass(frozen=False)
 class ContextualVariables:
+    """Container for one or more context tensors with optional names and time-dependence."""
 
     n_context: int
     X: List[torch.Tensor]
@@ -129,12 +138,15 @@ class ContextualVariables:
     @property
     def feature_dim(self) -> int:
         dims = {x.shape[-1] for x in self.X if x.ndim >= 2}
+        if not dims:
+            return 1
         if len(dims) > 1:
             raise ValueError("Inconsistent feature dimensions across contexts.")
-        return dims.pop() if dims else 1
+        return dims.pop()
 
     def to(self, device: Union[str, torch.device], dtype: Optional[torch.dtype] = None) -> "ContextualVariables":
-        X = [x.to(device=device, dtype=dtype or x.dtype) for x in self.X]
+        dtype = dtype or self.dtype
+        X = [x.to(device=device, dtype=dtype) for x in self.X]
         return ContextualVariables(self.n_context, X, self.time_dependent, self.names)
 
     def detach(self) -> "ContextualVariables":
@@ -160,5 +172,4 @@ class ContextualVariables:
         return ContextualVariables(self.n_context, normed, self.time_dependent, self.names)
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        # single-sample only: returns one context tensor
         return self.X[idx]
