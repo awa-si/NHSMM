@@ -3,66 +3,46 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import (
-    Distribution, Categorical, Normal, Bernoulli, MultivariateNormal, Laplace, StudentT, Independent
+    Distribution, Categorical, Normal, Bernoulli,
+    MultivariateNormal, Laplace, StudentT, Independent
 )
 
-import logging
 from sklearn.cluster import KMeans
 from collections import OrderedDict
 from typing import Optional, Union, Literal, Tuple, Dict, Any
 
-EPS = 1e-12
-MAX_LOGITS = 50.0
-DTYPE = torch.float32
-
-# -------------------------
-# Logger
-# -------------------------
-logger = logging.getLogger("nhsmm")
-if not logger.hasHandlers():
-    logger.setLevel(logging.INFO)  # default level; change to DEBUG if needed
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.DEBUG)
-    formatter = logging.Formatter('[%(levelname)s] %(name)s - %(message)s')
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
-
-
-class HSMMError(ValueError):
-    """Custom error class for HSMM module."""
-    pass
+from nhsmm.constants import DTYPE, EPS, MAX_LOGITS, logger
 
 
 class Contextual(nn.Module):
     """
-    Context-modulated parameter adapter with safe delta handling and
-    built-in caching for context-sensitive computations.
+    Context-modulated parameter adapter with caching and safe delta handling.
 
-    Provides:
-      - Single or sequence-level contexts ([D] or [T, D])
-      - Optional projection if dimension mismatch
-      - Temporal/spatial adapters
-      - Activation, scaling, clamping, gradient scaling
-      - Centralized cache with context hashing & invalidation
+    Supports:
+    - Single or batch contexts ([D] or [T, D])
+    - Optional projection for dimension mismatch
+    - Temporal/spatial adapters
+    - Activation, scaling, clamping, gradient scaling
+    - Gradient-safe caching
     """
 
     def __init__(
         self,
         target_dim: int,
-        context_dim: Optional[int],
-        aggregate_context: bool = True,
+        context_dim: Optional[int] = None,
         hidden_dim: Optional[int] = None,
+        aggregate_context: bool = True,
         aggregate_method: str = "mean",
-        final_activation: str = "tanh",
-        activation: str = "tanh",
-        device: Optional[torch.device] = None,
-        max_delta: float = 0.5,
         temporal_adapter: bool = False,
         spatial_adapter: bool = False,
         allow_projection: bool = True,
-        debug: bool = False,
+        final_activation: str = "tanh",
+        activation: str = "tanh",
+        max_delta: float = 0.5,
         cache_enabled: bool = True,
         cache_limit: int = 32,
+        device: Optional[torch.device] = None,
+        debug: bool = False,
     ):
         super().__init__()
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -71,11 +51,11 @@ class Contextual(nn.Module):
         self.aggregate_context = aggregate_context
         self.aggregate_method = aggregate_method
         self.allow_projection = allow_projection
-        self.max_delta = max_delta
         self.final_activation_name = final_activation
-        self.debug = debug
+        self.max_delta = max_delta
         self.cache_enabled = cache_enabled
         self.cache_limit = cache_limit
+        self.debug = debug
 
         hidden_dim = hidden_dim or max(16, target_dim // 2, context_dim or target_dim)
 
@@ -104,62 +84,14 @@ class Contextual(nn.Module):
         if self.spatial_adapter:
             nn.init.xavier_uniform_(self.spatial_adapter.weight)
 
-        # Optional projection layer (lazy)
+        # Lazy projection
         self._proj: Optional[nn.Linear] = None
 
-        # --- Central cache ---
+        # Gradient-safe LRU cache
         self._cache: OrderedDict[str, torch.Tensor] = OrderedDict()
-        self._cache_key: Optional[str] = None
         self._param_version = 0
 
-    # ---------------- Caching ----------------
-    def _context_hash(self, context: Optional[torch.Tensor]) -> str:
-        """Efficient deterministic hash for caching large contexts."""
-        if context is None:
-            return "none"
-        ctx = context.detach().cpu()
-
-        # Round to 6 decimals to reduce float noise
-        ctx_rounded = torch.round(ctx * 1e6) / 1e6
-
-        # If tensor is small, hash all; otherwise sample
-        flat = ctx_rounded.flatten()
-        N = min(len(flat), 1024)  # sample at most 1024 elements
-        if len(flat) > N:
-            indices = torch.linspace(0, len(flat)-1, N, dtype=torch.long)
-            flat_sample = flat[indices]
-        else:
-            flat_sample = flat
-
-        # deterministic hash using Python hash
-        h = hash(tuple(flat_sample.tolist()))
-        return f"{tuple(ctx.shape)}-{h & 0xffffffff}"
-
-    def _cache_get(self, key: str) -> Optional[torch.Tensor]:
-        if not self.cache_enabled:
-            return None
-        value = self._cache.get(key)
-        if value is not None:
-            # Move to end (LRU)
-            self._cache.move_to_end(key)
-        return value
-
-    def _cache_set(self, key: str, value: torch.Tensor):
-        if not self.cache_enabled:
-            return
-        if key in self._cache:
-            self._cache.move_to_end(key)
-        self._cache[key] = value.detach().to(self.device, DTYPE)
-        if len(self._cache) > self.cache_limit:
-            self._cache.popitem(last=False)
-
-    def _invalidate_cache(self):
-        """Invalidate all cached entries."""
-        self._cache.clear()
-        self._param_version += 1
-        if self.debug:
-            logger.debug(f"[Contextual] cache invalidated (v={self._param_version})")
-
+    # ---------------- Utilities ----------------
     def _get_activation(self, name: str) -> nn.Module:
         return {
             "tanh": nn.Tanh(),
@@ -186,7 +118,7 @@ class Contextual(nn.Module):
             nn.init.normal_(self._proj.weight, 0.0, 1e-3)
             nn.init.zeros_(self._proj.bias)
             if self.debug:
-                logger.debug(f"[Contextual] Added projection {in_dim} → {out_dim}")
+                print(f"[Contextual] Added projection {in_dim} → {out_dim}")
 
     def _validate_context(self, context: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if context is None:
@@ -202,44 +134,55 @@ class Contextual(nn.Module):
             context = self._proj(context)
         return context
 
-    def _prepare_delta(
-        self,
-        delta: torch.Tensor,
-        scale: float = 0.1,
-        grad_scale: Optional[float] = None,
-    ) -> torch.Tensor:
+    def _context_hash(self, context: Optional[torch.Tensor]) -> str:
+        if context is None:
+            return "none"
+        ctx = torch.round(context.detach().cpu() * 1e6) / 1e6
+        flat = ctx.flatten()
+        sample = flat[torch.linspace(0, len(flat) - 1, min(len(flat), 1024), dtype=torch.long)]
+        return f"{tuple(ctx.shape)}-{hash(tuple(sample.tolist())) & 0xffffffff}"
+
+    # ---------------- Caching ----------------
+    def _cache_get(self, key: str) -> Optional[torch.Tensor]:
+        if not self.cache_enabled:
+            return None
+        value = self._cache.get(key)
+        if value is not None:
+            self._cache.move_to_end(key)
+        return value
+
+    def _cache_set(self, key: str, value: torch.Tensor):
+        if not self.cache_enabled:
+            return
+        self._cache[key] = value.to(self.device, DTYPE)
+        if len(self._cache) > self.cache_limit:
+            self._cache.popitem(last=False)
+
+    def _invalidate_cache(self):
+        self._cache.clear()
+        self._param_version += 1
+        if self.debug:
+            print(f"[Contextual] cache invalidated (v={self._param_version})")
+
+    # ---------------- Core ----------------
+    def _prepare_delta(self, delta: torch.Tensor, scale: float = 0.1, grad_scale: Optional[float] = None) -> torch.Tensor:
         delta = delta.to(self.device, DTYPE)
 
         if self.temporal_adapter:
-            delta_ = delta.view(1, -1, 1)
-            delta_ = self.temporal_adapter(delta_)
-            delta = delta_.view(-1)
-
+            delta = self.temporal_adapter(delta.view(1, -1, 1)).view(-1)
         if self.spatial_adapter:
             delta = self.spatial_adapter(delta)
 
-        activation = self._get_activation(self.final_activation_name)
-        delta = activation(delta) * scale
-
-        if self.max_delta is not None:
-            delta = torch.clamp(delta, -self.max_delta, self.max_delta)
-
+        delta = self._get_activation(self.final_activation_name)(delta) * scale
+        delta = torch.clamp(delta, -self.max_delta, self.max_delta)
         if grad_scale is not None:
             delta = delta * grad_scale
-
         return delta
 
-    def _apply_context(
-        self,
-        base: torch.Tensor,
-        context: Optional[torch.Tensor],
-        scale: float = 0.1,
-        grad_scale: Optional[float] = None,
-    ) -> torch.Tensor:
-        """Apply context modulation with caching."""
+    def _apply_context(self, base: torch.Tensor, context: Optional[torch.Tensor], scale: float = 0.1, grad_scale: Optional[float] = None) -> torch.Tensor:
         context = self._validate_context(context)
-        cache_key = self._context_hash(context)
-        cached = self._cache_get(cache_key)
+        key = self._context_hash(context)
+        cached = self._cache_get(key)
         if cached is not None:
             return cached
 
@@ -251,25 +194,25 @@ class Contextual(nn.Module):
             result = base + torch.where(torch.isfinite(delta), delta, torch.zeros_like(delta))
             result = torch.clamp(result, -MAX_LOGITS, MAX_LOGITS)
 
-        self._cache_set(cache_key, result)
+        self._cache_set(key, result)
         return result
 
     # ---------------- Public ----------------
     def get_config(self) -> Dict[str, Any]:
         return dict(
-            context_dim=self.context_dim,
             target_dim=self.target_dim,
+            context_dim=self.context_dim,
             aggregate_context=self.aggregate_context,
             aggregate_method=self.aggregate_method,
             device=str(self.device),
             dtype=str(DTYPE),
+            max_delta=self.max_delta,
+            cache_enabled=self.cache_enabled,
+            cache_limit=self.cache_limit,
             debug=self.debug,
             temporal_adapter=self.temporal_adapter is not None,
             spatial_adapter=self.spatial_adapter is not None,
             allow_projection=self.allow_projection,
-            max_delta=self.max_delta,
-            cache_enabled=self.cache_enabled,
-            cache_limit=self.cache_limit,
         )
 
     def to(self, device, **kwargs):
@@ -327,11 +270,14 @@ class Emission(Contextual):
         self.dof = dof
         self.seed = seed
         self.scale = scale
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = self.device
 
         # State gating for context modulation
         self.state_gate = (
-            nn.Sequential(nn.Linear(context_dim, n_states, device=self.device, dtype=DTYPE), nn.Sigmoid())
+            nn.Sequential(
+                nn.Linear(context_dim, n_states, device=self.device, dtype=DTYPE),
+                nn.Sigmoid(),
+            )
             if context_dim is not None
             else None
         )
@@ -381,6 +327,7 @@ class Emission(Contextual):
             jitter += scale * 0.1 * torch.randn_like(jitter)
         return means + jitter
 
+    # ---------------- Initialization ----------------
     @torch.no_grad()
     def initialize(
         self,
@@ -392,25 +339,18 @@ class Emission(Contextual):
         init_spread: float = 1.0,
         k_means: Optional[bool] = None,
         context: Optional[torch.Tensor] = None,
-    ) -> Distribution:
-        """
-        Initialize emission parameters from data or sample.
-
-        Writes to internal buffers (_emission_means, _emission_covs, _emission_params)
-        and returns a torch Distribution object for the emission type.
-        """
+    ):
         k_means = k_means if k_means is not None else self.k_means
         emission_type = (emission_type or self.emission_type).lower()
         K, F = self.n_states, self.n_features
         device, dtype = self.device, DTYPE
 
-        # Move and stabilize input
         if X is not None:
             X = X.to(dtype=dtype, device=device)
             if X.std() < EPS:
                 X += 1e-3 * torch.randn_like(X)
 
-        # ---------------- Continuous emissions ----------------
+        # Continuous emissions
         if emission_type in {"gaussian", "laplace", "studentt"}:
             if X is not None and posterior is not None:
                 weights_sum = posterior.sum(dim=0, keepdim=True).clamp_min(EPS)
@@ -424,7 +364,7 @@ class Emission(Contextual):
                         denom = w.sum().clamp_min(EPS)
                         C = ((diff * w).T @ diff) / denom
                         covs[k] = 0.5 * (C + C.T) + self.min_covar * eye_F
-                else:  # laplace / studentt
+                else:
                     scales = torch.zeros(K, F, dtype=dtype, device=device)
                     for k in range(K):
                         w = posterior[:, k:k+1].clamp_min(EPS)
@@ -437,23 +377,19 @@ class Emission(Contextual):
                 else:
                     scales = torch.sqrt(torch.diagonal(self._emission_covs, dim1=-2, dim2=-1)).clamp_min(self.min_covar)
 
-            # Theta modulation
             if theta is not None:
                 theta_tensor = theta.mean(dim=0, keepdim=True) if theta.ndim == 2 else theta
                 means += theta_scale * theta_tensor.expand(K, -1)
 
-            # Context modulation
             if context is not None:
                 means = self._modulate_per_state(means, context)
 
-            # Gaussian mean spreading
             if emission_type == "gaussian":
                 means = self._spread_means(means, scale=init_spread)
                 self._emission_means.copy_(means)
                 self._emission_covs.copy_(covs)
                 return MultivariateNormal(loc=means, covariance_matrix=covs)
 
-            # Laplace / StudentT
             else:
                 self._emission_means.copy_(means)
                 self._emission_covs.copy_(torch.diag_embed(scales**2))
@@ -462,7 +398,7 @@ class Emission(Contextual):
                 else:
                     return Independent(StudentT(df=self.dof, loc=means, scale=scales), 1)
 
-        # ---------------- Discrete emissions ----------------
+        # Discrete emissions
         elif emission_type in {"categorical", "bernoulli", "poisson"}:
             if X is not None:
                 if emission_type == "categorical":
@@ -473,26 +409,23 @@ class Emission(Contextual):
             else:
                 params = torch.full((K, F), 1 / F, dtype=dtype, device=device)
 
-            # Theta/context modulation
             if theta is not None:
                 theta_tensor = theta.mean(dim=0, keepdim=True) if theta.ndim == 2 else theta
                 params = params + theta_scale * theta_tensor.expand(K, -1)
             if context is not None:
                 params = self._modulate_per_state(params, context)
 
-            # Clamp and normalize for categorical
             if emission_type == "categorical":
                 params = params.clamp_min(EPS)
                 params = params / params.sum(dim=-1, keepdim=True)
 
             self._emission_params.copy_(params)
 
-            # Return distribution
             if emission_type == "categorical":
                 return Categorical(probs=params)
             elif emission_type == "bernoulli":
                 return Independent(Bernoulli(probs=params), 1)
-            else:  # poisson
+            else:
                 return Independent(Poisson(params), 1)
 
         else:
@@ -515,10 +448,7 @@ class Emission(Contextual):
             scale = torch.clamp(self.scale_param, min=self.min_covar)
             self._emission_means.copy_(loc)
             self._emission_covs.copy_(torch.diag_embed(scale**2))
-            if self.emission_type == "laplace":
-                dist = Independent(Laplace(loc, scale), 1)
-            else:
-                dist = Independent(StudentT(df=self.dof, loc=loc, scale=scale), 1)
+            dist = Independent(Laplace(loc, scale), 1) if self.emission_type == "laplace" else Independent(StudentT(df=self.dof, loc=loc, scale=scale), 1)
 
         elif self.emission_type in {"categorical", "bernoulli", "poisson"}:
             base = getattr(self, "logits", getattr(self, "log_rate", None))
@@ -600,6 +530,9 @@ class Initial(Contextual):
         self._param_cache: OrderedDict[int, torch.Tensor] = OrderedDict()
         self._last_param_hash = torch.tensor([float(self.logits.detach().sum())], device=self.device, dtype=DTYPE)
 
+        if not hasattr(self, "_cache"):
+            self._cache: OrderedDict[int, torch.Tensor] = OrderedDict()
+
     @torch.no_grad()
     def initialize(self, mode: str = "uniform") -> Categorical:
         """Reset initial state logits and return Categorical distribution."""
@@ -614,12 +547,10 @@ class Initial(Contextual):
         else:
             raise ValueError(f"Unknown mode '{mode}'")
 
-        # Update internal state
         self.logits.copy_(logits)
         self._cache.clear()
         self._param_cache.clear()
         self._last_param_hash.fill_(logits.sum())
-
         return Categorical(logits=logits)
 
     # ----------------------------------------------------------------------
@@ -641,18 +572,23 @@ class Initial(Contextual):
                 logger.debug("[Initial] Parameter change detected, cache cleared")
         return changed
 
-    def _apply_context(self, logits: torch.Tensor, context: Optional[torch.Tensor], scale: float):
+    def _apply_context(self, logits: torch.Tensor, context: Optional[torch.Tensor], scale: float) -> torch.Tensor:
         mod = super()._apply_context(logits, context, scale)
         return torch.clamp(mod, -MAX_LOGITS, MAX_LOGITS)
 
     # ----------------------------------------------------------------------
     # Core
     # ----------------------------------------------------------------------
-    def forward(self, context: Optional[torch.Tensor] = None, log: bool = False, return_dist: bool = False):
+    def forward(
+        self,
+        context: Optional[torch.Tensor] = None,
+        log: bool = False,
+        return_dist: bool = False,
+    ) -> torch.Tensor | Categorical:
         self._params_changed()
         ctx_hash = self._context_hash(context)
 
-        # LRU cache check
+        # LRU cache lookup
         cached = self._param_cache.get(ctx_hash)
         if cached is not None:
             self._param_cache.move_to_end(ctx_hash)
@@ -671,12 +607,12 @@ class Initial(Contextual):
             return Categorical(logits=mod_logits)
         return log_probs if log else log_probs.exp()
 
-    def log_matrix(self, context: Optional[torch.Tensor] = None):
+    def log_matrix(self, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         return self.forward(context=context, log=True)
 
-    def sample(self, context: Optional[torch.Tensor] = None):
+    def sample(self, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         dist = self.forward(context=context, return_dist=True)
-        return dist.sample().to(self.device, DTYPE)
+        return dist.sample().to(self.device)
 
 
 class Duration(Contextual):
@@ -737,6 +673,8 @@ class Duration(Contextual):
         self._last_temp_hash = torch.tensor([self.temperature], device=self.device, dtype=DTYPE)
         self._last_scale_hash = torch.tensor([self.scale], device=self.device, dtype=DTYPE)
 
+        self._durations = torch.arange(1, max_duration + 1, device=self.device, dtype=DTYPE)
+
     @torch.no_grad()
     def initialize(self, mode: str = "uniform") -> Categorical:
         """Reset per-state duration logits and return Categorical distribution."""
@@ -756,7 +694,6 @@ class Duration(Contextual):
         self._last_param_hash.fill_(logits.sum())
         self._last_temp_hash.fill_(self.temperature)
         self._last_scale_hash.fill_(self.scale)
-
         return Categorical(logits=logits)
 
     # ---------------- Helpers ----------------
@@ -807,31 +744,35 @@ class Duration(Contextual):
 
         return mod_logits
 
-    def forward(self, context: Optional[torch.Tensor] = None, log: bool = False, return_dist: bool = False):
+    def forward(
+        self,
+        context: Optional[torch.Tensor] = None,
+        log: bool = False,
+        return_dist: bool = False
+    ) -> Union[torch.Tensor, Categorical]:
         mod_logits = self._mod_logits(context)
         if return_dist:
             return Categorical(logits=mod_logits)
         return F.log_softmax(mod_logits, dim=-1) if log else F.softmax(mod_logits, dim=-1)
 
-    def log_prob(self, x: torch.Tensor, context: Optional[torch.Tensor] = None):
+    def log_prob(self, x: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         dist = self.forward(context=context, return_dist=True)
         return dist.log_prob(x.to(self.device, dtype=torch.long))
 
-    def log_matrix(self, context: Optional[torch.Tensor] = None):
-        return F.log_softmax(self.forward(context=context, log=False), dim=-1)
+    def log_matrix(self, context: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return F.log_softmax(self._mod_logits(context), dim=-1)
 
-    def expected_duration(self, context: Optional[torch.Tensor] = None):
+    def expected_duration(self, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         probs = self.forward(context=context, log=False)
-        durations = torch.arange(1, self.max_duration + 1, device=self.device, dtype=DTYPE)
-        return (probs * durations).sum(dim=-1)
+        return (probs * self._durations).sum(dim=-1)
 
-    def mode(self, context: Optional[torch.Tensor] = None):
+    def mode(self, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         probs = self.forward(context=context, log=False)
-        return torch.argmax(probs, dim=-1) + 1
+        return torch.argmax(probs, dim=-1) + 1  # durations are 1-based
 
-    def sample(self, context: Optional[torch.Tensor] = None):
+    def sample(self, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         dist = self.forward(context=context, return_dist=True)
-        return dist.sample().to(self.device, DTYPE)
+        return dist.sample().to(self.device)
 
 
 class Transition(Contextual):
@@ -865,10 +806,10 @@ class Transition(Contextual):
         )
 
         self.n_states = n_states
+        self.cache_limit = cache_limit
         self.temperature = max(temperature, 1e-6)
         self.scale = scale
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.cache_limit = cache_limit
         self.debug = debug
 
         # ---------------- Initialize logits ----------------
@@ -877,6 +818,7 @@ class Transition(Contextual):
         elif init_mode == "diag_bias":
             logits_init = torch.full((n_states, n_states), 0.1, dtype=DTYPE)
             logits_init.fill_diagonal_(0.7)
+            logits_init /= logits_init.sum(dim=1, keepdim=True)
             logits_init = torch.log(logits_init)
         elif init_mode == "normal":
             logits_init = torch.randn(n_states, n_states) * 0.1
@@ -891,15 +833,16 @@ class Transition(Contextual):
         self._last_temp_hash = torch.tensor([self.temperature], device=self.device, dtype=DTYPE)
         self._last_scale_hash = torch.tensor([self.scale], device=self.device, dtype=DTYPE)
 
+    # ---------------- Initialization ----------------
     @torch.no_grad()
     def initialize(self, mode: str = "uniform") -> Categorical:
-        """Reset per-state transition logits and return Categorical distribution."""
         n = self.n_states
         if mode == "uniform":
             logits = torch.log(torch.ones(n, n, device=self.device, dtype=DTYPE) / n)
         elif mode == "diag_bias":
             logits = torch.full((n, n), 0.1, device=self.device, dtype=DTYPE)
             logits.fill_diagonal_(0.7)
+            logits /= logits.sum(dim=1, keepdim=True)
             logits = torch.log(logits)
         elif mode == "normal":
             logits = torch.randn(n, n, device=self.device, dtype=DTYPE) * 0.1
@@ -955,7 +898,6 @@ class Transition(Contextual):
         mod_logits = mod_logits.view(self.n_states, self.n_states) / self.temperature
         mod_logits = torch.clamp(mod_logits, -MAX_LOGITS, MAX_LOGITS)
 
-        # Maintain bounded LRU cache
         self._cache[ctx_hash] = mod_logits.detach()
         if len(self._cache) > self.cache_limit:
             self._cache.popitem(last=False)
@@ -963,26 +905,30 @@ class Transition(Contextual):
         return mod_logits
 
     # ---------------- Forward ----------------
-    def forward(self, context: Optional[torch.Tensor] = None, log: bool = False, return_dist: bool = False):
+    def forward(
+        self, context: Optional[torch.Tensor] = None, log: bool = False, return_dist: bool = False
+    ) -> Union[torch.Tensor, Categorical]:
         mod_logits = self._mod_logits(context)
         if return_dist:
             return Categorical(logits=mod_logits)
         return F.log_softmax(mod_logits, dim=-1) if log else F.softmax(mod_logits, dim=-1)
 
-    def log_prob(self, x: torch.Tensor, context: Optional[torch.Tensor] = None):
+    # ---------------- Utility Methods ----------------
+    def log_prob(self, x: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         dist = self.forward(context=context, return_dist=True)
         return dist.log_prob(x.to(self.device, dtype=torch.long))
 
-    def log_matrix(self, context: Optional[torch.Tensor] = None):
-        return F.log_softmax(self.forward(context=context, log=False), dim=-1)
+    def log_matrix(self, context: Optional[torch.Tensor] = None) -> torch.Tensor:
+        return F.log_softmax(self._mod_logits(context), dim=-1)
 
-    def expected_transitions(self, context: Optional[torch.Tensor] = None):
+    def expected_transitions(self, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         return self.forward(context=context, log=False)
 
-    def mode(self, context: Optional[torch.Tensor] = None):
+    def mode(self, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         probs = self.forward(context=context, log=False)
         return torch.argmax(probs, dim=-1)
 
-    def sample(self, context: Optional[torch.Tensor] = None):
+    def sample(self, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         dist = self.forward(context=context, return_dist=True)
-        return dist.sample().to(self.device, DTYPE)
+        return dist.sample()  # LongTensor for state indices
+

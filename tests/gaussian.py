@@ -3,7 +3,7 @@ import numpy as np
 from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
 from scipy.optimize import linear_sum_assignment
 
-from nhsmm.defaults import DTYPE, EPS
+from nhsmm.constants import DTYPE, EPS, logger
 from nhsmm.models import GaussianHSMM
 
 # -------------------------

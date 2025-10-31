@@ -1,5 +1,5 @@
-from typing import Optional, Dict, List
 import torch
+from typing import Optional, Dict, List
 
 
 class SeedGenerator:

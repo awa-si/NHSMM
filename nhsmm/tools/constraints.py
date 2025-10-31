@@ -2,7 +2,7 @@ import torch
 from enum import Enum
 from typing import Tuple, Optional, Union
 
-from nhsmm.defaults import DTYPE, EPS, logger
+from nhsmm.constants import DTYPE, EPS, logger
 
 
 # -------------------------------

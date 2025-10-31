@@ -5,7 +5,7 @@ from threading import Lock
 from typing import Callable, List, Optional
 import matplotlib.pyplot as plt
 
-from nhsmm.defaults import DTYPE, EPS, HSMMError, logger
+from nhsmm.constants import DTYPE, EPS, logger
 
 
 class ConvergenceMonitor:

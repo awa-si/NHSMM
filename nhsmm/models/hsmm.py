@@ -9,7 +9,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Distribution, Categorical, Independent
 
-from nhsmm.defaults import Initial, Emission, Duration, Transition, DTYPE, EPS, HSMMError, logger
+from nhsmm.constants import DTYPE, EPS, HSMMError, logger
+from nhsmm.default import Initial, Emission, Duration, Transition
 from nhsmm import utils, constraints, SeedGenerator, ConvergenceMonitor
 from nhsmm.context import ContextEncoder
 

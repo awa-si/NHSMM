@@ -7,7 +7,7 @@ import numpy as np
 import polars as pl
 from typing import Tuple, Optional, List
 
-from nhsmm.defaults import DTYPE
+from nhsmm.constants import DTYPE
 
 
 def load_dataframe(data_dir: str, pair: str, timeframe: str) -> pl.DataFrame:

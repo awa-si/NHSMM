@@ -2,11 +2,12 @@
 import torch
 import torch.nn as nn
 from torch.distributions import MultivariateNormal
+
+import numpy as np
 from sklearn.cluster import KMeans
 from typing import Optional, Literal
-import numpy as np
 
-from nhsmm.defaults import DTYPE, EPS, HSMMError
+from nhsmm.constants import DTYPE, EPS, HSMMError, logger
 from nhsmm.models.hsmm import HSMM
 
 

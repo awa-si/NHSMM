@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Literal, Union, Tuple
 
-from nhsmm.defaults import DTYPE, logger
+from nhsmm.constants import DTYPE, logger
 
 
 class ContextEncoder(nn.Module):
