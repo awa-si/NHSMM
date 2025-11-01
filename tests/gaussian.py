@@ -52,7 +52,7 @@ def best_permutation_accuracy(true, pred, n_classes):
 # -------------------------
 def print_duration_summary(model):
     with torch.no_grad():
-        D = torch.exp(model.duration_logits).cpu().numpy()
+        D = torch.exp(model.duration_module.log_matrix()).cpu().numpy()
     print("\nLearned duration modes (per state):")
     for i, row in enumerate(D):
         mode = int(np.argmax(row)) + 1

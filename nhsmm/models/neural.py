@@ -11,7 +11,7 @@ from sklearn.cluster import KMeans
 from dataclasses import dataclass
 import numpy as np
 
-from nhsmm.default import Duration, Emission, Transition
+from nhsmm.modules import Duration, Emission, Transition
 from nhsmm.constants import DTYPE, EPS
 from nhsmm.models.hsmm import HSMM
 from nhsmm import utils
