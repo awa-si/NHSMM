@@ -1,10 +1,45 @@
+import os
 import torch
 import numpy as np
+import polars as pl
 from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
 from scipy.optimize import linear_sum_assignment
 
 from nhsmm.constants import DTYPE, EPS, logger
 from nhsmm.models import GaussianHSMM
+
+
+def load_ohlcv_tensor(
+    data_dir: str,
+    symbol: str,
+    timeframe: str = "5m",
+    feature_cols: list[str] = ["open", "high", "low", "close", "volume"],
+    state_col: str = "state",
+) -> tuple[torch.Tensor, list[int] | None]:
+    """
+    Load OHLCV data from a feather/ipc file, extract features and optional state labels.
+
+    Args:
+        data_dir: Path to directory containing feather/ipc files.
+        symbol: Trading pair, e.g., "BTC/USDT:USDT".
+        timeframe: Candle timeframe string.
+        feature_cols: Columns to use as features.
+        state_col: Column name containing true states (if available).
+
+    Returns:
+        X: Tensor of shape [T, F]
+        true_states: List of int labels if state_col exists, else None
+    """
+    symbol_sanitized = symbol.replace("/", "_").replace(":", "_")
+    filename = f"{symbol_sanitized}-{timeframe}-futures.feather"
+    path = os.path.join(data_dir, filename)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Data file not found: {path}")
+
+    df = pl.read_ipc(path, memory_map=False).sort("date")[:5000]
+    X = torch.tensor(df.select(feature_cols).to_numpy(), dtype=DTYPE)
+    true_states = df[state_col].to_list() if state_col in df.columns else None
+    return X, true_states
 
 # -------------------------
 # Synthetic OHLCV generator (all states more distinct)
@@ -66,12 +101,22 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     np.random.seed(0)
 
+    # -------------------------
+    # Load OHLCV
+    # -------------------------
+    SYMBOL = "BTC/USDT:USDT"
+    DATA_DIR = "/opt/trader/user_data/data/bybit/futures"
+
+    # X, true_states = load_ohlcv_tensor(DATA_DIR, SYMBOL, "5m")
+    # print(f"Loaded X: {X.shape}, true_states: {len(true_states) if true_states else None}")
+
     true_states, X = generate_ohlcv(n_segments=12, seg_len_low=15, seg_len_high=40)
-    X_torch = torch.tensor(X, dtype=torch.float64)
+    X_torch = torch.tensor(X, dtype=DTYPE)
+    # X_torch = (X_torch - X_torch.mean(0)) / (X_torch.std(0) + 1e-6)
 
     n_states = 3
     n_features = X.shape[1]
-    max_duration = 60  # slightly higher to accommodate long segments
+    max_duration = 60
 
     print(f"\nConfig: n_states={n_states}, max_duration={max_duration}, n_features={n_features}")
 
@@ -80,6 +125,7 @@ if __name__ == "__main__":
         n_states=n_states,
         n_features=n_features,
         max_duration=max_duration,
+        min_covar=1e-3,
         k_means=True,
         alpha=1.0,
         seed=0
@@ -97,8 +143,8 @@ if __name__ == "__main__":
     t0 = time.time()
     model.fit(
         X_torch,
-        max_iter=5,
         n_init=3,
+        max_iter=5,
         sample_D_from_X=True,
         verbose=True,
         tol=1e-4

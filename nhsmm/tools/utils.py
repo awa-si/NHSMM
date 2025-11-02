@@ -1,11 +1,11 @@
 import torch
 from dataclasses import dataclass
-from typing import List, Optional, Union, Tuple
+from typing import List, Optional, Union, Tuple, Union
 
 
 @dataclass(frozen=False)
 class Observations:
-    """Container for one or more sequences, optional log-probs, and context vectors."""
+    """Container for sequences, optional log-probs, and context vectors."""
 
     sequence: List[torch.Tensor]
     lengths: Optional[List[int]] = None
@@ -81,28 +81,34 @@ class Observations:
         ctxs = [c.clone() if c is not None else None for c in self.context]
         return Observations(seqs, self.lengths, logs, ctxs)
 
-    def __getitem__(self, idx: int) -> "Observations":
-        """Return a single-sequence Observations object."""
-        seqs = [self.sequence[idx]]
-        lens = [self.lengths[idx]]
-        logs = [self.log_probs[idx]] if self.log_probs else None
-        ctxs = [self.context[idx]] if self.context else None
+    def __getitem__(self, idx: Union[int, slice]) -> "Observations":
+        if isinstance(idx, int):
+            seqs = [self.sequence[idx]]
+            lens = [self.lengths[idx]]
+            logs = [self.log_probs[idx]] if self.log_probs else None
+            ctxs = [self.context[idx]] if self.context else None
+        else:  # slice
+            seqs = self.sequence[idx]
+            lens = self.lengths[idx]
+            logs = self.log_probs[idx] if self.log_probs else None
+            ctxs = self.context[idx] if self.context else None
         return Observations(seqs, lens, logs, ctxs)
 
     def normalize(self, mask: Optional[List[torch.Tensor]] = None, eps: float = 1e-6) -> "Observations":
-        """Normalize sequences with optional per-sequence masks."""
+        """Normalize sequences per feature, optional per-sequence masks."""
         normed = []
         for i, s in enumerate(self.sequence):
             m = mask[i].unsqueeze(-1) if mask else torch.ones_like(s)
-            mean = (s * m).sum(0) / m.sum().clamp_min(1)
-            std = ((s - mean) * m).pow(2).sum(0).sqrt() / m.sum().clamp_min(1)
-            normed.append((s - mean) / std.clamp_min(eps))
+            mean = (s * m).sum(0) / m.sum().clamp_min(1.0)
+            var = (((s - mean) * m) ** 2).sum(0) / m.sum().clamp_min(1.0)
+            std = var.sqrt().clamp_min(eps)
+            normed.append((s - mean) / std)
         return Observations(normed, self.lengths, self.log_probs, self.context)
 
 
 @dataclass(frozen=False)
 class ContextualVariables:
-    """Container for one or more context tensors with optional names and time-dependence."""
+    """Container for multiple context tensors with optional names and time-dependence."""
 
     n_context: int
     X: List[torch.Tensor]
@@ -118,10 +124,10 @@ class ContextualVariables:
             raise ValueError("`names` length must match `n_context`.")
         devices = {x.device for x in self.X}
         if len(devices) > 1:
-            raise ValueError("All tensors must be on the same device.")
+            raise ValueError("All context tensors must be on the same device.")
         dtypes = {x.dtype for x in self.X}
         if len(dtypes) > 1:
-            raise ValueError("All tensors must have the same dtype.")
+            raise ValueError("All context tensors must have the same dtype.")
 
     @property
     def shape(self) -> Tuple[torch.Size, ...]:
@@ -158,6 +164,7 @@ class ContextualVariables:
         return ContextualVariables(self.n_context, X, self.time_dependent, self.names)
 
     def cat(self, dim: int = -1, normalize: bool = False, eps: float = 1e-6) -> torch.Tensor:
+        """Concatenate all context tensors along `dim`, optional normalization."""
         out = self.X[0] if len(self.X) == 1 else torch.cat(self.X, dim=dim)
         if normalize:
             mean, std = out.mean(0, keepdim=True), out.std(0, keepdim=True).clamp_min(eps)

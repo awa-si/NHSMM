@@ -5,6 +5,7 @@ import logging
 EPS = 1e-12
 MAX_LOGITS = 50.0
 DTYPE = torch.float32
+DEBUG = False
 
 # -------------------------
 # Logger

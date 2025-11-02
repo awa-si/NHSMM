@@ -47,14 +47,6 @@ class GaussianHSMM(HSMM):
             seed=seed,
         )
 
-    @property
-    def dof(self) -> int:
-        K, F = self.n_states, self.n_features
-        trans_dof = K * (K - 1)
-        mean_dof = K * F
-        cov_dof = K * F * (F + 1) // 2
-        return trans_dof + mean_dof + cov_dof
-
     def _contextual_emission_pdf(self, X: Optional[torch.Tensor] = None, theta: Optional[dict] = None) -> Optional[MultivariateNormal]:
         pdf = getattr(self, "_params", {}).get("emission_pdf", None)
         if isinstance(pdf, MultivariateNormal):
