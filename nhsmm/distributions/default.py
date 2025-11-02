@@ -133,9 +133,20 @@ class Contextual(nn.Module):
     def _context_hash(self, context: Optional[torch.Tensor]) -> str:
         if context is None:
             return "none"
+
+        # Round to fixed precision to avoid floating-point instability
         ctx = torch.round(context.detach().cpu() * 1e6) / 1e6
         flat = ctx.flatten()
-        sample = flat[torch.linspace(0, len(flat) - 1, min(len(flat), 32), dtype=torch.long)]
+
+        # Sample evenly up to 32 points, handle small tensors gracefully
+        n_samples = min(len(flat), 32)
+        if n_samples == 0:
+            sample = torch.tensor([], dtype=flat.dtype)
+        else:
+            indices = torch.linspace(0, len(flat) - 1, n_samples, dtype=torch.long)
+            sample = flat[indices]
+
+        # Hash as unsigned 32-bit integer for consistency
         return f"{tuple(ctx.shape)}-{hash(tuple(sample.tolist())) & 0xffffffff}"
 
     def _cache_get(self, key: str) -> Optional[torch.Tensor]:
@@ -176,23 +187,38 @@ class Contextual(nn.Module):
         scale: float = 0.1,
         grad_scale: Optional[float] = None,
     ) -> torch.Tensor:
+        """
+        Prepare delta tensor with temporal/spatial adapters, activation, and scaling.
+        Fully vectorized for batch and single-feature inputs.
+        """
         delta = delta.to(self.device, DTYPE)
-        batch_mode = delta.ndim == 2
+        is_batch = delta.ndim == 2  # [B, F] vs [F]
 
-        if self.temporal_adapter:
-            if not batch_mode:
-                delta = delta.unsqueeze(0).unsqueeze(-1)
+        # --- Temporal adapter ---
+        if self.temporal_adapter is not None:
+            # Ensure shape [1, F, B] for batch or [1, F, 1] for single vector
+            if is_batch:
+                delta_exp = delta.transpose(0, 1).unsqueeze(0)  # [1, F, B]
             else:
-                delta = delta.transpose(1, 0).unsqueeze(0)
-            delta = self.temporal_adapter(delta).squeeze(-1).transpose(0, 1) if batch_mode else delta.squeeze()
+                delta_exp = delta.unsqueeze(0).unsqueeze(-1)   # [1, F, 1]
 
-        if self.spatial_adapter:
+            delta_exp = self.temporal_adapter(delta_exp)      # [1, F, B] or [1, F, 1]
+            delta = delta_exp.squeeze(-1).transpose(0, 1) if is_batch else delta_exp.squeeze()
+
+        # --- Spatial adapter ---
+        if self.spatial_adapter is not None:
             delta = self.spatial_adapter(delta)
 
+        # --- Activation and scaling ---
         delta = self.final_activation_fn(delta) * scale
-        delta = torch.nan_to_num(delta)
+
+        # --- Numerical safety ---
+        delta = torch.nan_to_num(delta, nan=0.0)
+
+        # --- Optional gradient scaling ---
         if grad_scale is not None:
             delta = delta * grad_scale
+
         return delta
 
     def _apply_context(
@@ -202,21 +228,64 @@ class Contextual(nn.Module):
         scale: float = 0.1,
         grad_scale: Optional[float] = None,
     ) -> torch.Tensor:
+        """
+        Apply context modulation to the base parameters.
+
+        Supports:
+          - Optional projection if context dimension differs.
+          - Additive delta with final activation and scaling.
+          - Optional gradient scaling.
+          - LRU caching for repeated contexts.
+          - Automatic broadcasting for batch or single context.
+
+        Parameters
+        ----------
+        base : torch.Tensor
+            Base parameters to modulate (e.g., logits, means).
+        context : Optional[torch.Tensor]
+            Context tensor, shape [D] or [T, D] or [B, T, D].
+        scale : float
+            Scaling factor for context delta.
+        grad_scale : Optional[float]
+            Optional gradient multiplier for delta.
+
+        Returns
+        -------
+        torch.Tensor
+            Context-modulated parameters, same shape as `base`.
+        """
         context = self._validate_context(context)
         key = self._context_hash(context)
         cached = self._cache_get(key)
         if cached is not None:
             return cached
 
+        # No context → return base directly
         if context is None:
             result = base
         else:
-            delta = self.context_net(context) if self.context_net else self._proj(context)
+            # Compute delta
+            if self.context_net:
+                delta = self.context_net(context)
+            elif self._proj:
+                delta = self._proj(context)
+            else:
+                raise RuntimeError("Context provided but no context_net or projection available.")
+
+            # Ensure delta broadcastable to base
+            if delta.ndim < base.ndim:
+                delta = delta.expand(*base.shape[:-1], delta.shape[-1])
+
+            # Apply temporal/spatial adapters, final activation, scaling, grad multiplier
             delta = self._prepare_delta(delta, scale=scale, grad_scale=grad_scale)
+
+            # Add delta to base
             result = base + delta
 
-        self._cache_set(key, result)
+        # Cache the result
+        self._cache_set(key, result.detach() if grad_scale is None else result)
         return result
+
 
     # ---------------- Dummy initializer ----------------
     def initialize(self, mode: str = "uniform", **kwargs):
@@ -300,17 +369,27 @@ class Emission(Contextual):
     def _spread_means(self, means: torch.Tensor, scale: float = 1.0, n_iter: int = 5) -> torch.Tensor:
         if self.seed is not None:
             torch.manual_seed(self.seed)
+
         K, F = means.shape
         jitter = scale * torch.randn_like(means)
+        candidate = means + jitter
+
         for _ in range(n_iter):
-            candidate = means + jitter
-            diff = candidate.unsqueeze(0) - candidate.unsqueeze(1)
-            dist = torch.sqrt((diff ** 2).sum(-1) + torch.eye(K, device=means.device) * 1e12)
-            min_dist = dist.min(dim=1).values
+            # pairwise squared distances, excluding diagonal
+            diff = candidate.unsqueeze(0) - candidate.unsqueeze(1)  # [K,K,F]
+            dist_sq = (diff ** 2).sum(-1)                          # [K,K]
+            mask = torch.eye(K, device=means.device, dtype=torch.bool)
+            dist_sq.masked_fill_(mask, float('inf'))
+
+            min_dist = dist_sq.min(dim=1).values  # min distance to other means
             if torch.all(min_dist > 1e-3):
-                break
-            jitter += 0.1 * scale * torch.randn_like(jitter)
-        return means + jitter
+                return candidate
+
+            # vectorized jitter update
+            jitter = 0.1 * scale * torch.randn_like(means)
+            candidate = candidate + jitter
+
+        return candidate
 
     # ---------------- Initialization ----------------
     @torch.no_grad()
@@ -404,6 +483,46 @@ class Emission(Contextual):
 
         else:
             raise ValueError(f"Unsupported emission_type: {emission_type}")
+
+    def _apply_context(
+        self,
+        X: torch.Tensor,
+        theta: Optional[torch.Tensor] = None,
+        scale: float = 1.0,
+        grad_scale: Optional[float] = None,
+    ) -> torch.Tensor:
+        """
+        Apply contextual modulation to emission parameters with optional temporal/spatial adapters.
+        Uses Contextual._apply_context as base, then applies emission-specific adapters and safe scaling.
+
+        Args:
+            X: [B, F] or [F] feature tensor (emission parameters).
+            theta: Optional context tensor.
+            scale: Scaling factor for delta modulation.
+            grad_scale: Optional gradient scaling factor.
+
+        Returns:
+            Modulated emission tensor, same shape as X.
+        """
+        # --- Compute base delta from Contextual class ---
+        delta = super()._apply_context(X, theta)  # shape matches X
+
+        # --- Apply temporal/spatial adapters via _prepare_delta if defined ---
+        if hasattr(self, "_prepare_delta"):
+            delta = self._prepare_delta(delta, scale=scale, grad_scale=grad_scale)
+
+        # --- Emission-specific adapter ---
+        if getattr(self, "emission_adapter", None):
+            delta = self.emission_adapter(delta)
+
+        # --- Safe activation and NaN handling ---
+        delta = self.final_activation_fn(delta) * scale
+        delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # --- Additive modulation to original emissions ---
+        X_mod = X + delta
+
+        return X_mod
 
     # ---------------- Forward ----------------
     def forward(self, context: Optional[torch.Tensor] = None, return_dist: bool = False):
