@@ -74,17 +74,18 @@ class Contextual(nn.Module):
             nn.Linear(target_dim, target_dim, bias=False).to(self.device, DTYPE)
             if spatial_adapter else None
         )
-        if self.temporal_adapter:
-            nn.init.xavier_uniform_(self.temporal_adapter.weight)
-        if self.spatial_adapter:
-            nn.init.xavier_uniform_(self.spatial_adapter.weight)
+        for a in [self.temporal_adapter, self.spatial_adapter]:
+            if a is not None:
+                nn.init.xavier_uniform_(a.weight)
 
         self._proj: Optional[nn.Linear] = None
         self._cache: OrderedDict[str, torch.Tensor] = OrderedDict()
         self._param_version = 0
-        self._last_param_sum: Optional[float] = None  # generic param change tracking
+        self._last_param_sum: Optional[float] = None
 
-    # ---------------- Activation & init ----------------
+    # -------------------------------------------------------------------------
+    # Internal utilities
+    # -------------------------------------------------------------------------
     def _get_activation(self, name: str) -> nn.Module:
         return {
             "tanh": nn.Tanh(),
@@ -102,11 +103,13 @@ class Contextual(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    # ---------------- Context validation ----------------
+    # -------------------------------------------------------------------------
+    # Context validation and projection
+    # -------------------------------------------------------------------------
     def _ensure_projection(self, in_dim: int):
         if not self.allow_projection:
-            raise ValueError(f"Expected context dimension {self.context_dim}, got {in_dim}")
-        if self._proj is None or in_dim != self._proj.in_features:
+            raise ValueError(f"Expected context_dim={self.context_dim}, got {in_dim}")
+        if self._proj is None or self._proj.in_features != in_dim:
             out_dim = self.context_dim or self.target_dim
             self._proj = nn.Linear(in_dim, out_dim, device=self.device, dtype=DTYPE)
             nn.init.normal_(self._proj.weight, 0.0, 1e-3)
@@ -117,7 +120,7 @@ class Contextual(nn.Module):
     def _validate_context(self, context: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if context is None:
             return None
-        if context.ndim not in [1, 2]:
+        if context.ndim not in (1, 2):
             raise ValueError(f"Expected 1D or 2D context, got {context.shape}")
         context = context.to(self.device, DTYPE)
         in_dim = context.shape[-1]
@@ -128,25 +131,19 @@ class Contextual(nn.Module):
             context = self._proj(context)
         return context
 
-    # ---------------- Caching & param-change ----------------
+    # -------------------------------------------------------------------------
+    # Caching
+    # -------------------------------------------------------------------------
     @torch.no_grad()
     def _context_hash(self, context: Optional[torch.Tensor]) -> str:
         if context is None:
             return "none"
-
-        # Round to fixed precision to avoid floating-point instability
         ctx = torch.round(context.detach().cpu() * 1e6) / 1e6
         flat = ctx.flatten()
-
-        # Sample evenly up to 32 points, handle small tensors gracefully
-        n_samples = min(len(flat), 32)
-        if n_samples == 0:
-            sample = torch.tensor([], dtype=flat.dtype)
-        else:
-            indices = torch.linspace(0, len(flat) - 1, n_samples, dtype=torch.long)
-            sample = flat[indices]
-
-        # Hash as unsigned 32-bit integer for consistency
+        if len(flat) == 0:
+            return f"{tuple(ctx.shape)}-empty"
+        idx = torch.linspace(0, len(flat) - 1, min(32, len(flat)), dtype=torch.long)
+        sample = flat[idx]
         return f"{tuple(ctx.shape)}-{hash(tuple(sample.tolist())) & 0xffffffff}"
 
     def _cache_get(self, key: str) -> Optional[torch.Tensor]:
@@ -160,7 +157,7 @@ class Contextual(nn.Module):
     def _cache_set(self, key: str, value: torch.Tensor):
         if not self.cache_enabled:
             return
-        self._cache[key] = value.to(self.device, DTYPE)
+        self._cache[key] = value.detach().to(self.device, DTYPE)
         if len(self._cache) > self.cache_limit:
             self._cache.popitem(last=False)
 
@@ -172,7 +169,6 @@ class Contextual(nn.Module):
 
     @torch.no_grad()
     def _params_changed(self, param: torch.Tensor) -> bool:
-        """Detect param change and invalidate cache if needed."""
         current_sum = float(param.detach().sum())
         if self._last_param_sum is None or abs(current_sum - self._last_param_sum) > 1e-7:
             self._last_param_sum = current_sum
@@ -180,45 +176,30 @@ class Contextual(nn.Module):
             return True
         return False
 
-    # ---------------- Core ----------------
+    # -------------------------------------------------------------------------
+    # Core logic
+    # -------------------------------------------------------------------------
     def _prepare_delta(
         self,
         delta: torch.Tensor,
         scale: float = 0.1,
         grad_scale: Optional[float] = None,
     ) -> torch.Tensor:
-        """
-        Prepare delta tensor with temporal/spatial adapters, activation, and scaling.
-        Fully vectorized for batch and single-feature inputs.
-        """
         delta = delta.to(self.device, DTYPE)
-        is_batch = delta.ndim == 2  # [B, F] vs [F]
+        is_batch = delta.ndim == 2
 
-        # --- Temporal adapter ---
+        # Temporal adapter expects [B,F] → [1,F,B]
         if self.temporal_adapter is not None:
-            # Ensure shape [1, F, B] for batch or [1, F, 1] for single vector
-            if is_batch:
-                delta_exp = delta.transpose(0, 1).unsqueeze(0)  # [1, F, B]
-            else:
-                delta_exp = delta.unsqueeze(0).unsqueeze(-1)   # [1, F, 1]
+            x = delta.transpose(0, 1).unsqueeze(0) if is_batch else delta[None, :, None]
+            delta = self.temporal_adapter(x).squeeze(0).transpose(0, 1) if is_batch else self.temporal_adapter(x).squeeze()
 
-            delta_exp = self.temporal_adapter(delta_exp)      # [1, F, B] or [1, F, 1]
-            delta = delta_exp.squeeze(-1).transpose(0, 1) if is_batch else delta_exp.squeeze()
-
-        # --- Spatial adapter ---
         if self.spatial_adapter is not None:
             delta = self.spatial_adapter(delta)
 
-        # --- Activation and scaling ---
         delta = self.final_activation_fn(delta) * scale
-
-        # --- Numerical safety ---
         delta = torch.nan_to_num(delta, nan=0.0)
-
-        # --- Optional gradient scaling ---
         if grad_scale is not None:
             delta = delta * grad_scale
-
         return delta
 
     def _apply_context(
@@ -228,71 +209,36 @@ class Contextual(nn.Module):
         scale: float = 0.1,
         grad_scale: Optional[float] = None,
     ) -> torch.Tensor:
-        """
-        Apply context modulation to the base parameters.
-
-        Supports:
-          - Optional projection if context dimension differs.
-          - Additive delta with final activation and scaling.
-          - Optional gradient scaling.
-          - LRU caching for repeated contexts.
-          - Automatic broadcasting for batch or single context.
-
-        Parameters
-        ----------
-        base : torch.Tensor
-            Base parameters to modulate (e.g., logits, means).
-        context : Optional[torch.Tensor]
-            Context tensor, shape [D] or [T, D] or [B, T, D].
-        scale : float
-            Scaling factor for context delta.
-        grad_scale : Optional[float]
-            Optional gradient multiplier for delta.
-
-        Returns
-        -------
-        torch.Tensor
-            Context-modulated parameters, same shape as `base`.
-        """
         context = self._validate_context(context)
         key = self._context_hash(context)
         cached = self._cache_get(key)
         if cached is not None:
             return cached
 
-        # No context → return base directly
         if context is None:
             result = base
         else:
-            # Compute delta
-            if self.context_net:
+            delta = None
+            if self.context_net is not None:
                 delta = self.context_net(context)
-            elif self._proj:
+            elif self._proj is not None:
                 delta = self._proj(context)
             else:
-                raise RuntimeError("Context provided but no context_net or projection available.")
+                raise RuntimeError("Context provided but no encoder/projection available.")
 
-            # Ensure delta broadcastable to base
             if delta.ndim < base.ndim:
-                delta = delta.expand(*base.shape[:-1], delta.shape[-1])
+                delta = delta.expand_as(base)
 
-            # Apply temporal/spatial adapters, final activation, scaling, grad multiplier
             delta = self._prepare_delta(delta, scale=scale, grad_scale=grad_scale)
-
-            # Add delta to base
             result = base + delta
 
-        # Cache the result
-        self._cache_set(key, result.detach() if grad_scale is None else result)
+        self._cache_set(key, result)
         return result
 
-
-    # ---------------- Dummy initializer ----------------
+    # -------------------------------------------------------------------------
+    # API consistency
+    # -------------------------------------------------------------------------
     def initialize(self, mode: str = "uniform", **kwargs):
-        """
-        Dummy initializer for API consistency.
-        Derived modules override with actual init logic.
-        """
         if self.debug:
             print(f"[Contextual.initialize] mode={mode} (noop)")
         return self
@@ -571,7 +517,17 @@ class Emission(Contextual):
 
     # ---------------- Log-Prob and Sampling ----------------
     def log_prob(self, x: torch.Tensor, context: Optional[torch.Tensor] = None):
-        return self.forward(context=context, return_dist=True).log_prob(x.to(self.device, DTYPE))
+        """
+        Compute log-probabilities of observations x under context-modulated emissions.
+        Supports [L, D] inputs and returns [L, K] outputs.
+        """
+        dist = self.forward(context=context, return_dist=True)
+        x = x.to(self.device, DTYPE)
+
+        # Expand for broadcasting: [L, 1, D] vs [K, D]
+        x_expanded = x.unsqueeze(1)  # [L, 1, D]
+        log_probs = dist.log_prob(x_expanded)  # [L, K]
+        return log_probs
 
     def sample(self, n_samples: int = 1, context: Optional[torch.Tensor] = None):
         return self.forward(context=context, return_dist=True).sample((n_samples,)).to(self.device, DTYPE)
