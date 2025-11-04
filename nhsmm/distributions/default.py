@@ -296,15 +296,15 @@ class Emission(Contextual):
 
         # Learnable parameters
         if self.emission_type == "gaussian":
-            self.mu = nn.Parameter(torch.randn(n_states, n_features, device=self.device, dtype=DTYPE)*0.1)
-            self.log_var = nn.Parameter(torch.full((n_states, n_features), -1.0, device=self.device, dtype=DTYPE))
-        elif self.emission_type in {"categorical","bernoulli"}:
-            self.logits = nn.Parameter(torch.zeros(n_states, n_features, device=self.device, dtype=DTYPE))
+            self.mu = nn.Parameter(torch.randn(n_states, n_features, dtype=DTYPE, device=self.device) * 0.1)
+            self.log_var = nn.Parameter(torch.full((n_states, n_features), -1.0, dtype=DTYPE, device=self.device))
+        elif self.emission_type in {"categorical", "bernoulli"}:
+            self.logits = nn.Parameter(torch.zeros(n_states, n_features, dtype=DTYPE, device=self.device))
         elif self.emission_type == "poisson":
-            self.log_rate = nn.Parameter(torch.zeros(n_states, n_features, device=self.device, dtype=DTYPE))
-        elif self.emission_type in {"laplace","studentt"}:
-            self.loc = nn.Parameter(torch.randn(n_states, n_features, device=self.device, dtype=DTYPE)*0.1)
-            self.scale_param = nn.Parameter(torch.full((n_states, n_features), 0.1, device=self.device, dtype=DTYPE))
+            self.log_rate = nn.Parameter(torch.zeros(n_states, n_features, dtype=DTYPE, device=self.device))
+        elif self.emission_type in {"laplace", "studentt"}:
+            self.loc = nn.Parameter(torch.randn(n_states, n_features, dtype=DTYPE, device=self.device) * 0.1)
+            self.scale_param = nn.Parameter(torch.full((n_states, n_features), 0.1, dtype=DTYPE, device=self.device))
         else:
             raise ValueError(f"Unsupported emission_type: {self.emission_type}")
 
@@ -314,13 +314,18 @@ class Emission(Contextual):
         K, F = means.shape
         candidate = means + scale * torch.randn_like(means)
         for _ in range(n_iter):
-            diff = candidate.unsqueeze(0)-candidate.unsqueeze(1)
-            dist_sq = (diff**2).sum(-1)
+            diff = candidate.unsqueeze(0) - candidate.unsqueeze(1)
+            dist_sq = (diff ** 2).sum(-1)
             dist_sq.fill_diagonal_(float('inf'))
             if torch.all(dist_sq.min(dim=1).values > 1e-3):
                 return candidate
-            candidate += 0.1*scale*torch.randn_like(means)
+            candidate += 0.1 * scale * torch.randn_like(means)
         return candidate
+
+    def _adapt(self, tensor: torch.Tensor, context: Optional[torch.Tensor]) -> torch.Tensor:
+        if context is not None and self.adaptive_scale:
+            return tensor * self.scale / (context.norm(dim=-1, keepdim=True) + EPS)
+        return tensor
 
     @torch.no_grad()
     def initialize(
@@ -336,96 +341,129 @@ class Emission(Contextual):
         etype = (emission_type or self.emission_type).lower()
         K, F = self.n_states, self.n_features
         X = X.to(dtype=DTYPE, device=self.device) if X is not None else None
-        if X is not None and X.std() < EPS: X += 1e-3*torch.randn_like(X)
+        if X is not None and X.std() < EPS: X += 1e-3 * torch.randn_like(X)
 
-        if etype in {"gaussian","laplace","studentt"}:
+        if etype in {"gaussian", "laplace", "studentt"}:
+            # Weighted initialization
             if X is not None and posterior is not None:
                 weights = posterior.clamp_min(EPS)
                 weights_sum = weights.sum(dim=0, keepdim=True)
                 means = (weights.T @ X) / weights_sum.T
-                if etype=="gaussian":
-                    diff = X.unsqueeze(1)-means.unsqueeze(0)
-                    weighted = diff*weights.unsqueeze(-1)
-                    covs = torch.einsum("tkf,tkd->kfd",weighted,diff)/weights_sum.T.unsqueeze(-1)
-                    covs = 0.5*(covs+covs.transpose(-1,-2)) + self.min_covar*torch.eye(F,device=self.device)
+                if etype == "gaussian":
+                    diff = X.unsqueeze(1) - means.unsqueeze(0)
+                    weighted = diff * weights.unsqueeze(-1)
+                    covs = torch.einsum("tkf,tkd->kfd", weighted, diff) / weights_sum.T.unsqueeze(-1)
+                    covs = 0.5 * (covs + covs.transpose(-1, -2)) + self.min_covar * torch.eye(F, device=self.device)
                 else:
-                    scales = ((X.unsqueeze(1)-means.unsqueeze(0)).abs()*weights.unsqueeze(-1)).sum(dim=0)/weights_sum.T
+                    scales = ((X.unsqueeze(1) - means.unsqueeze(0)).abs() * weights.unsqueeze(-1)).sum(dim=0) / weights_sum.T
                     scales = scales.clamp_min(self.min_covar)
             else:
                 means = self._emission_means.clone()
-                covs = self._emission_covs.clone() if etype=="gaussian" else torch.diag_embed(torch.sqrt(torch.diagonal(self._emission_covs,dim1=-2,dim2=-1)).clamp_min(self.min_covar))
+                covs = self._emission_covs.clone() if etype == "gaussian" else torch.diag_embed(torch.sqrt(torch.diagonal(self._emission_covs, dim1=-2, dim2=-1)).clamp_min(self.min_covar))
+
             if theta is not None:
-                theta_tensor = theta.mean(dim=0,keepdim=True) if theta.ndim==2 else theta
-                means += theta_scale*theta_tensor.expand(K,-1)
+                theta_tensor = theta.mean(dim=0, keepdim=True) if theta.ndim == 2 else theta
+                means += theta_scale * theta_tensor.expand(K, -1)
             if context is not None:
                 means = self._apply_context(means, context, self.scale)
-            if etype=="gaussian":
+
+            if etype == "gaussian":
                 means = self._spread_means(means, scale=init_spread)
                 self._emission_means.copy_(means)
                 self._emission_covs.copy_(covs)
-                return MultivariateNormal(loc=means,covariance_matrix=covs)
+                return MultivariateNormal(loc=means, covariance_matrix=covs)
             else:
                 self._emission_means.copy_(means)
-                self._emission_covs.copy_(torch.diag_embed(scales**2))
-                return Independent(Laplace(means,scales),1) if etype=="laplace" else Independent(StudentT(df=self.dof,loc=means,scale=scales),1)
+                self._emission_covs.copy_(torch.diag_embed(scales ** 2))
+                dist_cls = Laplace if etype == "laplace" else StudentT
+                return Independent(dist_cls(loc=means, scale=scales) if etype=="laplace" else Independent(StudentT(df=self.dof, loc=means, scale=scales), 1), 1)
 
-        elif etype in {"categorical","bernoulli","poisson"}:
+        elif etype in {"categorical", "bernoulli", "poisson"}:
             if X is not None:
-                if etype=="categorical":
-                    counts = torch.stack([torch.bincount(X[:,f].long(),minlength=F) for f in range(F)],dim=1).T.float()
-                    params = counts/counts.sum(-1,keepdim=True)
+                if etype == "categorical":
+                    counts = torch.stack([torch.bincount(X[:, f].long(), minlength=F) for f in range(F)], dim=1).T.float()
+                    params = counts / counts.sum(-1, keepdim=True)
                 else:
-                    params = X.float().mean(0,keepdim=True).expand(K,-1)
+                    params = X.float().mean(0, keepdim=True).expand(K, -1)
             else:
-                params = torch.full((K,F),1/F,dtype=DTYPE,device=self.device)
+                params = torch.full((K, F), 1 / F, dtype=DTYPE, device=self.device)
+
             if theta is not None:
-                theta_tensor = theta.mean(dim=0,keepdim=True) if theta.ndim==2 else theta
-                params += theta_scale*theta_tensor.expand(K,-1)
+                theta_tensor = theta.mean(dim=0, keepdim=True) if theta.ndim == 2 else theta
+                params += theta_scale * theta_tensor.expand(K, -1)
             if context is not None:
                 params = self._apply_context(params, context, self.scale)
-            if etype=="categorical": params = params.clamp_min(EPS); params/=params.sum(dim=-1,keepdim=True)
+
+            if etype == "categorical":
+                params = params.clamp_min(EPS)
+                params /= params.sum(dim=-1, keepdim=True)
             self._emission_params.copy_(params)
-            if etype=="categorical": return Categorical(probs=params)
-            elif etype=="bernoulli": return Independent(Bernoulli(probs=params),1)
-            else: return Independent(Poisson(params),1)
+
+            if etype == "categorical":
+                return Categorical(probs=params)
+            elif etype == "bernoulli":
+                return Independent(Bernoulli(probs=params), 1)
+            else:
+                return Independent(Poisson(params), 1)
+
         else:
             raise ValueError(f"Unsupported emission_type: {etype}")
 
-    def forward(self, context: Optional[torch.Tensor]=None, return_dist: bool=False):
+    def forward(self, context: Optional[torch.Tensor] = None, return_dist: bool = False):
+        """Always returns a distribution if return_dist=True, else returns raw parameters."""
         etype = self.emission_type
-        if etype=="gaussian":
-            mu = self._apply_context(self.mu, context, self.scale)
+
+        if etype == "gaussian":
+            mu = self._adapt(self._apply_context(self.mu, context, self.scale), context)
             var = torch.clamp(F.softplus(self.log_var), min=self.min_covar)
-            if self.modulate_var: var = torch.clamp(var+self._apply_context(var, context, self.scale).abs(), min=self.min_covar)
-            if self.adaptive_scale and context is not None: mu*=self.scale/(context.norm(dim=-1,keepdim=True)+EPS)
+            if self.modulate_var: var = torch.clamp(var + self._apply_context(var, context, self.scale).abs(), min=self.min_covar)
+            cov = torch.diag_embed(var)
             self._emission_means.copy_(mu)
-            self._emission_covs.copy_(torch.diag_embed(var))
-            dist = Independent(Normal(mu,var.sqrt()),1)
-        elif etype in {"laplace","studentt"}:
-            loc = self._apply_context(self.loc, context, self.scale)
-            scale = torch.clamp(self.scale_param,min=self.min_covar)
-            if self.adaptive_scale and context is not None: loc*=self.scale/(context.norm(dim=-1,keepdim=True)+EPS)
+            self._emission_covs.copy_(cov)
+            dist = Independent(Normal(mu, var.sqrt()), 1)
+
+        elif etype in {"laplace", "studentt"}:
+            loc = self._adapt(self._apply_context(self.loc, context, self.scale), context)
+            scale = torch.clamp(self.scale_param, min=self.min_covar)
             self._emission_means.copy_(loc)
             self._emission_covs.copy_(torch.diag_embed(scale**2))
-            dist = Independent(Laplace(loc,scale),1) if etype=="laplace" else Independent(StudentT(df=self.dof,loc=loc,scale=scale),1)
+            dist = Independent(Laplace(loc, scale), 1) if etype == "laplace" else Independent(StudentT(df=self.dof, loc=loc, scale=scale), 1)
+
         else:  # categorical, bernoulli, poisson
-            base = getattr(self,"logits",getattr(self,"log_rate",None))
-            out = F.softplus(base) if etype=="poisson" else base
-            out = self._apply_context(out, context, self.scale)
-            if self.adaptive_scale and context is not None: out*=self.scale/(context.norm(dim=-1,keepdim=True)+EPS)
+            base = getattr(self, "logits", getattr(self, "log_rate", None))
+            out = self._adapt(self._apply_context(base, context, self.scale), context)
             self._emission_params.copy_(out)
-            if etype=="categorical": dist = Categorical(logits=out)
-            elif etype=="bernoulli": dist = Independent(Bernoulli(logits=out),1)
-            else: dist = Independent(Poisson(out),1)
+            if etype == "categorical":
+                dist = Categorical(logits=out)
+            elif etype == "bernoulli":
+                dist = Independent(Bernoulli(logits=out), 1)
+            else:
+                dist = Independent(Poisson(out), 1)
 
-        return dist if return_dist else (self._emission_means, self._emission_covs) if etype in {"gaussian","laplace","studentt"} else self._emission_params
+        if return_dist:
+            return dist
+        else:
+            if etype in {"gaussian", "laplace", "studentt"}:
+                return self._emission_means, self._emission_covs
+            else:
+                return self._emission_params
 
-    def log_prob(self, x: torch.Tensor, context: Optional[torch.Tensor]=None):
+    def log_prob(self, x: torch.Tensor, context: Optional[torch.Tensor] = None):
         dist = self.forward(context=context, return_dist=True)
-        return dist.log_prob(x.unsqueeze(1))
+        if x.ndim == 2 and isinstance(dist, Independent):
+            x = x.unsqueeze(1)  # match [L, 1, F]
+        return dist.log_prob(x)
 
-    def sample(self, n_samples: int=1, context: Optional[torch.Tensor]=None):
-        return self.forward(context=context, return_dist=True).sample((n_samples,)).to(self.device, DTYPE)
+    def sample(self, n_samples: int = 1, context: Optional[torch.Tensor] = None):
+        dist = self.forward(context=context, return_dist=True)
+        return dist.sample((n_samples,)).to(self.device, DTYPE)
+
+    def parameters_tensor(self):
+        """Returns raw emission parameters as tensor for DP fallback."""
+        if self.emission_type in {"gaussian", "laplace", "studentt"}:
+            return self._emission_means, self._emission_covs
+        else:
+            return self._emission_params
 
 
 class Initial(Contextual):
