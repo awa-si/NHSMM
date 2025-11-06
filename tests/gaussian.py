@@ -3,7 +3,7 @@ import time
 import torch
 import numpy as np
 import polars as pl
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import (
     confusion_matrix,
     precision_score,
@@ -16,18 +16,22 @@ import matplotlib.pyplot as plt
 from nhsmm.constants import DEBUG, DTYPE, EPS, logger
 from nhsmm.models import GaussianHSMM
 
+DEFAULT_RNG_SEED = 0
+DEFAULT_LABELS = ["range", "bull", "bear"]
+
 # ============================================================
 # Synthetic OHLCV generator (robust 2D output)
 # ============================================================
-def generate_ohlcv(n_segments=12, seg_len_low=15, seg_len_high=40, rng_seed=42):
+def generate_ohlcv(n_segments=12, seg_len_low=15, seg_len_high=40, rng_seed=None):
+    rng_seed = DEFAULT_RNG_SEED if rng_seed is None else rng_seed
     rng = np.random.default_rng(rng_seed)
     states, obs = [], []
 
-    # Define distinct means for each regime/state
+    # Distinct means for each regime/state (keep order consistent with DEFAULT_LABELS)
     means = [
         np.array([140, 145, 135, 140, 2e6]),  # range
-        np.array([60, 65, 55, 60, 2e5]),      # bear
         np.array([200, 210, 190, 200, 5e5]),  # bull
+        np.array([60, 65, 55, 60, 2e5]),      # bear
     ]
     cov = np.diag([2.0, 2.0, 2.0, 2.0, 5e4])
 
@@ -35,25 +39,14 @@ def generate_ohlcv(n_segments=12, seg_len_low=15, seg_len_high=40, rng_seed=42):
         s = int(rng.integers(0, len(means)))
         L = int(rng.integers(seg_len_low, seg_len_high + 1))
         seg = rng.multivariate_normal(means[s], cov, size=L)
-
-        # Ensure segment is 2D
-        if seg.ndim == 1:
-            seg = seg.reshape(1, -1)
-
+        seg = np.atleast_2d(seg)
         obs.append(seg)
         states.extend([s] * L)
 
-    # Stack all segments safely
-    if len(obs) == 0:
-        X_np = np.empty((0, len(means[0])))
-    else:
-        X_np = np.vstack(obs)
-
+    X_np = np.vstack(obs) if obs else np.empty((0, len(means[0])))
     states_arr = np.array(states, dtype=int)
-    label_map = {0: "range", 1: "bear", 2: "bull"}
-
+    label_map = {i: lbl for i, lbl in enumerate(DEFAULT_LABELS)}
     return states_arr, X_np, label_map
-
 
 # ============================================================
 # Data Loading
@@ -63,9 +56,10 @@ def load_ohlcv_tensor(
     symbol: str,
     max_rows: int = 5000,
     timeframe: str = "5m",
-    feature_cols: list[str] = ["open", "high", "low", "close", "volume"],
+    feature_cols: list[str] = ["open", "high", "low", "close"],
     state_col: str = "state",
-    default_labels: list[str] = ["range", "bull", "bear"],
+    default_labels: list[str] = DEFAULT_LABELS,
+    rng_seed: int = DEFAULT_RNG_SEED,
 ):
     """
     Load OHLCV data from a feather/ipc file. Optional state labels are encoded.
@@ -83,19 +77,19 @@ def load_ohlcv_tensor(
             encoder = LabelEncoder()
             true_states = encoder.fit_transform(df[state_col].to_list())
             label_map = {i: lbl for i, lbl in enumerate(encoder.classes_)}
+            logger.info(f"Loaded {len(df)} rows with provided state column.")
         else:
             true_states = None
             label_map = {i: lbl for i, lbl in enumerate(default_labels)}
-            print(f"No state column found — using default label map: {label_map}")
+            logger.info(f"No state column found — using default label map: {label_map}")
     else:
         # fallback synthetic data
-        true_states, X_np, label_map = generate_ohlcv()
+        true_states, X_np, label_map = generate_ohlcv(rng_seed=rng_seed)
         X = torch.tensor(X_np, dtype=DTYPE)
         true_states = np.array(true_states)
-        print(f"No data file found — using synthetic data with label map: {label_map}")
+        logger.info(f"No data file found — using synthetic data with label map: {label_map}")
 
     return X, true_states, label_map
-
 
 # ============================================================
 # Hungarian permutation alignment
@@ -103,23 +97,20 @@ def load_ohlcv_tensor(
 def best_permutation_accuracy(true, pred, n_classes, label_map=None):
     true = np.array(true)
     pred = np.array(pred)
-
     C = confusion_matrix(true, pred, labels=list(range(n_classes)))
     row_ind, col_ind = linear_sum_assignment(-C)
     mapping = {col: row for row, col in zip(row_ind, col_ind)}
     mapped_pred = np.array([mapping.get(p, p) for p in pred])
     acc = (mapped_pred == true).mean()
-
-    if label_map:
-        readable = {
+    readable = (
+        {
             f"model_{m} ({label_map.get(m, m)})": f"true_{t} ({label_map.get(t, t)})"
             for m, t in mapping.items()
         }
-    else:
-        readable = mapping
-
+        if label_map
+        else mapping
+    )
     return acc, mapped_pred, mapping, readable
-
 
 # ============================================================
 # Duration and variance summary
@@ -133,16 +124,15 @@ def print_duration_summary(model):
             else None
         )
 
-    print("\nLearned duration statistics:")
+    logger.info("Learned duration statistics:")
     for i, row in enumerate(D):
         mode = int(np.argmax(row)) + 1
         mean_dur = float((np.arange(1, len(row) + 1) * row).sum())
         if V is not None:
             var_dur = float((np.arange(1, len(row) + 1) ** 2 * V[i]).sum())
-            print(f" state {i}: mode={mode}, mean={mean_dur:.2f}, var={var_dur:.2f}")
+            logger.info(f" state {i}: mode={mode}, mean={mean_dur:.2f}, var={var_dur:.2f}")
         else:
-            print(f" state {i}: mode={mode}, mean={mean_dur:.2f}")
-
+            logger.info(f" state {i}: mode={mode}, mean={mean_dur:.2f}")
 
 # ============================================================
 # Main execution
@@ -156,12 +146,20 @@ if __name__ == "__main__":
 
     # --- Load or generate data ---
     X, true_states, label_map = load_ohlcv_tensor(DATA_DIR, SYMBOL)
+    if X.numel() == 0:
+        raise RuntimeError("No data available after load/generate — aborting.")
+
     X_torch = X.detach().clone() if isinstance(X, torch.Tensor) else torch.tensor(X, dtype=DTYPE)
     n_states = len(label_map)
     n_features = X.shape[1]
     max_duration = 50
 
-    print(f"\n[Config] n_states={n_states}, n_features={n_features}, max_duration={max_duration}")
+    logger.info(f"[Config] n_states={n_states}, n_features={n_features}, max_duration={max_duration}")
+
+    # --- Feature scaling (critical) ---
+    # scaler = StandardScaler()
+    # X_scaled = scaler.fit_transform(X_torch)
+    # X_torch = torch.tensor(X_scaled, dtype=DTYPE)
 
     # --- Initialize HSMM ---
     model = GaussianHSMM(
@@ -171,15 +169,23 @@ if __name__ == "__main__":
         min_covar=1e-3,
         k_means=True,
         alpha=1.0,
-        seed=0,
+        seed=DEFAULT_RNG_SEED,
     )
     # model.emission_module.initialize(X=X_torch)
+
+    print("[Init] Duration logits differentiated per state.")
 
     # --- EM Training ---
     print("\n=== EM Training ===")
 
     t0 = time.time()
-    model.fit(X_torch, n_init=3, max_iter=9, sample_D_from_X=True, verbose=True, tol=1e-4)
+    model.fit(
+        X_torch,
+        n_init=3,
+        tol=1e-4,
+        max_iter=9,
+        verbose=True,
+    )
     elapsed = time.time() - t0
 
     # --- Decode ---
@@ -222,6 +228,12 @@ if __name__ == "__main__":
         print("\nTransition matrix (row=from, col=to):")
         for i, row in enumerate(trans):
             print(f"  {label_map[i]}: {' '.join(f'{v:.3f}' for v in row)}")
+
+
+        print("\n----- Duration -----\n")
+        dur_logits = model.duration_module.log_matrix()
+        print("test: dur_logits.requires_grad", dur_logits.requires_grad)
+        print("test: dur_logits.mean(dim=-1)", dur_logits.mean(dim=-1))
 
     # --- Inferred state occupancy ---
     unique, counts = np.unique(v_path, return_counts=True)

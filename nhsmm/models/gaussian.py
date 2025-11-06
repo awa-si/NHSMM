@@ -47,12 +47,6 @@ class GaussianHSMM(HSMM):
             seed=seed,
         )
 
-    def _contextual_emission_pdf(self, X: Optional[torch.Tensor] = None, theta: Optional[dict] = None) -> Optional[MultivariateNormal]:
-        pdf = getattr(self, "_params", {}).get("emission_pdf", None)
-        if isinstance(pdf, MultivariateNormal):
-            return pdf
-        return None
-
     def decode(self, X: torch.Tensor, algorithm: Literal["viterbi", "map"] = "viterbi") -> np.ndarray:
         if not isinstance(X, torch.Tensor):
             X = torch.as_tensor(X, dtype=DTYPE)
