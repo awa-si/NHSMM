@@ -37,7 +37,7 @@ class Contextual(nn.Module):
         spatial_adapter: bool = False,
         allow_projection: bool = True,
         final_activation: str = "tanh",
-        cache_enabled: bool = False,
+        cache_enabled: bool = True,
         activation: str = "tanh",
         max_delta: float = 0.5,
         cache_limit: int = 32,
@@ -290,24 +290,24 @@ class Emission(Contextual):
         target_dim = n_states * n_features
         super().__init__(
             target_dim=target_dim,
-            context_dim=context_dim,
             hidden_dim=hidden_dim,
-            temporal_adapter=temporal_adapter,
+            context_dim=context_dim,
             spatial_adapter=spatial_adapter,
+            temporal_adapter=temporal_adapter,
             allow_projection=allow_projection,
             debug=debug,
         )
 
-        self.n_states = n_states
-        self.n_features = n_features
-        self.k_means = k_means
-        self.min_covar = min_covar
-        self.modulate_var = modulate_var
-        self.adaptive_scale = adaptive_scale
-        self.emission_type = emission_type.lower()
         self.dof = dof
         self.seed = seed
         self.scale = scale
+        self.k_means = k_means
+        self.n_states = n_states
+        self.min_covar = min_covar
+        self.n_features = n_features
+        self.modulate_var = modulate_var
+        self.adaptive_scale = adaptive_scale
+        self.emission_type = emission_type
 
         # Cached buffers
         self.register_buffer("_emission_means", torch.zeros(n_states, n_features, dtype=DTYPE, device=self.device))
@@ -329,17 +329,14 @@ class Emission(Contextual):
             raise ValueError(f"Unsupported emission_type: {self.emission_type}")
 
     @torch.no_grad()
-    def _spread_means(self, means: torch.Tensor, scale: float = 1.0, n_iter: int = 5) -> torch.Tensor:
+    def _spread_means(self, means, scale=1.0, n_iter=5):
         if self.seed is not None: torch.manual_seed(self.seed)
-        K, F = means.shape
         candidate = means + scale * torch.randn_like(means)
         for _ in range(n_iter):
-            diff = candidate.unsqueeze(0) - candidate.unsqueeze(1)
-            dist_sq = (diff ** 2).sum(-1)
+            dist_sq = torch.cdist(candidate, candidate, p=2)**2
             dist_sq.fill_diagonal_(float('inf'))
-            if torch.all(dist_sq.min(dim=1).values > 1e-3):
-                return candidate
-            candidate += 0.1 * scale * torch.randn_like(means)
+            if torch.all(dist_sq.min(dim=1).values > 1e-3): return candidate
+            candidate += 0.1*scale*torch.randn_like(means)
         return candidate
 
     def _adapt(self, tensor: torch.Tensor, context: Optional[torch.Tensor]) -> torch.Tensor:
@@ -361,37 +358,42 @@ class Emission(Contextual):
     ):
         etype = (emission_type or self.emission_type).lower()
         K, F = self.n_states, self.n_features
-        X = X.to(dtype=DTYPE, device=self.device) if X is not None else None
-        if X is not None and X.std() < EPS:
-            X += 1e-3 * torch.randn_like(X)
 
+        if X is not None:
+            X = X.to(dtype=DTYPE, device=self.device)
+            if X.std() < EPS:
+                X += 1e-3 * torch.randn_like(X)
+
+        # Continuous distributions
         if etype in {"gaussian", "laplace", "studentt"}:
-            # Weighted initialization
             if X is not None and posterior is not None:
                 weights = posterior.clamp_min(EPS)
                 weights_sum = weights.sum(dim=0, keepdim=True)
                 means = (weights.T @ X) / weights_sum.T
+
                 if etype == "gaussian":
                     diff = X.unsqueeze(1) - means.unsqueeze(0)
                     weighted = diff * weights.unsqueeze(-1)
                     covs = torch.einsum("tkf,tkd->kfd", weighted, diff) / weights_sum.T.unsqueeze(-1)
                     covs = 0.5 * (covs + covs.transpose(-1, -2))
-                    
-                    # --- Ensure positive-definite with adaptive jitter ---
-                    jitter = self.min_covar
+                    covs = covs.clamp_min(self.min_covar)
+
+                    # Vectorized PD check using cholesky_ex
                     for k in range(K):
-                        for i in range(max_jitter):
-                            try:
-                                torch.linalg.cholesky(covs[k])
+                        jitter = self.min_covar
+                        for _ in range(max_jitter):
+                            chol, info = torch.linalg.cholesky_ex(covs[k])
+                            if info == 0:
                                 break
-                            except RuntimeError:
-                                covs[k] += jitter * torch.eye(F, device=self.device)
-                                jitter *= 2
+                            covs[k] += jitter * torch.eye(F, device=self.device)
+                            jitter *= 2
                         else:
-                            raise RuntimeError(f"Covariance for state {k} is not PD even after jitter.")
-                else:
+                            raise RuntimeError(f"Covariance for state {k} is not PD after {max_jitter} attempts.")
+
+                else:  # laplace/studentt
                     scales = ((X.unsqueeze(1) - means.unsqueeze(0)).abs() * weights.unsqueeze(-1)).sum(dim=0) / weights_sum.T
                     scales = scales.clamp_min(self.min_covar)
+
             else:
                 means = self._emission_means.clone()
                 covs = self._emission_covs.clone() if etype == "gaussian" else torch.diag_embed(
@@ -401,6 +403,7 @@ class Emission(Contextual):
             if theta is not None:
                 theta_tensor = theta.mean(dim=0, keepdim=True) if theta.ndim == 2 else theta
                 means += theta_scale * theta_tensor.expand(K, -1)
+
             if context is not None:
                 means = self._apply_context(means, context, self.scale)
 
@@ -411,10 +414,11 @@ class Emission(Contextual):
                 return MultivariateNormal(loc=means, covariance_matrix=covs)
             else:
                 self._emission_means.copy_(means)
-                self._emission_covs.copy_(torch.diag_embed(scales ** 2))
+                self._emission_covs.copy_(torch.diag_embed(scales**2))
                 dist_cls = Laplace if etype == "laplace" else StudentT
                 return Independent(dist_cls(loc=means, scale=scales), 1)
 
+        # Discrete distributions
         elif etype in {"categorical", "bernoulli", "poisson"}:
             if X is not None:
                 if etype == "categorical":

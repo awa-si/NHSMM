@@ -54,7 +54,7 @@ def generate_ohlcv(n_segments=12, seg_len_low=15, seg_len_high=40, rng_seed=None
 def load_ohlcv_tensor(
     data_dir: str,
     symbol: str,
-    max_rows: int = 5000,
+    max_rows: int = 3000,
     timeframe: str = "5m",
     feature_cols: list[str] = ["open", "high", "low", "close"],
     state_col: str = "state",
