@@ -1,4 +1,4 @@
-# NHSMM — Neural Hidden Semi-Markov Models
+# NHSMM — (Neural) Hidden Semi-Markov Models
 
 [![PyPI](https://img.shields.io/pypi/v/nhsmm.svg)](https://pypi.org/project/nhsmm/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 
@@ -26,8 +26,8 @@ It extends classical HSMMs with **learnable emission, duration, and transition c
 ### From Source (Recommended for Development)
 
 ```bash
-git clone https://github.com/awwea/NeuralHSMM.git
-cd NeuralHSMM
+git clone https://github.com/awa-si/NHSMM.git
+cd NHSMM
 pip install -e .
 ```
 
@@ -98,6 +98,8 @@ print("Log-likelihood:", log_prob.item())
 print("Most likely states:", states.shape)
 print("Sampled states:", samples.shape)
 print("Expected durations per state:", expected_durations)
+
+(Look also tests/scripts dirs)
 ```
 
 ---
@@ -105,32 +107,32 @@ print("Expected durations per state:", expected_durations)
 ## 🔍 Contextual Flow Diagram (Conceptual)
 
 ```
-      ┌───────────────┐
-      │ External Input │  ← covariates, features, embeddings
-      └───────┬───────┘
-              │
-              ▼
+    ┌───────────────┐
+    │ External Input│  ← covariates, features, embeddings
+    └───────┬───────┘
+            │
+            ▼
 ┌─────────────────────────┐
-│ Neural Initial State     │  ← context-modulated initial probabilities
-│ Distribution             │
+│ Neural Initial State    │  ← context-modulated initial probabilities
+│ Distribution            │
 └─────────┬───────────────┘
           │
           ▼
 ┌─────────────────────────┐
-│ Neural Transition        │  ← context-gated, temperature-scaled transitions
-│ Distribution             │
+│ Neural Transition       │  ← context-gated, temperature-scaled transitions
+│ Distribution            │
 └─────────┬───────────────┘
           │
           ▼
 ┌─────────────────────────┐
-│ Neural Duration          │  ← context-aware duration probabilities per state
-│ Distribution             │
+│ Neural Duration         │  ← context-aware duration probabilities per state
+│ Distribution            │
 └─────────┬───────────────┘
           │
           ▼
 ┌─────────────────────────┐
-│ Emission Model           │  ← context-modulated observation likelihoods
-│ (Gaussian / Multinomial) │
+│ Emission Model          │  ← context-modulated observation likelihoods
+│ (Gaussian / Multinomial)│
 └─────────────────────────┘
 ```
 
