@@ -1,7 +1,7 @@
-from nhsmm.tools import constraints, ConvergenceMonitor, SeedGenerator, utils
+from nhsmm.tools import constraints, ConvergenceTracker, SeedGenerator, utils
 
 __all__ = [
-    'ConvergenceMonitor'
+    'ConvergenceTracker'
     'SeedGenerator',
     'constraints',
     'utils',

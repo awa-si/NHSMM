@@ -1,7 +1,11 @@
 import torch
 from dataclasses import dataclass
-from typing import List, Optional, Union, Tuple, Union
+from typing import List, Optional, Union, Tuple
 
+
+# ============================================================
+# Observations
+# ============================================================
 
 @dataclass(frozen=False)
 class Observations:
@@ -11,7 +15,7 @@ class Observations:
     lengths: Optional[List[int]] = None
     log_probs: Optional[List[torch.Tensor]] = None
     context: Optional[List[Optional[torch.Tensor]]] = None
-    mask: Optional[List[torch.Tensor]] = None  # new optional batch mask
+    mask: Optional[List[torch.Tensor]] = None  # optional per-sequence mask
 
     def __post_init__(self):
         if not self.sequence:
@@ -24,13 +28,13 @@ class Observations:
             raise ValueError("Mismatch between sequence lengths and `lengths`.")
         object.__setattr__(self, "lengths", seq_lengths)
 
-        if self.log_probs:
+        if self.log_probs is not None:
             if len(self.log_probs) != len(self.sequence):
                 raise ValueError("`log_probs` length must match `sequence` length.")
             if not all(isinstance(lp, torch.Tensor) for lp in self.log_probs):
                 raise TypeError("All elements in `log_probs` must be torch.Tensor.")
 
-        if self.context:
+        if self.context is not None:
             if len(self.context) != len(self.sequence):
                 raise ValueError("`context` length must match `sequence` length.")
             if not all(c is None or isinstance(c, torch.Tensor) for c in self.context):
@@ -38,7 +42,7 @@ class Observations:
         else:
             object.__setattr__(self, "context", [None] * len(self.sequence))
 
-        if self.mask:
+        if self.mask is not None:
             if len(self.mask) != len(self.sequence):
                 raise ValueError("`mask` length must match `sequence` length.")
             for m, s in zip(self.mask, self.sequence):
@@ -49,11 +53,14 @@ class Observations:
         else:
             object.__setattr__(
                 self, "mask",
-                [torch.ones(len_s, 1, dtype=torch.bool, device=self.sequence[0].device)
-                 for len_s in seq_lengths]
+                [torch.ones(l, 1, dtype=torch.bool, device=self.sequence[0].device)
+                 for l in seq_lengths]
             )
 
     # ---------------- Properties ----------------
+    def __len__(self) -> int:
+        return len(self.sequence)
+
     @property
     def n_sequences(self) -> int:
         return len(self.sequence)
@@ -106,15 +113,15 @@ class Observations:
         if isinstance(idx, int):
             seqs = [self.sequence[idx]]
             lens = [self.lengths[idx]]
-            logs = [self.log_probs[idx]] if self.log_probs else None
-            ctxs = [self.context[idx]] if self.context else None
-            masks = [self.mask[idx]] if self.mask else None
+            logs = [self.log_probs[idx]] if self.log_probs is not None else None
+            ctxs = [self.context[idx]] if self.context is not None else None
+            masks = [self.mask[idx]] if self.mask is not None else None
         else:
             seqs = self.sequence[idx]
             lens = self.lengths[idx]
-            logs = self.log_probs[idx] if self.log_probs else None
-            ctxs = self.context[idx] if self.context else None
-            masks = self.mask[idx] if self.mask else None
+            logs = self.log_probs[idx] if self.log_probs is not None else None
+            ctxs = self.context[idx] if self.context is not None else None
+            masks = self.mask[idx] if self.mask is not None else None
         return Observations(seqs, lens, logs, ctxs, masks)
 
     # ---------------- Normalization ----------------
@@ -123,15 +130,19 @@ class Observations:
         normed = []
         mask_list = mask or self.mask
         for s, m in zip(self.sequence, mask_list):
-            m = m.to(s.device, s.dtype)
-            m = m.unsqueeze(-1) if m.ndim == 1 else m
-            m_sum = m.sum(0).clamp_min(1.0)
-            mean = (s * m).sum(0) / m_sum
-            var = ((s - mean) ** 2 * m).sum(0) / m_sum
-            std = var.sqrt().clamp_min(eps)
-            normed.append(((s - mean) / std) * m + (1 - m) * s)  # keep padded entries intact
+            m = m.to(s.device)
+            m_f = m.to(s.dtype)
+            m_sum = m_f.sum(0).clamp_min(1.0)
+            mean = (s * m_f).sum(0) / m_sum
+            var = ((s - mean) ** 2 * m_f).sum(0) / m_sum
+            std = (var + eps).sqrt()
+            normed.append(((s - mean) / std) * m_f + (~m) * s)  # keep padded entries intact
         return Observations(normed, self.lengths, self.log_probs, self.context, mask_list)
 
+
+# ============================================================
+# ContextualVariables
+# ============================================================
 
 @dataclass(frozen=False)
 class ContextualVariables:
@@ -142,8 +153,7 @@ class ContextualVariables:
     time_dependent: bool = False
     names: Optional[List[str]] = None
 
-    # internal lightweight cache for concatenated context
-    _cache: Optional[dict] = None
+    _cache: Optional[dict] = None  # internal cache
 
     def __post_init__(self):
         if not self.X:
@@ -200,10 +210,13 @@ class ContextualVariables:
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        X = self.X
         if self.time_dependent:
-            ref_len = max(x.shape[0] for x in X if x.ndim >= 2)
+            if "_ref_len" not in self._cache:
+                self._cache["_ref_len"] = max(x.shape[0] for x in self.X if x.ndim >= 2)
+            ref_len = self._cache["_ref_len"]
             X = self._align_time(ref_len)
+        else:
+            X = self.X
 
         out = X[0] if len(X) == 1 else torch.cat(X, dim=dim)
         if normalize:
@@ -229,7 +242,7 @@ class ContextualVariables:
     def __getitem__(self, idx: Union[int, slice, torch.Tensor]) -> "ContextualVariables":
         """Supports indexing/slicing across all context tensors."""
         X = [x[idx] for x in self.X]
-        return ContextualVariables(len(X), X, self.time_dependent, self.names)
+        return ContextualVariables(self.n_context, X, self.time_dependent, self.names)
 
     def __repr__(self) -> str:
         names = self.names or [f"ctx{i}" for i in range(self.n_context)]

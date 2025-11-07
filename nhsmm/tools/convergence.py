@@ -2,130 +2,185 @@ import json
 import torch
 import numpy as np
 from threading import Lock
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Protocol
 import matplotlib.pyplot as plt
 
 from nhsmm.constants import DTYPE, EPS, logger
 
 
-class ConvergenceMonitor:
-    """Tracks iterative convergence for EM-like algorithms with robust rolling delta monitoring."""
+class CallbackFn(Protocol):
+    def __call__(
+        self,
+        monitor: "ConvergenceTracker",
+        iteration: int,
+        init_idx: int,
+        score: float,
+        delta_abs: float,
+        delta_rel: float,
+        converged: bool,
+    ) -> None: ...
+
+
+class ConvergenceTracker:
+    """Tracks EM-style convergence with rolling tolerance checks, best score tracking, and callbacks."""
 
     def __init__(
         self,
-        max_iter: int,
         n_init: int,
+        max_iter: int,
         tol: float = 1e-5,
         rel_tol: float = 1e-5,
-        post_conv_iter: int = 3,
-        verbose: bool = True,
-        callbacks: Optional[List[Callable]] = None,
+        patience: int = 3,
         early_stop: bool = True,
+        callbacks: Optional[List[CallbackFn]] = None,
         device: Optional[torch.device] = None,
+        verbose: bool = True,
     ):
-        self.max_iter = int(max_iter)
-        self.n_init = int(n_init)
         self.tol = float(tol)
         self.rel_tol = float(rel_tol)
-        self.post_conv_iter = int(post_conv_iter)
-        self.verbose = verbose
+        self.n_init = int(n_init)
+        self.max_iter = int(max_iter)
+        self.patience = int(patience)
         self.early_stop = early_stop
-        self.callbacks = callbacks or []
         self.device = device or torch.device("cpu")
+        self.verbose = verbose
+        self.callbacks = callbacks or []
 
+        # --- tracked values ---
         shape = (self.max_iter + 1, self.n_init)
-        self.score = torch.full(shape, float("nan"), dtype=DTYPE, device=self.device)
-        self.delta = torch.full_like(self.score, float("nan"))
-        self.rel_delta = torch.full_like(self.score, float("nan"))
-        self.is_converged_per_init = torch.zeros(self.n_init, dtype=torch.bool, device=self.device)
+        self.scores = torch.full(shape, float("nan"), dtype=DTYPE, device=self.device)
+        self.deltas = torch.full_like(self.scores, float("nan"))
+        self.rel_deltas = torch.full_like(self.scores, float("nan"))
+        self.converged_flags = torch.zeros(self.n_init, dtype=torch.bool, device=self.device)
+
+        # rolling buffers
+        self._rolling_abs = torch.full((self.n_init, self.patience), float("nan"), dtype=DTYPE, device=self.device)
+        self._rolling_rel = torch.full_like(self._rolling_abs, float("nan"))
+
+        # best-score tracking
+        self.best_scores = torch.full((self.n_init,), float("-inf"), dtype=DTYPE, device=self.device)
+        self.best_iters = torch.full((self.n_init,), -1, dtype=torch.int32, device=self.device)
+
+        self._lock = Lock()
         self.stop_training = False
 
-        # Single rolling tensor for all inits
-        self._rolling_deltas = torch.full(
-            (self.n_init, self.post_conv_iter), float("nan"), dtype=DTYPE, device=self.device
-        )
-        self._rolling_rel_deltas = torch.full_like(self._rolling_deltas, float("nan"))
-        self._lock = Lock()
+    # ---------------------------------------------------------------------- #
+    #                            Public interface                            #
+    # ---------------------------------------------------------------------- #
 
-    def push_pull(self, new_score: torch.Tensor | float, iteration: int, rank: int) -> bool:
-        """Push new score and check convergence."""
-        self.push(new_score, iteration, rank)
-        return self.check_converged(iteration, rank)
+    def update(self, score: torch.Tensor | float, iteration: int, init_idx: int) -> bool:
+        """Log a new score and check convergence."""
+        self._record_score(score, iteration, init_idx)
+        return self._evaluate_convergence(iteration, init_idx)
 
-    def push(self, new_score: torch.Tensor | float, iteration: int, rank: int):
-        """Record new score, compute absolute and relative delta, and update rolling buffers."""
-        val = new_score.detach() if torch.is_tensor(new_score) else torch.tensor(float(new_score), dtype=DTYPE, device=self.device)
-        self.score[iteration, rank] = val
-
-        if iteration > 0 and torch.isfinite(self.score[iteration - 1, rank]):
-            delta = val - self.score[iteration - 1, rank]
-            self.delta[iteration, rank] = delta
-
-            prev_val = self.score[iteration - 1, rank].abs()
-            rel_delta = delta / (prev_val + EPS)
-            self.rel_delta[iteration, rank] = rel_delta
-
-            # Rolling buffers
-            self._rolling_deltas[rank] = torch.roll(self._rolling_deltas[rank], -1)
-            self._rolling_deltas[rank, -1] = delta
-
-            self._rolling_rel_deltas[rank] = torch.roll(self._rolling_rel_deltas[rank], -1)
-            self._rolling_rel_deltas[rank, -1] = rel_delta
-
-    def check_converged(self, iteration: int, rank: int) -> bool:
-        """Check if convergence criteria are met and trigger callbacks."""
-        buf = self._rolling_deltas[rank]
-        buf_rel = self._rolling_rel_deltas[rank]
-
-        valid_abs = buf[torch.isfinite(buf)]
-        valid_rel = buf_rel[torch.isfinite(buf_rel)]
-
-        conv_abs = valid_abs.numel() >= self.post_conv_iter and torch.all(torch.abs(valid_abs) < self.tol).item()
-        conv_rel = valid_rel.numel() >= self.post_conv_iter and torch.all(torch.abs(valid_rel) < self.rel_tol).item()
-        conv = conv_abs and conv_rel
-
-        self.is_converged_per_init[rank] = conv
-        self._trigger_callbacks(iteration, rank, conv)
-
-        if self.verbose:
-            s = float(self.score[iteration, rank].item())
-            d_abs = float(self.delta[iteration, rank].item()) if torch.isfinite(self.delta[iteration, rank]) else float("nan")
-            d_rel = float(self.rel_delta[iteration, rank].item()) if torch.isfinite(self.rel_delta[iteration, rank]) else float("nan")
-            status = "✔️ Converged" if conv else ""
-            logger.info(f"[Init {rank+1:02d}] Iter {iteration:03d} | Score: {s:.6f} | Δ: {d_abs:.3e} | Δ%: {d_rel:.3e} {status}")
-
-        if conv and self.early_stop:
-            self.stop_training = True
-
-        return conv
-
-    def register_callback(self, fn: Callable):
-        """Add a callback function triggered each iteration."""
+    def add_callback(self, fn: CallbackFn):
         if fn not in self.callbacks:
             self.callbacks.append(fn)
 
-    def _trigger_callbacks(self, iteration: int, rank: int, conv: bool):
-        """Safely call all registered callbacks."""
+    def reset(self):
+        self.scores.fill_(float("nan"))
+        self.deltas.fill_(float("nan"))
+        self.rel_deltas.fill_(float("nan"))
+        self.converged_flags.fill_(False)
+        self._rolling_abs.fill_(float("nan"))
+        self._rolling_rel.fill_(float("nan"))
+        self.best_scores.fill_(float("-inf"))
+        self.best_iters.fill_(-1)
+        self.stop_training = False
+
+    # ---------------------------------------------------------------------- #
+    #                             Core tracking                              #
+    # ---------------------------------------------------------------------- #
+
+    def _record_score(self, score: torch.Tensor | float, iteration: int, init_idx: int):
+        val = (
+            score.detach() if torch.is_tensor(score)
+            else torch.tensor(float(score), dtype=DTYPE, device=self.device)
+        )
+        self.scores[iteration, init_idx] = val
+
+        # best score tracking
+        if val > self.best_scores[init_idx]:
+            self.best_scores[init_idx] = val
+            self.best_iters[init_idx] = iteration
+
+        if iteration == 0:
+            return
+
+        prev_val = self.scores[iteration - 1, init_idx]
+        if not torch.isfinite(prev_val):
+            return
+
+        delta = val - prev_val
+        rel_delta = delta / (prev_val.abs() + EPS)
+
+        self.deltas[iteration, init_idx] = delta
+        self.rel_deltas[iteration, init_idx] = rel_delta
+
+        # rolling buffers
+        self._rolling_abs[init_idx] = torch.roll(self._rolling_abs[init_idx], -1)
+        self._rolling_rel[init_idx] = torch.roll(self._rolling_rel[init_idx], -1)
+        self._rolling_abs[init_idx, -1] = delta
+        self._rolling_rel[init_idx, -1] = rel_delta
+
+    def _evaluate_convergence(self, iteration: int, init_idx: int) -> bool:
+        """Check rolling-window convergence for given init."""
+        if iteration < self.patience:
+            return False
+
+        buf_abs = self._rolling_abs[init_idx]
+        buf_rel = self._rolling_rel[init_idx]
+
+        valid_abs = buf_abs[torch.isfinite(buf_abs)]
+        valid_rel = buf_rel[torch.isfinite(buf_rel)]
+
+        conv_abs = valid_abs.numel() >= self.patience and torch.all(valid_abs.abs() < self.tol)
+        conv_rel = valid_rel.numel() >= self.patience and torch.all(valid_rel.abs() < self.rel_tol)
+        converged = bool(conv_abs and conv_rel)
+
+        self.converged_flags[init_idx] = converged
+        self._run_callbacks(iteration, init_idx, converged)
+
+        if self.verbose:
+            s = float(self.scores[iteration, init_idx].item())
+            da = float(self.deltas[iteration, init_idx].item()) if torch.isfinite(self.deltas[iteration, init_idx]) else float("nan")
+            dr = float(self.rel_deltas[iteration, init_idx].item()) if torch.isfinite(self.rel_deltas[iteration, init_idx]) else float("nan")
+            tag = "✔️" if converged else ""
+            logger.info(f"[Init {init_idx+1:02d}] Iter {iteration:03d} | Score: {s:.6f} | Δ: {da:.3e} | Δ%: {dr:.3e} {tag}")
+
+        if self.early_stop and torch.all(self.converged_flags):
+            self.stop_training = True
+
+        return converged
+
+    def _run_callbacks(self, iteration: int, init_idx: int, converged: bool):
         with self._lock:
-            s = float(self.score[iteration, rank].item())
-            d_abs = float(self.delta[iteration, rank].item()) if torch.isfinite(self.delta[iteration, rank]) else float("nan")
-            d_rel = float(self.rel_delta[iteration, rank].item()) if torch.isfinite(self.rel_delta[iteration, rank]) else float("nan")
+            s = float(self.scores[iteration, init_idx].item())
+            da = float(self.deltas[iteration, init_idx].item()) if torch.isfinite(self.deltas[iteration, init_idx]) else float("nan")
+            dr = float(self.rel_deltas[iteration, init_idx].item()) if torch.isfinite(self.rel_deltas[iteration, init_idx]) else float("nan")
             for fn in self.callbacks:
                 try:
-                    fn(self, iteration, rank, s, d_abs, d_rel, conv)
+                    fn(self, iteration, init_idx, s, da, dr, converged)
                 except Exception as e:
                     logger.warning(f"[Callback Error] {fn.__name__}: {e}")
 
-    def plot_convergence(self, show: bool = True, savepath: Optional[str] = None,
-                         title: str = "Convergence Curve", log_scale: bool = False):
-        """Plot convergence curves for all initializations."""
+    # ---------------------------------------------------------------------- #
+    #                             Visualization                              #
+    # ---------------------------------------------------------------------- #
+
+    def plot(self, show: bool = True, savepath: Optional[str] = None,
+             title: str = "Convergence Progress", log_scale: bool = False):
         plt.style.use("ggplot")
         fig, ax = plt.subplots(figsize=(9, 5))
-        iters = torch.arange(self.max_iter + 1, device=self.device)
+        iters = torch.arange(self.max_iter + 1)
         for r in range(self.n_init):
-            mask = torch.isfinite(self.score[:, r])
+            mask = torch.isfinite(self.scores[:, r])
             if mask.any():
-                ax.plot(iters[mask].cpu(), self.score[mask, r].cpu(), marker="o", lw=1.5, label=f"Init {r+1}")
+                ax.plot(iters[mask].cpu(), self.scores[mask, r].cpu(), marker="o", lw=1.5, label=f"Init {r+1}")
+                ax.scatter(
+                    [self.best_iters[r].cpu()], [self.best_scores[r].cpu()],
+                    color="black", marker="x", s=60, zorder=5
+                )
         ax.set_title(title)
         ax.set_xlabel("Iteration")
         ax.set_ylabel("Score / Log-Likelihood")
@@ -140,33 +195,27 @@ class ConvergenceMonitor:
         else:
             plt.close(fig)
 
-    def export_log(self, path: str):
-        """Export scores, deltas, relative deltas, and convergence status to JSON."""
+    # ---------------------------------------------------------------------- #
+    #                                Export                                  #
+    # ---------------------------------------------------------------------- #
+
+    def export(self, path: str):
         data = {
             "tol": self.tol,
-            "n_init": self.n_init,
             "rel_tol": self.rel_tol,
+            "n_init": self.n_init,
             "max_iter": self.max_iter,
-            "scores": self._tensor_to_list(self.score),
-            "delta": self._tensor_to_list(self.delta),
-            "rel_delta": self._tensor_to_list(self.rel_delta),
-            "converged": self.is_converged_per_init.cpu().tolist()
+            "scores": self._tensor_to_list(self.scores),
+            "deltas": self._tensor_to_list(self.deltas),
+            "rel_deltas": self._tensor_to_list(self.rel_deltas),
+            "converged": self.converged_flags.cpu().tolist(),
+            "best_scores": self.best_scores.cpu().tolist(),
+            "best_iters": self.best_iters.cpu().tolist(),
         }
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
 
     @staticmethod
     def _tensor_to_list(t: torch.Tensor) -> List[List[Optional[float]]]:
-        """Convert tensor to nested list, replacing NaNs with None."""
         arr = t.cpu().numpy()
         return [[float(x) if np.isfinite(x) else None for x in row] for row in arr]
-
-    def reset(self):
-        """Reset all internal states."""
-        self.score.fill_(float("nan"))
-        self.delta.fill_(float("nan"))
-        self.rel_delta.fill_(float("nan"))
-        self.is_converged_per_init.fill_(False)
-        self.stop_training = False
-        self._rolling_deltas.fill_(float("nan"))
-        self._rolling_rel_deltas.fill_(float("nan"))

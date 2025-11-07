@@ -1,11 +1,11 @@
-from .convergence import ConvergenceMonitor
+from .convergence import ConvergenceTracker
 from .seed import SeedGenerator
 from . import constraints
 from . import utils
 
 
 __all__ = [
-    'ConvergenceMonitor',
+    'ConvergenceTracker',
     'SeedGenerator',
     'constraints',
     'utils',
