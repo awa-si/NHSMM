@@ -1,23 +1,40 @@
-# NHSMM — (Neural) Hidden Semi-Markov Models
 
-[![PyPI](https://img.shields.io/pypi/v/nhsmm.svg)](https://pypi.org/project/nhsmm/) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+# NHSMM — Neural Hidden Semi-Markov Models (Base for SAE)
 
-**NHSMM** is a modular PyTorch library for **hierarchical regime detection** and **temporal sequence modeling** using ** Hidden Semi-Markov Models (HSMMs) **.
+[![PyPI](https://img.shields.io/pypi/v/nhsmm.svg)](https://pypi.org/project/nhsmm/) [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0) [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 
-It extends classical HSMMs with **learnable emission, duration, and transition components**, enabling **context-aware modeling** of temporal sequences in domains such as financial regimes, sensor signals, speech, and biomedical data.
+---
+
+**Downloadable Overview:**  
+This document serves as a **self-contained guide** for NHSMM, the modular PyTorch library that forms the foundation for **State Aware Engine (SAE)**. It is suitable for **developers, data scientists, and system integrators** to understand, download, and start using the library across multiple domains.
+
+---
+
+## Overview
+
+**NHSMM** enables **temporal sequence modeling** and **hidden-state detection** using **Hidden Semi-Markov Models (HSMMs)**.  
+
+It powers **SAE**, a **cross-domain platform** for detecting hidden regimes in **IoT, Health, Security, Robotics, and Finance**.  
+
+SAE leverages NHSMM for:  
+- **Cloud-first SaaS deployment** for immediate access  
+- **On-prem / Edge deployment** for low-latency or privacy-sensitive systems  
+- **Quantum/hardware accelerator readiness** for next-generation predictive modeling
 
 ---
 
 ## 🚀 Key Features
 
-* **Neural Emission Models** — Gaussian, Multinomial, or Bernoulli outputs, fully differentiable.
-* **Neural Duration Models** — explicit discrete duration distributions, context-modulated.
-* **Neural Transition Models** — learnable, covariate-aware transitions with gating and temperature scaling.
-* **Contextual HSMM** — external covariates dynamically modulate emissions, durations, and transitions.
-* **Subclassable Distributions** — Initial, Duration, Transition, and Emission inherit from PyTorch `Distribution`.
-* **HSMM-HMM Hybrid Inference** — forward-backward and Viterbi algorithms adapted for neural components.
-* **GPU-ready Implementation** — fully batched operations for fast training and inference.
-* **EM-style Updates & Initialization** — maximum likelihood or differentiable updates with temperature annealing.
+* Emission Models — Gaussian, Multinomial, or Bernoulli outputs, fully differentiable  
+* Duration Models — explicit discrete duration distributions, context-modulated  
+* Transition Models — learnable, covariate-aware transitions with gating and temperature scaling  
+* Contextual HSMM — external covariates dynamically modulate emissions, durations, and transitions  
+* Subclassable Distributions — Initial, Duration, Transition, and Emission inherit from PyTorch `Distribution`  
+* HSMM-HMM Hybrid Inference — forward-backward and Viterbi algorithms adapted for neural components  
+* GPU-ready Implementation — fully batched operations for fast training and inference  
+* EM-style Updates & Initialization — maximum likelihood or differentiable updates with temperature annealing  
+* Multi-Domain Usage — supports trading, IoT, robotics, wearable health, cybersecurity applications and even more...
+* Extensible — foundation for SAE adapters and API integration for multi-domain systems  
 
 ---
 
@@ -72,7 +89,7 @@ from nhsmm.models import NeuralHSMM
 # Example input sequence: 256 time steps, 32 features
 X = torch.randn(256, 32)
 
-# Optional external context: could be market indicators, sensor readings, or embeddings
+# Optional external context: market indicators, sensor readings, embeddings, etc.
 context = torch.randn(256, 16)  # 16-dimensional covariates
 
 # Initialize a 4-state Neural HSMM
@@ -99,12 +116,12 @@ print("Most likely states:", states.shape)
 print("Sampled states:", samples.shape)
 print("Expected durations per state:", expected_durations)
 
-(Look also tests/scripts dirs)
+# Explore tests and scripts for more examples
 ```
 
 ---
 
-## 🔍 Contextual Flow Diagram (Conceptual)
+## 🔍 Conceptual Flow Diagram
 
 ```
     ┌───────────────┐
@@ -136,10 +153,6 @@ print("Expected durations per state:", expected_durations)
 └─────────────────────────┘
 ```
 
-* Context flows into **Initial**, **Transition**, and **Duration** distributions.
-* Each component can be **batch-modulated** and supports **temperature scaling** without affecting argmax modes.
-* EM-style updates allow **differentiable learning** of all parameters while preserving stability.
-
 ---
 
 ## ⚙️ Development
@@ -158,6 +171,19 @@ ruff check nhsmm
 
 ---
 
+## 🌐 Multi-Domain Applicability
+
+SAE (built on NHSMM) can be applied to:
+
+* IoT / Industrial Systems — Predict machine regime changes for maintenance  
+* Health / Wearables — Detect activity and physiological state transitions  
+* Security / Cyber-Physical Systems — Identify hidden network or operational states  
+* Robotics / Motion — Monitor robot behavior for unexpected transitions  
+* Finance / Trading — Market regime detection and adaptive strategy modeling
+
+---
+
 ## 🧾 License
 
-MIT © 2025 AWA
+Apache 2.0 © 2025 AWA  
+*See [LICENSE](LICENSE) for details.*

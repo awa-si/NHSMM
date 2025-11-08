@@ -142,7 +142,7 @@ if __name__ == "__main__":
     np.random.seed(0)
 
     SYMBOL = "BTC/USDT:USDT"
-    DATA_DIR = "/opt/trader/user_data/data/bybit/futures_"
+    DATA_DIR = "/opt/trader/user_data/data/bybit/futures"
 
     # --- Load or generate data ---
     X, true_states, label_map = load_ohlcv_tensor(DATA_DIR, SYMBOL)
