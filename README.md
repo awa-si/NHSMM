@@ -1,11 +1,11 @@
 
-# NHSMM — Neural Hidden Semi-Markov Models (Base for SAE)
+# NHSMM — (Neural) Hidden Semi-Markov Models (very ALPHA state)
 
 [![PyPI](https://img.shields.io/pypi/v/nhsmm.svg)](https://pypi.org/project/nhsmm/) [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0) [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 
 ---
 
-**Downloadable Overview:**  
+**Overview:**  
 This document serves as a **self-contained guide** for NHSMM, the modular PyTorch library that forms the foundation for **State Aware Engine (SAE)**. It is suitable for **developers, data scientists, and system integrators** to understand, download, and start using the library across multiple domains.
 
 ---
@@ -14,9 +14,9 @@ This document serves as a **self-contained guide** for NHSMM, the modular PyTorc
 
 **NHSMM** enables **temporal sequence modeling** and **hidden-state detection** using **Hidden Semi-Markov Models (HSMMs)**.  
 
-It powers **SAE**, a **cross-domain platform** for detecting hidden regimes in **IoT, Health, Security, Robotics, and Finance**.  
+It powers **SAE** State Aware Engine, a **cross-domain platform** for detecting hidden regimes in **IoT, Health, Security, Robotics, and Finance**. Anyway it can serve as solid base for any research project based on hsmm.
 
-SAE leverages NHSMM for:  
+**SAE** leverages NHSMM for:  
 - **Cloud-first SaaS deployment** for immediate access  
 - **On-prem / Edge deployment** for low-latency or privacy-sensitive systems  
 - **Quantum/hardware accelerator readiness** for next-generation predictive modeling
@@ -60,20 +60,20 @@ pip install nhsmm
 
 ```
 nhsmm/
-├── constants.py           # Default configuration and base classes
 ├── context.py             # Contextual Encoder
+├── constants.py           # Default configuration
 ├── models/
 │   ├── hsmm.py            # Core HSMM model & inference
-│   ├── gaussian.py        # Contextual gaussian components
 │   ├── neural.py          # Contextual neural components
+│   ├── gaussian.py        # Contextual gaussian components
 │   └── __init__.py
 ├── distributions/
 │   ├── default.py         # Initial, Duration, Transition, Emission
 │   └── __init__.py
 ├── utilities/
-│   ├── utils.py
 │   ├── constraints.py
-│   ├── seeds.py
+│   ├── utils.py
+│   ├── seed.py
 │   └── __init__.py
 └── __init__.py
 ```
@@ -132,21 +132,21 @@ print("Expected durations per state:", expected_durations)
 ┌─────────────────────────┐
 │ Neural Initial State    │  ← context-modulated initial probabilities
 │ Distribution            │
-└─────────┬───────────────┘
-          │
-          ▼
+└───────────┬─────────────┘
+            │
+            ▼
 ┌─────────────────────────┐
 │ Neural Transition       │  ← context-gated, temperature-scaled transitions
 │ Distribution            │
-└─────────┬───────────────┘
-          │
-          ▼
+└───────────┬─────────────┘
+            │
+            ▼
 ┌─────────────────────────┐
 │ Neural Duration         │  ← context-aware duration probabilities per state
 │ Distribution            │
-└─────────┬───────────────┘
-          │
-          ▼
+└───────────┬─────────────┘
+            │
+            ▼
 ┌─────────────────────────┐
 │ Emission Model          │  ← context-modulated observation likelihoods
 │ (Gaussian / Multinomial)│
@@ -175,15 +175,15 @@ ruff check nhsmm
 
 SAE (built on NHSMM) can be applied to:
 
+* Security / Cyber-Physical Systems — Identify hidden network or operational states  
+* Finance / Trading — Market regime detection and adaptive strategy modeling
 * IoT / Industrial Systems — Predict machine regime changes for maintenance  
 * Health / Wearables — Detect activity and physiological state transitions  
-* Security / Cyber-Physical Systems — Identify hidden network or operational states  
 * Robotics / Motion — Monitor robot behavior for unexpected transitions  
-* Finance / Trading — Market regime detection and adaptive strategy modeling
 
 ---
 
 ## 🧾 License
 
-Apache 2.0 © 2025 AWA  
+Apache 2.0 © 2025 AWA.SI
 *See [LICENSE](LICENSE) for details.*
