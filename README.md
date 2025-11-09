@@ -1,5 +1,7 @@
 
-# NHSMM — (Neural) Hidden Semi-Markov Models (very ALPHA state)
+# NHSMM — (Neural) Hidden Semi-Markov Models
+- *Documentation: [wiki](Wiki)*
+- *Version: [version](alpha)*
 
 [![PyPI](https://img.shields.io/pypi/v/nhsmm.svg)](https://pypi.org/project/nhsmm/) [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0) [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 
@@ -25,16 +27,16 @@ It powers **SAE** State Aware Engine, a **cross-domain platform** for detecting 
 
 ## 🚀 Key Features
 
-* Emission Models — Gaussian, Multinomial, or Bernoulli outputs, fully differentiable  
 * Duration Models — explicit discrete duration distributions, context-modulated  
+* Emission Models — Gaussian, Multinomial, or Bernoulli outputs, fully differentiable  
 * Transition Models — learnable, covariate-aware transitions with gating and temperature scaling  
 * Contextual HSMM — external covariates dynamically modulate emissions, durations, and transitions  
-* Subclassable Distributions — Initial, Duration, Transition, and Emission inherit from PyTorch `Distribution`  
 * HSMM-HMM Hybrid Inference — forward-backward and Viterbi algorithms adapted for neural components  
-* GPU-ready Implementation — fully batched operations for fast training and inference  
+* Subclassable Distributions — Initial, Duration, Transition, and Emission inherit from PyTorch `Distribution`  
 * EM-style Updates & Initialization — maximum likelihood or differentiable updates with temperature annealing  
 * Multi-Domain Usage — supports trading, IoT, robotics, wearable health, cybersecurity applications and even more...
 * Extensible — foundation for SAE adapters and API integration for multi-domain systems  
+* GPU-ready Implementation — fully batched operations for fast training and inference  
 
 ---
 
@@ -43,15 +45,15 @@ It powers **SAE** State Aware Engine, a **cross-domain platform** for detecting 
 ### From Source (Recommended for Development)
 
 ```bash
-git clone https://github.com/awa-si/NHSMM.git
-cd NHSMM
-pip install -e .
+git clone https://github.com/awa-si/NHSMM.git;
+cd NHSMM;
+pip install -e .;
 ```
 
 ### From PyPI (Upcoming)
 
 ```bash
-pip install nhsmm
+pip install nhsmm;
 ```
 
 ---
