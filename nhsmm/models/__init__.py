@@ -1,7 +1,5 @@
-from .gaussian import GaussianHSMM
-from .neural import NeuralHSMM
+from .base import HSMM
 
 __all__ = [
-    'GaussianHSMM',
-    'NeuralHSMM',
+    'HSMM'
 ]

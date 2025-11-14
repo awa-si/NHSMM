@@ -87,8 +87,8 @@ if __name__ == "__main__":
 
     n_states = 3
     n_features = 5
-    max_duration = 60
     context_dim = 2
+    max_duration = 60
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Generate synthetic data

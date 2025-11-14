@@ -10,11 +10,12 @@
 **Overview:**  
 This document serves as a **self-contained guide** for NHSMM, the modular PyTorch library that forms the foundation for **State Aware Engine (SAE)**. It is suitable for **developers, data scientists, and system integrators** to understand, download, and start using the library across multiple domains.
 
+**Highlights HSMM + neural + contextual + hierarchical features**
 ---
 
 ## Overview
 
-**NHSMM** enables **temporal sequence modeling** and **hidden-state detection** using **Hidden Semi-Markov Models (HSMMs)**.  
+**NHSMM** enables **temporal sequence modeling** and **hidden-state detection** using **Hidden Semi-Markov Models (HSMMs)**.
 
 It powers **SAE** State Aware Engine, a **cross-domain platform** for detecting hidden regimes in **IoT, Health, Security, Robotics, and Finance**. Anyway it can serve as solid base for any research project based on hsmm.
 
@@ -65,15 +66,14 @@ nhsmm/
 ├── context.py             # Contextual Encoder
 ├── constants.py           # Default configuration
 ├── models/
-│   ├── hsmm.py            # Core HSMM model & inference
-│   ├── neural.py          # Contextual neural components
-│   ├── gaussian.py        # Contextual gaussian components
+│   ├── base.py            # Core HSMM model & inference
 │   └── __init__.py
 ├── distributions/
 │   ├── default.py         # Initial, Duration, Transition, Emission
 │   └── __init__.py
-├── utilities/
+├── tools/
 │   ├── constraints.py
+│   ├── convergence.py
 │   ├── utils.py
 │   ├── seed.py
 │   └── __init__.py
@@ -86,7 +86,7 @@ nhsmm/
 
 ```python
 import torch
-from nhsmm.models import NeuralHSMM
+from nhsmm.models import HSMM
 
 # Example input sequence: 256 time steps, 32 features
 X = torch.randn(256, 32)
@@ -95,7 +95,7 @@ X = torch.randn(256, 32)
 context = torch.randn(256, 16)  # 16-dimensional covariates
 
 # Initialize a 4-state Neural HSMM
-model = NeuralHSMM(
+model = HSMM(
     n_states=4,
     context_dim=context.shape[1],  # enable context-aware modulation
     hidden_dim=64,                 # hidden dimension for neural adapters

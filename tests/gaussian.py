@@ -14,7 +14,7 @@ from scipy.optimize import linear_sum_assignment
 import matplotlib.pyplot as plt
 
 from nhsmm.constants import DEBUG, DTYPE, EPS, logger
-from nhsmm.models import GaussianHSMM
+from nhsmm.models import HSMM
 
 DEFAULT_RNG_SEED = 0
 DEFAULT_LABELS = ["range", "bull", "bear"]
@@ -142,7 +142,7 @@ if __name__ == "__main__":
     np.random.seed(0)
 
     SYMBOL = "BTC/USDT:USDT"
-    DATA_DIR = "/opt/trader/user_data/data/bybit/futures"
+    DATA_DIR = "/opt/trader/user_data/data/bybit/futures_"
 
     # --- Load or generate data ---
     X, true_states, label_map = load_ohlcv_tensor(DATA_DIR, SYMBOL)
@@ -162,12 +162,11 @@ if __name__ == "__main__":
     # X_torch = torch.tensor(X_scaled, dtype=DTYPE)
 
     # --- Initialize HSMM ---
-    model = GaussianHSMM(
+    model = HSMM(
         n_states=n_states,
         n_features=n_features,
         max_duration=max_duration,
         min_covar=1e-3,
-        k_means=True,
         alpha=1.0,
         seed=DEFAULT_RNG_SEED,
     )
@@ -230,10 +229,15 @@ if __name__ == "__main__":
             print(f"  {label_map[i]}: {' '.join(f'{v:.3f}' for v in row)}")
 
 
-        print("\n----- Duration -----\n")
+        print("\n----- Duration -----")
         dur_logits = model.duration_module.log_matrix()
         print("test: dur_logits.requires_grad", dur_logits.requires_grad)
         print("test: dur_logits.mean(dim=-1)", dur_logits.mean(dim=-1))
+
+        print("\n----- Transition -----")
+        transition_logits = model.transition_module.log_matrix()
+        print("test: transition_logits.requires_grad", transition_logits.requires_grad)
+        print("test: transition_logits.mean(dim=-1)", transition_logits.mean(dim=-1))
 
     # --- Inferred state occupancy ---
     unique, counts = np.unique(v_path, return_counts=True)

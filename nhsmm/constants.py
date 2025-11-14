@@ -3,7 +3,7 @@ import torch
 import logging
 
 EPS = 1e-12
-MAX_LOGITS = 50.0
+MAX_LOGITS = 1e4
 DTYPE = torch.float32
 DEBUG = False
 
