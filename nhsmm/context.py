@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Literal, Union, Tuple
-from nhsmm.constants import DTYPE, logger
+from nhsmm.constants import DTYPE, EPS, logger
 
 
 class ContextEncoder(nn.Module):
@@ -17,6 +17,7 @@ class ContextEncoder(nn.Module):
         device: torch.device to place module and buffers.
         layer_norm: Apply layer normalization to pooled context.
         dropout: Dropout rate on pooled context.
+        context_scale: Scaling factor applied after tanh to pooled context.
         debug: Enable debug logging.
     """
 
@@ -28,22 +29,23 @@ class ContextEncoder(nn.Module):
         device: Optional[torch.device] = None,
         layer_norm: bool = True,
         dropout: float = 0.0,
+        context_scale: float = 10.0,
         debug: bool = False,
     ):
         super().__init__()
-        self.encoder = encoder
-        self.pool = pool.lower()
-        self.device = device or next(encoder.parameters(), torch.tensor(0.0)).device
-        self.layer_norm_flag = layer_norm
-        self.n_heads = n_heads
-        self.debug = debug
-        self._context: Optional[torch.Tensor] = None
 
+        self.device = device or (next(encoder.parameters()).device if any(encoder.parameters()) else torch.device("cpu"))
+        self._context: Optional[torch.Tensor] = None
+        self.pool = pool.lower()
+        self.encoder = encoder.to(self.device, dtype=DTYPE)
+        self.n_heads = n_heads
+        self.layer_norm_flag = layer_norm
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.context_scale = context_scale
+        self.debug = debug
+
         self._attn_vector = nn.Parameter(torch.empty(0, device=self.device, dtype=DTYPE))
         self._mha: Optional[nn.MultiheadAttention] = None
-
-        self.encoder.to(device=self.device, dtype=DTYPE)
         self._dbg(f"ContextEncoder initialized: pool={self.pool}, device={self.device}")
 
     def _dbg(self, msg: str):
@@ -61,10 +63,11 @@ class ContextEncoder(nn.Module):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Encode a sequence and optionally produce pooled context for HSMM modules.
+
         Returns:
-            - theta_out: last or full sequence tensor [B, F] or [B, T, F]
-            - context: pooled context [B, F] suitable for Contextual modules
-            - attn_weights: optional attention weights
+            theta_out: [B, F] or [B, T, F] depending on return_sequence
+            context: pooled context [B, F]
+            attn_weights: optional attention weights [B, T, 1] or None
         """
         x = x.to(self.device, dtype=DTYPE)
         if x.ndim == 2:
@@ -87,10 +90,10 @@ class ContextEncoder(nn.Module):
         # Pooling
         context, attn_weights = self._pool_context(theta, mask, return_attn_weights)
 
-        # Layer norm + soft clipping + dropout
+        # Layer norm + tanh scaling + dropout
         if self.layer_norm_flag:
             context = F.layer_norm(context, context.shape[-1:])
-        context = self.dropout(torch.tanh(context) * 10.0)
+        context = self.dropout(torch.tanh(context) * self.context_scale)
 
         self._context = context.detach() if detach_context else context
 
@@ -111,7 +114,7 @@ class ContextEncoder(nn.Module):
             if mask is not None:
                 lengths = mask.sum(dim=1).clamp_min(1)
                 idx = (lengths - 1).unsqueeze(-1).expand(-1, F)
-                context = theta.gather(1, idx.unsqueeze(1)).squeeze(1)
+                context = theta.gather(1, idx[:, None, :]).squeeze(1)
             else:
                 context = theta[:, -1, :]
         elif self.pool == "mean":
@@ -127,15 +130,9 @@ class ContextEncoder(nn.Module):
             else:
                 context = theta.max(dim=1).values
         elif self.pool == "attn":
-            ctx_list, attn_list = [], []
-            for b in range(B):
-                ctx, attn = self._attention_context(theta[b], mask[b] if mask is not None else None, True)
-                ctx_list.append(ctx)
-                attn_list.append(attn)
-            context = torch.stack(ctx_list)
-            attn_weights = torch.stack(attn_list) if return_attn else None
+            context, attn_weights = self._attention_context(theta, mask, return_attn)
         elif self.pool == "mha":
-            context, attn_weights = self._multihead_context(theta, mask, True)
+            context, attn_weights = self._multihead_context(theta, mask, return_attn)
         else:
             raise ValueError(f"Unsupported pooling mode: {self.pool}")
 
@@ -143,23 +140,23 @@ class ContextEncoder(nn.Module):
 
     # ---------------- Attention ----------------
     def _attention_context(self, theta: torch.Tensor, mask: Optional[torch.Tensor], return_attn: bool = False):
-        T, F = theta.shape
+        B, T, F = theta.shape
         if self._attn_vector.numel() != F:
             self._attn_vector = nn.Parameter(torch.empty(F, device=self.device, dtype=DTYPE))
             nn.init.normal_(self._attn_vector, mean=0.0, std=0.1)
             self._dbg(f"Initialized _attn_vector (dim={F})")
 
-        attn_scores = theta @ self._attn_vector
+        # Vectorized over batch
+        attn_scores = theta @ self._attn_vector  # [B,T]
         if mask is not None:
-            if mask.sum() == 0:
-                context = torch.zeros(F, device=self.device, dtype=DTYPE)
-                attn_weights = torch.zeros((T, 1), device=self.device, dtype=DTYPE)
-                return (context, attn_weights) if return_attn else context
             attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
+            zero_mask = (mask.sum(dim=1) == 0)
+            if zero_mask.any():
+                attn_scores[zero_mask] = 0.0
 
-        attn_weights = torch.softmax(attn_scores, dim=0).unsqueeze(-1)
-        context = (attn_weights * theta).sum(dim=0)
-        return (context, attn_weights) if return_attn else context
+        attn_weights = torch.softmax(attn_scores, dim=1).unsqueeze(-1)  # [B,T,1]
+        context = (attn_weights * theta).sum(dim=1)  # [B,F]
+        return (context, attn_weights) if return_attn else (context, None)
 
     def _multihead_context(self, theta: torch.Tensor, mask: Optional[torch.Tensor], return_attn: bool = False):
         B, T, F = theta.shape
@@ -169,7 +166,7 @@ class ContextEncoder(nn.Module):
         attn_mask = (~mask.bool()) if mask is not None else None
         attn_output, attn_weights = self._mha(theta, theta, theta, key_padding_mask=attn_mask)
         context = attn_output.mean(dim=1)
-        return (context, attn_weights) if return_attn else context
+        return (context, attn_weights) if return_attn else (context, None)
 
     # ---------------- Context Utilities ----------------
     def set_context(self, context: Optional[torch.Tensor], detach: bool = True):

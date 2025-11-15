@@ -3,50 +3,50 @@ from dataclasses import dataclass
 from typing import List, Optional, Union, Tuple
 
 
-# ============================================================
-# Observations
-# ============================================================
-
 @dataclass(frozen=False)
 class Observations:
-    """Container for sequences, optional log-probs, and context vectors."""
+    """Container for sequences, optional log-probs, context vectors, and masks."""
 
     sequence: List[torch.Tensor]
     lengths: Optional[List[int]] = None
     log_probs: Optional[List[torch.Tensor]] = None
     context: Optional[List[Optional[torch.Tensor]]] = None
-    mask: Optional[List[torch.Tensor]] = None  # optional per-sequence mask
+    mask: Optional[List[torch.Tensor]] = None  # per-sequence mask
 
     def __post_init__(self):
         if not self.sequence:
             raise ValueError("`sequence` cannot be empty.")
-        if not all(isinstance(s, torch.Tensor) for s in self.sequence):
+        if not all(torch.is_tensor(s) for s in self.sequence):
             raise TypeError("All elements in `sequence` must be torch.Tensor.")
 
+        # Lengths
         seq_lengths = self.lengths or [s.shape[0] for s in self.sequence]
         if any(s.shape[0] != l for s, l in zip(self.sequence, seq_lengths)):
             raise ValueError("Mismatch between sequence lengths and `lengths`.")
         object.__setattr__(self, "lengths", seq_lengths)
 
+        # Log probabilities
         if self.log_probs is not None:
             if len(self.log_probs) != len(self.sequence):
                 raise ValueError("`log_probs` length must match `sequence` length.")
-            if not all(isinstance(lp, torch.Tensor) for lp in self.log_probs):
+            if not all(torch.is_tensor(lp) for lp in self.log_probs):
                 raise TypeError("All elements in `log_probs` must be torch.Tensor.")
 
+        # Context
         if self.context is not None:
             if len(self.context) != len(self.sequence):
                 raise ValueError("`context` length must match `sequence` length.")
-            if not all(c is None or isinstance(c, torch.Tensor) for c in self.context):
+            if not all(c is None or torch.is_tensor(c) for c in self.context):
                 raise TypeError("All elements in `context` must be torch.Tensor or None.")
         else:
             object.__setattr__(self, "context", [None] * len(self.sequence))
 
+        # Mask
         if self.mask is not None:
             if len(self.mask) != len(self.sequence):
                 raise ValueError("`mask` length must match `sequence` length.")
             for m, s in zip(self.mask, self.sequence):
-                if not isinstance(m, torch.Tensor):
+                if not torch.is_tensor(m):
                     raise TypeError("All elements in `mask` must be torch.Tensor.")
                 if m.shape[0] != s.shape[0]:
                     raise ValueError("Each mask must match its sequence length.")
@@ -58,9 +58,6 @@ class Observations:
             )
 
     # ---------------- Properties ----------------
-    def __len__(self) -> int:
-        return len(self.sequence)
-
     @property
     def n_sequences(self) -> int:
         return len(self.sequence)
@@ -89,44 +86,46 @@ class Observations:
     # ---------------- Device / Clone Ops ----------------
     def to(self, device: Union[str, torch.device], dtype: Optional[torch.dtype] = None) -> "Observations":
         dtype = dtype or self.dtype
-        seqs = [s.to(device=device, dtype=dtype) for s in self.sequence]
-        logs = [l.to(device=device, dtype=dtype) for l in self.log_probs] if self.log_probs else None
-        ctxs = [c.to(device=device, dtype=dtype) if c is not None else None for c in self.context]
-        masks = [m.to(device=device) for m in self.mask] if self.mask else None
-        return Observations(seqs, self.lengths, logs, ctxs, masks)
+        return Observations(
+            sequence=[s.to(device=device, dtype=dtype) for s in self.sequence],
+            lengths=self.lengths,
+            log_probs=[l.to(device=device, dtype=dtype) for l in self.log_probs] if self.log_probs else None,
+            context=[c.to(device=device, dtype=dtype) if c is not None else None for c in self.context],
+            mask=[m.to(device=device) for m in self.mask] if self.mask else None
+        )
 
     def detach(self) -> "Observations":
-        seqs = [s.detach() for s in self.sequence]
-        logs = [l.detach() for l in self.log_probs] if self.log_probs else None
-        ctxs = [c.detach() if c is not None else None for c in self.context]
-        masks = [m.clone() for m in self.mask] if self.mask else None
-        return Observations(seqs, self.lengths, logs, ctxs, masks)
+        return Observations(
+            sequence=[s.detach() for s in self.sequence],
+            lengths=self.lengths,
+            log_probs=[l.detach() for l in self.log_probs] if self.log_probs else None,
+            context=[c.detach() if c is not None else None for c in self.context],
+            mask=[m.clone() for m in self.mask] if self.mask else None
+        )
 
     def clone(self) -> "Observations":
-        seqs = [s.clone() for s in self.sequence]
-        logs = [l.clone() for l in self.log_probs] if self.log_probs else None
-        ctxs = [c.clone() if c is not None else None for c in self.context]
-        masks = [m.clone() for m in self.mask] if self.mask else None
-        return Observations(seqs, self.lengths, logs, ctxs, masks)
+        return Observations(
+            sequence=[s.clone() for s in self.sequence],
+            lengths=self.lengths,
+            log_probs=[l.clone() for l in self.log_probs] if self.log_probs else None,
+            context=[c.clone() if c is not None else None for c in self.context],
+            mask=[m.clone() for m in self.mask] if self.mask else None
+        )
 
     def __getitem__(self, idx: Union[int, slice]) -> "Observations":
-        if isinstance(idx, int):
-            seqs = [self.sequence[idx]]
-            lens = [self.lengths[idx]]
-            logs = [self.log_probs[idx]] if self.log_probs is not None else None
-            ctxs = [self.context[idx]] if self.context is not None else None
-            masks = [self.mask[idx]] if self.mask is not None else None
-        else:
-            seqs = self.sequence[idx]
-            lens = self.lengths[idx]
-            logs = self.log_probs[idx] if self.log_probs is not None else None
-            ctxs = self.context[idx] if self.context is not None else None
-            masks = self.mask[idx] if self.mask is not None else None
+        seqs = self.sequence[idx] if isinstance(idx, slice) else [self.sequence[idx]]
+        lens = self.lengths[idx] if isinstance(idx, slice) else [self.lengths[idx]]
+        logs = self.log_probs[idx] if self.log_probs is not None and isinstance(idx, slice) else \
+               ([self.log_probs[idx]] if self.log_probs is not None else None)
+        ctxs = self.context[idx] if self.context is not None and isinstance(idx, slice) else \
+               ([self.context[idx]] if self.context is not None else None)
+        masks = self.mask[idx] if self.mask is not None and isinstance(idx, slice) else \
+                ([self.mask[idx]] if self.mask is not None else None)
         return Observations(seqs, lens, logs, ctxs, masks)
 
     # ---------------- Normalization ----------------
     def normalize(self, mask: Optional[List[torch.Tensor]] = None, eps: float = 1e-6) -> "Observations":
-        """Normalize sequences per feature, using internal or external masks."""
+        """Normalize sequences per feature, respecting masks and padded entries."""
         normed = []
         mask_list = mask or self.mask
         for s, m in zip(self.sequence, mask_list):
@@ -134,15 +133,11 @@ class Observations:
             m_f = m.to(s.dtype)
             m_sum = m_f.sum(0).clamp_min(1.0)
             mean = (s * m_f).sum(0) / m_sum
-            var = ((s - mean) ** 2 * m_f).sum(0) / m_sum
+            var = ((s - mean)**2 * m_f).sum(0) / m_sum
             std = (var + eps).sqrt()
-            normed.append(((s - mean) / std) * m_f + (~m) * s)  # keep padded entries intact
+            normed.append(((s - mean) / std) * m_f + (~m) * s)
         return Observations(normed, self.lengths, self.log_probs, self.context, mask_list)
 
-
-# ============================================================
-# ContextualVariables
-# ============================================================
 
 @dataclass(frozen=False)
 class ContextualVariables:

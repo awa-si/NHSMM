@@ -1,4 +1,4 @@
-from .default import Categorical, Initial, Emission, Duration, Transition
+from .base import Categorical, Initial, Emission, Duration, Transition
 
 __all__ = [
     'Initial',

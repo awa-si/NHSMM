@@ -229,15 +229,15 @@ if __name__ == "__main__":
             print(f"  {label_map[i]}: {' '.join(f'{v:.3f}' for v in row)}")
 
 
-        print("\n----- Duration -----")
-        dur_logits = model.duration_module.log_matrix()
-        print("test: dur_logits.requires_grad", dur_logits.requires_grad)
-        print("test: dur_logits.mean(dim=-1)", dur_logits.mean(dim=-1))
+        # print("\n----- Duration -----")
+        # dur_logits = model.duration_module.log_matrix()
+        # print("test: dur_logits.requires_grad", dur_logits.requires_grad)
+        # print("test: dur_logits.mean(dim=-1)", dur_logits.mean(dim=-1))
 
-        print("\n----- Transition -----")
-        transition_logits = model.transition_module.log_matrix()
-        print("test: transition_logits.requires_grad", transition_logits.requires_grad)
-        print("test: transition_logits.mean(dim=-1)", transition_logits.mean(dim=-1))
+        # print("\n----- Transition -----")
+        # transition_logits = model.transition_module.log_matrix()
+        # print("test: transition_logits.requires_grad", transition_logits.requires_grad)
+        # print("test: transition_logits.mean(dim=-1)", transition_logits.mean(dim=-1))
 
     # --- Inferred state occupancy ---
     unique, counts = np.unique(v_path, return_counts=True)

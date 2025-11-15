@@ -16,7 +16,41 @@ from nhsmm.distributions import Categorical, Initial, Emission, Duration, Transi
 
 class HSMM(nn.Module, ABC):
     """
-        Hidden Semi-Markov Model (HSMM) base class.
+    Hidden Semi-Markov Model (HSMM) base class.
+
+    This class implements the core structure for HSMMs with support for:
+
+        - Variable-length sequences.
+        - Contextual or neural modulation of parameters (Initial, Duration, Transition, Emission).
+        - Batched forward, backward, and Viterbi computations.
+        - State-duration modeling, allowing explicit duration distributions per state.
+
+    Core Components:
+        - `initial_module`: Provides the log-probabilities for initial states.
+        - `duration_module`: Provides log-duration probabilities per state.
+        - `transition_module`: Provides state-to-state transition log-probabilities.
+        - `emission_module`: Computes observation likelihoods, can be neural or parametric.
+        - Optional `ContextEncoder` for conditioning parameters on external context vectors.
+
+    Forward/Backward Methods:
+        - `_forward(X, theta)`: Computes the log-probabilities α[t, k, d] of ending in
+          state `k` at time `t` with duration `d`.
+        - `_backward(X, theta)`: Computes the log-probabilities β[t, k, d] of generating
+          observations from time `t` onward assuming a state-duration pair.
+        - `_compute_state_posteriors(X, theta)`: Returns γ (state marginals), ξ (state transitions),
+          and η (state-duration joint posteriors).
+        - `_viterbi(X, theta, duration_weight)`: Computes the most likely state sequence,
+          optionally weighting duration probabilities.
+
+    Notes:
+        - Supports both discrete (Categorical) and continuous (Normal/MultivariateNormal) emissions.
+        - All computations are GPU-compatible and support batching.
+        - Designed for extensibility with custom neural modules for context-modulated distributions.
+
+    Attributes:
+        n_states: Number of hidden states (K).
+        max_duration: Maximum allowed state duration (Dmax).
+        device: Torch device for computation (CPU/GPU).
     """
 
     def __init__(
@@ -24,53 +58,58 @@ class HSMM(nn.Module, ABC):
         n_states: int,
         n_features: int,
         max_duration: int,
+        temperature: float = 1.0,
         seed: Optional[int] = None,
         modulate_var: bool = False,
-        transition_type: Any = None,
         alpha: Optional[float] = 1.0,
         emission_type: str = "gaussian",
+        transition_type: Any = constraints.Transitions.ERGODIC,
         min_covar: Optional[float] = 1e-6,
         hidden_dim: Optional[int] = None,
         context_dim: Optional[int] = None,
         device: Optional[torch.device] = None,
+
+        # HSMM encoder params
         encoder: Optional[nn.Module] = None,
+        pool: Literal["mean", "last", "max", "attn", "mha"] = "mean",
+        embed_dim: Optional[int] = None,
+        precompute: bool = True,
+        dropout: float = 0.0,
+        debug: bool = False,
+        n_heads: int = 4,
     ):
         super().__init__()
 
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.transition_type = transition_type or constraints.Transitions.ERGODIC
         self.seed = seed or SeedGenerator(seed).seed
         self.emission_type = emission_type
         self.max_duration = max_duration
-        self.modulate_var = modulate_var
         self.context_dim = context_dim
         self.hidden_dim = hidden_dim
         self.n_features = n_features
-        self.min_covar = min_covar
+        self.precompute = precompute
         self.n_states = n_states
         self.alpha = alpha
+        self.debug = debug
 
         self._context: Optional[torch.Tensor] = None
-        self.encoder: Optional[nn.Module] = None
+        self.encoder: Optional[ContextEncoder] = None
         self._params: Dict[str, Any] = {}
 
+        # ---------------- Encoder setup ----------------
         if encoder is not None:
-            # If already a ContextEncoder, attach directly
             if isinstance(encoder, ContextEncoder):
                 self.encoder = encoder
             else:
-                # Wrap any raw nn.Module automatically
                 self.encoder = ContextEncoder(
-                    encoder=encoder,
                     pool=pool,
+                    encoder=encoder,
                     n_heads=n_heads,
                     dropout=dropout,
-                    embed_dim=embed_dim,
                     device=self.device
                 )
-
-        # update context_dim automatically if known
-        if hasattr(self.encoder, "out_dim"):
+        # Auto-update context_dim from encoder
+        if hasattr(self.encoder, "out_dim") and self.encoder.out_dim is not None:
             self.context_dim = self.encoder.out_dim
 
         # ---------------- Seed ----------------
@@ -79,63 +118,124 @@ class HSMM(nn.Module, ABC):
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(self.seed)
 
-        self._init_modules()
+        # ---------------- Initialize modules ----------------
+        self._init_modules(
+            transition_type=transition_type,
+            emission_type=emission_type,
+            modulate_var=modulate_var,
+            max_duration=max_duration,
+            context_dim=context_dim,
+            temperature=temperature,
+            hidden_dim=hidden_dim,
+            min_covar=min_covar,
+            device=device,
+        )
+
+        # Move to device
         self.to(self.device)
 
-    def _init_modules(self) -> None:
-        """Initialize HSMM modules (initial, emission, duration, transition) with consistent Contextual base."""
+    def _init_modules(
+        self,
+        transition_type: str,
+        device: torch.device | str = "cpu",
+        emission_type: str = "gaussian",
+        modulate_var: bool = False,
+        n_states: int = 4,
+        n_features: int = 1,
+        max_duration: int = 30,
+        context_dim: int | None = None,
+        hidden_dim: int | None = None,
+        temperature: float = 1.0,
+        scale: float = 1.0,
+        dof: float = 5.0,
+        min_covar: Optional[float] = 1e-6,
+        adaptive_scale: bool = True,
+        temporal_adapter: bool = False,
+        spatial_adapter: bool = False,
+        init_mode_transition: str = "diag_bias",
+        init_mode_duration: str = "uniform",
+        init_mode_initial: str = "uniform",
+        init_mode_emission: str = "data",
+        cache_limit: int = 32,
+        debug: bool = False,
+    ):
+        """Initialize all HSMM modules with consistent device, context, and precomputation."""
 
-        device = self.device
-        debug = getattr(self, "debug", DEBUG)
+        device, debug = self.device, self.debug
 
+        # ---------------- Initial ----------------
         self.initial_module = Initial(
-            init_mode="uniform",
+            init_mode=init_mode_initial,
             n_states=self.n_states,
-            context_dim=self.context_dim,
-            hidden_dim=self.hidden_dim,
+            context_dim=context_dim,
+            temperature=temperature,
+            cache_limit=cache_limit,
+            hidden_dim=hidden_dim,
+            scale=scale,
             debug=debug,
         ).to(device)
 
+        # ---------------- Emission ----------------
         self.emission_module = Emission(
             n_states=self.n_states,
             n_features=self.n_features,
-            min_covar=self.min_covar,
-            emission_type=self.emission_type,
-            context_dim=self.context_dim,
-            modulate_var=self.modulate_var,
-            dof=getattr(self, "dof", 5.0),
+            temporal_adapter=temporal_adapter,
+            spatial_adapter=spatial_adapter,
+            adaptive_scale=adaptive_scale,
+            emission_type=emission_type,
+            modulate_var=modulate_var,
+            context_dim=context_dim,
+            hidden_dim=hidden_dim,
+            min_covar=min_covar,
             seed=self.seed,
+            scale=scale,
             debug=debug,
+            dof=dof,
         ).to(device)
 
+        # ---------------- Duration ----------------
         self.duration_module = Duration(
-            init_mode="uniform",
             n_states=self.n_states,
-            max_duration=self.max_duration,
-            context_dim=self.context_dim,
-            hidden_dim=self.hidden_dim,
-            temperature=getattr(self, "duration_temp", 1.0),
-            scale=getattr(self, "duration_scale", 1.0),
+            init_mode=init_mode_duration,
+            max_duration=max_duration,
+            context_dim=context_dim,
+            temperature=temperature,
+            cache_limit=cache_limit,
+            hidden_dim=hidden_dim,
+            scale=scale,
             debug=debug,
         ).to(device)
 
+        # ---------------- Transition ----------------
         self.transition_module = Transition(
-            init_mode="diag_bias",
             n_states=self.n_states,
-            context_dim=self.context_dim,
-            hidden_dim=self.hidden_dim,
-            temperature=getattr(self, "transition_temp", 1.0),
-            scale=getattr(self, "transition_scale", 1.0),
+            init_mode=init_mode_transition,
+            transition_type=transition_type,
+            context_dim=context_dim,
+            temperature=temperature,
+            cache_limit=cache_limit,
+            hidden_dim=hidden_dim,
+            gate_factor=0.5,
+            scale=scale,
             debug=debug,
         ).to(device)
+
+        # ---------------- Optional Precompute ----------------
+        if self.precompute and self.context_dim is not None:
+            with torch.no_grad():
+                dummy_ctx = torch.zeros(1, self.context_dim, device=device)
+                self.initial_module(dummy_ctx)
+                self.duration_module(dummy_ctx)
+                self.transition_module(dummy_ctx)
+                self.emission_module(dummy_ctx)
 
         # ---------------- Initialize PDFs ----------------
         try:
             self._params.update({
-                "initial_pdf": self.initial_module.initialize(),
-                "duration_pdf": self.duration_module.initialize(),
-                "transition_pdf": self.transition_module.initialize(),
-                "emission_pdf": self.emission_module.initialize(),
+                "initial_pdf": self.initial_module.initialize(mode=init_mode_initial),
+                "duration_pdf": self.duration_module.initialize(mode=init_mode_duration),
+                "transition_pdf": self.transition_module.initialize(mode=init_mode_transition),
+                "emission_pdf": self.emission_module.initialize(mode=init_mode_emission),
             })
         except Exception as e:
             raise RuntimeError(f"Failed to initialize HSMM PDFs: {e}") from e
@@ -146,32 +246,40 @@ class HSMM(nn.Module, ABC):
                 f"HSMM modules initialized on {device}: "
                 f"n_states={self.n_states}, n_features={self.n_features}, "
                 f"context_dim={self.context_dim}, emission={self.emission_type}, "
-                f"max_duration={self.max_duration}"
+                f"max_duration={self.max_duration}, precompute={self.precompute}"
             )
 
     def _align_theta(self, theta: Optional[torch.Tensor | list[torch.Tensor]], seq_len: int) -> Optional[torch.Tensor]:
         """
-        Align context theta to [seq_len, F] or [B, seq_len, F] for batching.
-        Supports 1D, 2D, 3D tensors, or list of tensors. Pads shorter sequences with zeros.
+        Align context theta to shape [seq_len, F] or [B, seq_len, F] for batching.
+        Supports:
+            - 1D tensor: [F] -> broadcast to [seq_len, F]
+            - 2D tensor: [T, F] -> pad/truncate to [seq_len, F]
+            - 3D tensor: [B, T, F] -> pad/truncate to [B, seq_len, F]
+            - list of tensors: concatenated along feature dim -> [B, seq_len, F_total]
+        Always returns a single torch.Tensor or None.
         """
         if theta is None:
             return None
 
         device = self.device
 
-        # Convert list of tensors to a 3D tensor
+        # Convert list of tensors to 3D tensor, concatenate along feature dim
         if isinstance(theta, list):
             if not theta:
                 return None
             if not all(torch.is_tensor(t) for t in theta):
                 raise TypeError("All elements in theta list must be torch.Tensor")
-            B, F = len(theta), theta[0].shape[-1]
-            aligned = torch.zeros(B, seq_len, F, device=device, dtype=DTYPE)
-            for i, t in enumerate(theta):
+            aligned_list = []
+            for t in theta:
                 t = t.to(device=device, dtype=DTYPE)
-                L = min(t.shape[0], seq_len)
-                aligned[i, :L] = t[:L]
-            return aligned
+                T = t.shape[0]
+                F = t.shape[1] if t.ndim > 1 else 1
+                padded = torch.zeros(seq_len, F, device=device, dtype=DTYPE)
+                padded[:min(T, seq_len), :] = t[:min(T, seq_len)] if t.ndim > 1 else t[:min(T, seq_len)].unsqueeze(-1)
+                aligned_list.append(padded)
+            # Stack along batch dim
+            return torch.stack(aligned_list, dim=0)
 
         # Ensure tensor is on correct device/dtype
         theta = theta.to(device=device, dtype=DTYPE)
@@ -195,7 +303,7 @@ class HSMM(nn.Module, ABC):
             padded[:, :min(T, seq_len), :] = theta[:, :min(T, seq_len), :]
             return padded
 
-        raise TypeError(f"Unsupported theta dimension {ndim}, expected 1, 2, 3, or list")
+        raise TypeError(f"Unsupported theta dimension {ndim}, expected 1, 2, 3, or list of tensors")
 
     def _validate(
         self,
@@ -206,68 +314,71 @@ class HSMM(nn.Module, ABC):
         allow_nan: bool = False,
     ) -> torch.Tensor:
         """
-        Validate a tensor against the emission module:
-          - Align device/dtype
-          - Add batch/time dimension if missing
-          - Check PDF support and optionally clamp
+        Validate and align input tensor for emission module.
+
+        Steps:
+          - Move to correct device/dtype
+          - Add batch dimension if needed
+          - Check for NaN/Inf
+          - Validate against distribution support, optionally clamp
           - Verify event shape
-          - Optional NaN/Inf checks
-          - Optional value range checks (for discrete PDFs)
-        
+          - Optional discrete PDF range checks
+
         Args:
-            value: Tensor of observations to validate
-            clamp: If True, clamp out-of-support values
-            context: Optional context for contextual emissions
-            check_range: If True, check values against PDF type (e.g., integer range for categorical)
-            allow_nan: If False, raise on NaN/Inf values
+            value: Tensor of observations
+            clamp: Clamp out-of-support values if True
+            context: Optional context tensor
+            check_range: Enforce discrete distribution bounds if True
+            allow_nan: Allow NaN/Inf if True
 
         Returns:
-            Validated tensor of same shape as input
+            Validated tensor aligned to emission module
         """
         if not hasattr(self, "emission_module"):
             raise RuntimeError("Emission module not found. Initialize `self.emission_module` first.")
 
-        # --- Align device/dtype ---
-        value = value.to(self.emission_module.device, dtype=DTYPE)
+        # --- Device and dtype alignment ---
+        device = getattr(self.emission_module, "device", value.device)
+        value = value.to(device=device, dtype=DTYPE)
 
         # --- Forward to get distribution ---
         dist = self.emission_module.forward(context=context, return_dist=True)
         event_shape = dist.event_shape or ()
 
-        # --- Add batch dimension if missing ---
+        # --- Add batch dimension if value lacks it ---
         if event_shape and value.ndim == len(event_shape):
             value = value.unsqueeze(0)
 
-        # --- Check for NaN/Inf ---
-        if not allow_nan:
-            if not torch.isfinite(value).all():
-                raise ValueError("NaN or Inf detected in input values.")
+        # --- NaN/Inf check ---
+        if not allow_nan and not torch.isfinite(value).all():
+            bad_vals = value[~torch.isfinite(value)].unique()
+            raise ValueError(f"NaN or Inf detected in input values: {bad_vals}")
 
-        # --- Clamp/check support ---
-        if hasattr(dist, "support"):
-            support = dist.support
-            if hasattr(support, "check"):
-                mask = support.check(value)
-                if not mask.all():
-                    if clamp:
-                        if hasattr(support, "clamp"):
-                            value = torch.where(mask, value, support.clamp(value))
-                        else:
-                            lower = getattr(support, "lower_bound", -float("inf"))
-                            upper = getattr(support, "upper_bound", float("inf"))
-                            value = value.clamp(lower, upper)
+        # --- Clamp/check PDF support ---
+        if hasattr(dist, "support") and hasattr(dist.support, "check"):
+            mask = dist.support.check(value)
+            if not mask.all():
+                if clamp:
+                    # Prefer `clamp` method if available
+                    if hasattr(dist.support, "clamp"):
+                        value = torch.where(mask, value, dist.support.clamp(value))
                     else:
-                        bad_vals = value[~mask].flatten().unique()
-                        raise ValueError(f"Values outside PDF support: {bad_vals.tolist()}")
+                        lower = getattr(dist.support, "lower_bound", -float("inf"))
+                        upper = getattr(dist.support, "upper_bound", float("inf"))
+                        value = value.clamp(lower, upper)
+                else:
+                    bad_vals = value[~mask].flatten().unique()
+                    raise ValueError(f"Values outside PDF support: {bad_vals.tolist()}")
 
         # --- Event shape validation ---
         if event_shape and tuple(value.shape[-len(event_shape):]) != tuple(event_shape):
             raise ValueError(
-                f"PDF event shape mismatch: expected {tuple(event_shape)}, got {tuple(value.shape[-len(event_shape):])}"
+                f"Event shape mismatch: expected {tuple(event_shape)}, got {tuple(value.shape[-len(event_shape):])}"
             )
 
-        # --- Additional range checks for discrete distributions ---
+        # --- Range validation for discrete distributions ---
         if check_range:
+            from torch.distributions import Categorical, Bernoulli, Poisson
             if isinstance(dist, Categorical):
                 if not ((value >= 0) & (value < dist.logits.shape[-1])).all():
                     raise ValueError(f"Categorical values must be in [0, {dist.logits.shape[-1]-1}]")
@@ -287,21 +398,17 @@ class HSMM(nn.Module, ABC):
         pool: Optional[str] = None,
         detach: bool = True,
         store: bool = True,
-    ) -> Optional[torch.Tensor]:
+    ) -> Optional[list[torch.Tensor]]:
         """
         Vectorized encoding of sequences into context vectors using the attached encoder.
 
-        Supports:
-            - Single feature vector: [F]
-            - Single sequence: [T, F]
-            - Batched sequences: [B, T, F]
-            - List of sequences (variable lengths)
-
         Returns:
-            Tensor of shape [B, H] (context per sequence) or None if no encoder attached.
+            List of context tensors, one per sequence, each with shape [seq_len, H].
+            Compatible with Observations.context.
         """
         if self.encoder is None:
-            if store: self._context = None
+            if store:
+                self._context = None
             return None
 
         device = self.device
@@ -310,13 +417,13 @@ class HSMM(nn.Module, ABC):
             self.encoder.pool = pool
 
         try:
-            # --- Normalize to list of tensors ---
+            # Normalize input to list of tensors
             if torch.is_tensor(sequences):
-                if sequences.ndim == 1:  # [F]
+                if sequences.ndim == 1:
                     seq_list = [sequences.unsqueeze(0)]
-                elif sequences.ndim == 2:  # [T,F]
+                elif sequences.ndim == 2:
                     seq_list = [sequences]
-                elif sequences.ndim == 3:  # [B,T,F]
+                elif sequences.ndim == 3:
                     seq_list = [sequences[b] for b in range(sequences.shape[0])]
                 else:
                     raise TypeError(f"Unsupported tensor ndim={sequences.ndim}")
@@ -330,9 +437,9 @@ class HSMM(nn.Module, ABC):
             batch_size = len(seq_list)
             lengths = torch.tensor([seq.shape[0] for seq in seq_list], device=device)
             max_len = lengths.max().item()
-            feature_dim = seq_list[0].shape[1] if seq_list[0].ndim > 1 else seq_list[0].shape[0]
+            feature_dim = seq_list[0].shape[1] if seq_list[0].ndim > 1 else 1
 
-            # --- Padded batch tensor ---
+            # Pad sequences to [B, max_len, F]
             padded = torch.zeros(batch_size, max_len, feature_dim, device=device, dtype=DTYPE)
             for i, seq in enumerate(seq_list):
                 seq = seq.to(device=device, dtype=DTYPE)
@@ -340,13 +447,11 @@ class HSMM(nn.Module, ABC):
                     seq = seq.unsqueeze(-1)
                 padded[i, :seq.shape[0], :] = seq
 
-            # --- Boolean mask for variable lengths ---
+            # Mask for variable lengths
             mask = torch.arange(max_len, device=device).unsqueeze(0) < lengths.unsqueeze(1)
 
-            # --- Forward pass through encoder ---
-            encoder_kwargs = {}
-            if "mask" in self.encoder.forward.__code__.co_varnames:
-                encoder_kwargs["mask"] = mask
+            # Forward pass through encoder
+            encoder_kwargs = {"mask": mask} if "mask" in self.encoder.forward.__code__.co_varnames else {}
             _ = self.encoder(padded, return_context=True, **encoder_kwargs)
             context_batch = self.encoder.get_context()
             if context_batch is None:
@@ -355,18 +460,20 @@ class HSMM(nn.Module, ABC):
             if detach:
                 context_batch = context_batch.detach()
 
-            # --- Ensure batch size matches input ---
-            if context_batch.shape[0] != batch_size:
-                context_batch = context_batch[:batch_size]
+            # Align context to sequence lengths: broadcast single context per sequence
+            aligned_contexts = []
+            for i, seq_len in enumerate(lengths):
+                ctx = context_batch[i].unsqueeze(0).expand(seq_len, -1).contiguous()
+                aligned_contexts.append(ctx)
 
         finally:
             if hasattr(self.encoder, "pool"):
                 self.encoder.pool = original_pool
 
         if store:
-            self._context = context_batch
+            self._context = aligned_contexts
 
-        return context_batch
+        return aligned_contexts
 
     def _prepare_observations(
         self,
@@ -376,7 +483,6 @@ class HSMM(nn.Module, ABC):
     ) -> utils.Observations:
         """
         Convert raw sequences + optional neural/contextual context into Observations.
-        Supports Gaussian, Laplace, StudentT, Categorical, Bernoulli, Poisson emissions.
 
         Args:
             X: Input sequence(s) [T,F], [B,T,F], or list of [T_i,F].
@@ -384,7 +490,7 @@ class HSMM(nn.Module, ABC):
             chunk_size: Number of states processed per batch for VRAM control.
 
         Returns:
-            utils.Observations containing sequences, log_probs, lengths, and context.
+            utils.Observations containing sequences, log_probs, lengths, context, and masks.
         """
         device = self.device
 
@@ -398,58 +504,46 @@ class HSMM(nn.Module, ABC):
 
         B = len(X_list)
         lengths = [seq.shape[0] if seq.ndim > 1 else 1 for seq in X_list]
-        n_features = X_list[0].shape[-1] if X_list[0].ndim > 1 else X_list[0].shape[0]
+        n_features = X_list[0].shape[-1] if X_list[0].ndim > 1 else 1
         max_len = max(lengths)
 
         # --- Pad sequences into tensor ---
         seq_tensor = torch.zeros(B, max_len, n_features, device=device, dtype=DTYPE)
+        mask_list = []
         for b, seq in enumerate(X_list):
             seq = seq.to(device=device, dtype=DTYPE)
             if seq.ndim == 1:
                 seq = seq.unsqueeze(-1)
             seq_tensor[b, :seq.shape[0], :] = seq
+            mask_list.append(torch.ones(seq.shape[0], 1, dtype=torch.bool, device=device))
 
-        # --- Align context ---
-        theta_tensor = self._align_theta(theta or getattr(self, "_context", None), seq_len=max_len)
+        # --- Encode or align context ---
+        if theta is None and hasattr(self, "_encode_observations"):
+            theta_list = self._encode_observations(X_list, store=False)
+        else:
+            theta_list = theta
 
-        # Handle neural/temporal context
-        if theta_tensor is not None:
-            if theta_tensor.ndim == 1:  # [D] → broadcast
-                theta_tensor = theta_tensor.unsqueeze(0).unsqueeze(0).expand(B, max_len, -1)
-            elif theta_tensor.ndim == 2:  # [B,D] → broadcast over time
-                theta_tensor = theta_tensor.unsqueeze(1).expand(B, max_len, -1)
-            elif theta_tensor.ndim == 3:  # [B,T,D] → pad/truncate to max_len
-                T_ctx = theta_tensor.shape[1]
-                if T_ctx < max_len:
-                    pad = torch.zeros(B, max_len - T_ctx, theta_tensor.shape[2], device=device, dtype=DTYPE)
-                    theta_tensor = torch.cat([theta_tensor, pad], dim=1)
-                elif T_ctx > max_len:
-                    theta_tensor = theta_tensor[:, :max_len, :]
-            else:
-                raise ValueError(f"Unsupported context shape {theta_tensor.shape}")
+        theta_tensor = self._align_theta(theta_list, seq_len=max_len) if theta_list is not None else None
 
-        # --- Get emission distribution ---
+        # --- Compute emission log-probs ---
         dist = self.emission_module.forward(context=theta_tensor, return_dist=True)
         if not isinstance(dist, torch.distributions.Distribution):
             dist = torch.distributions.Independent(dist, 1)
 
         K = self.n_states
-        T_max = seq_tensor.shape[1]
-        log_probs_full = torch.empty(B, T_max, K, device=device, dtype=DTYPE)
+        log_probs_full = torch.empty(B, max_len, K, device=device, dtype=DTYPE)
         etype = self.emission_module.emission_type
 
-        # --- Vectorized emission log-prob computation ---
         if etype in {"gaussian", "laplace", "studentt"}:
-            means = self.emission_module._emission_means  # [K, F]
-            stds = self.emission_module._emission_covs.diagonal(dim1=-2, dim2=-1).sqrt()  # [K, F]
-
+            means = self.emission_module._emission_means
+            stds = self.emission_module._emission_covs.diagonal(dim1=-2, dim2=-1).sqrt()
             for k_start in range(0, K, chunk_size):
                 k_end = min(K, k_start + chunk_size)
-                seq_exp = seq_tensor.unsqueeze(2).expand(-1, T_max, k_end - k_start, n_features)
+                seq_exp = seq_tensor.unsqueeze(2).expand(-1, max_len, k_end - k_start, n_features)
                 chunk_means = means[k_start:k_end].unsqueeze(0).unsqueeze(0)
                 chunk_stds = stds[k_start:k_end].unsqueeze(0).unsqueeze(0)
                 log_norm = -0.5 * torch.log(2 * torch.pi * chunk_stds**2)
-                log_exp = -0.5 * ((seq_exp - chunk_means)**2 / (chunk_stds**2))
+                log_exp = -0.5 * ((seq_exp - chunk_means) ** 2 / (chunk_stds**2))
                 log_probs_full[:, :, k_start:k_end] = (log_norm + log_exp).sum(-1)
 
         elif etype == "categorical":
@@ -478,12 +572,14 @@ class HSMM(nn.Module, ABC):
         sequences = [seq_tensor[b, :lengths[b]] for b in range(B)]
         log_probs_list = [log_probs_full[b, :lengths[b]] for b in range(B)]
         context_list = [theta_tensor[b, :lengths[b]] if theta_tensor is not None else None for b in range(B)]
+        masks = [mask_list[b][:lengths[b]] for b in range(B)]
 
         return utils.Observations(
             sequence=sequences,
-            log_probs=log_probs_list,
             lengths=lengths,
+            log_probs=log_probs_list,
             context=context_list,
+            mask=masks,
         )
 
     def _forward(
