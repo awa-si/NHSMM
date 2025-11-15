@@ -141,6 +141,8 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     np.random.seed(0)
 
+    MAX_ITER = 9
+    MAX_DURATION = 50
     SYMBOL = "BTC/USDT:USDT"
     DATA_DIR = "/opt/trader/user_data/data/bybit/futures_"
 
@@ -152,23 +154,22 @@ if __name__ == "__main__":
     X_torch = X.detach().clone() if isinstance(X, torch.Tensor) else torch.tensor(X, dtype=DTYPE)
     n_states = len(label_map)
     n_features = X.shape[1]
-    max_duration = 50
 
-    logger.info(f"[Config] n_states={n_states}, n_features={n_features}, max_duration={max_duration}")
+    logger.info(f"[Config] n_states={n_states}, n_features={n_features}, max_duration={MAX_DURATION}")
 
-    # --- Feature scaling (critical) ---
-    # scaler = StandardScaler()
-    # X_scaled = scaler.fit_transform(X_torch)
-    # X_torch = torch.tensor(X_scaled, dtype=DTYPE)
+    # --- Feature scaling ---
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_torch)
+    X_torch = torch.tensor(X_scaled, dtype=DTYPE)
 
     # --- Initialize HSMM ---
     model = HSMM(
         n_states=n_states,
         n_features=n_features,
-        max_duration=max_duration,
+        max_duration=MAX_DURATION,
+        seed=DEFAULT_RNG_SEED,
         min_covar=1e-3,
         alpha=1.0,
-        seed=DEFAULT_RNG_SEED,
     )
     # model.emission_module.initialize(X=X_torch)
 
@@ -182,7 +183,7 @@ if __name__ == "__main__":
         X_torch,
         n_init=3,
         tol=1e-4,
-        max_iter=9,
+        max_iter=MAX_ITER,
         verbose=True,
     )
     elapsed = time.time() - t0

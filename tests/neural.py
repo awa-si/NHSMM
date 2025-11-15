@@ -118,7 +118,7 @@ if __name__ == "__main__":
         context_dim=context_dim if context_dim > 0 else None
     )
 
-    model = NeuralHSMM(config)
+    model = NHSMM(config)
     model.attach_encoder(
         encoder=encoder,
         batch_first=True,  # True if input shape is (B, T, F)
