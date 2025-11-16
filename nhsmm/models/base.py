@@ -395,11 +395,16 @@ class HSMM(nn.Module, ABC):
         store: bool = True,
     ) -> Optional[list[torch.Tensor]]:
         """
-        Vectorized encoding of sequences into context vectors using the attached encoder.
+        Encode sequences into context vectors using the attached encoder.
+
+        Args:
+            sequences: [B, T, F] tensor or list of [T, F] tensors
+            pool: pooling mode to override encoder default
+            detach: detach context from computation graph
+            store: store internally in self._context
 
         Returns:
-            List of context tensors, one per sequence, each with shape [seq_len, H].
-            Compatible with Observations.context.
+            List of context tensors [seq_len, H] aligned to input sequences
         """
         if self.encoder is None:
             if store:
@@ -412,54 +417,52 @@ class HSMM(nn.Module, ABC):
             self.encoder.pool = pool
 
         try:
-            # Normalize input to list of tensors
-            if torch.is_tensor(sequences):
+            # --- Normalize input to [B, T, F] tensor ---
+            if isinstance(sequences, torch.Tensor):
                 if sequences.ndim == 1:
-                    seq_list = [sequences.unsqueeze(0)]
+                    seq_tensor = sequences.unsqueeze(0).unsqueeze(-1)
                 elif sequences.ndim == 2:
-                    seq_list = [sequences]
+                    seq_tensor = sequences.unsqueeze(0)
                 elif sequences.ndim == 3:
-                    seq_list = [sequences[b] for b in range(sequences.shape[0])]
+                    seq_tensor = sequences
                 else:
                     raise TypeError(f"Unsupported tensor ndim={sequences.ndim}")
             elif isinstance(sequences, (list, tuple)):
-                if not all(torch.is_tensor(seq) for seq in sequences):
-                    raise TypeError("All elements must be torch.Tensor.")
-                seq_list = list(sequences)
+                if not sequences:
+                    return []
+                max_len = max(seq.shape[0] for seq in sequences)
+                feature_dim = sequences[0].shape[1] if sequences[0].ndim > 1 else 1
+                batch_size = len(sequences)
+                seq_tensor = torch.zeros(batch_size, max_len, feature_dim, device=device, dtype=DTYPE)
+                for i, seq in enumerate(sequences):
+                    seq = seq.to(device=device, dtype=DTYPE)
+                    if seq.ndim == 1:
+                        seq = seq.unsqueeze(-1)
+                    seq_tensor[i, :seq.shape[0], :] = seq
             else:
                 raise TypeError(f"Unsupported input type {type(sequences)}")
 
-            batch_size = len(seq_list)
-            lengths = torch.tensor([seq.shape[0] for seq in seq_list], device=device)
-            max_len = lengths.max().item()
-            feature_dim = seq_list[0].shape[1] if seq_list[0].ndim > 1 else 1
+            B, T, F = seq_tensor.shape
+            lengths = torch.tensor([seq.shape[0] if seq.ndim > 1 else 1 for seq in (sequences if isinstance(sequences, list) else [seq_tensor[i] for i in range(B)])], device=device)
 
-            # Pad sequences to [B, max_len, F]
-            padded = torch.zeros(batch_size, max_len, feature_dim, device=device, dtype=DTYPE)
-            for i, seq in enumerate(seq_list):
-                seq = seq.to(device=device, dtype=DTYPE)
-                if seq.ndim == 1:
-                    seq = seq.unsqueeze(-1)
-                padded[i, :seq.shape[0], :] = seq
+            # --- Create mask ---
+            mask = torch.arange(T, device=device).unsqueeze(0) < lengths.unsqueeze(1)  # [B, T]
 
-            # Mask for variable lengths
-            mask = torch.arange(max_len, device=device).unsqueeze(0) < lengths.unsqueeze(1)
-
-            # Forward pass through encoder
+            # --- Forward pass through encoder ---
             encoder_kwargs = {"mask": mask} if "mask" in self.encoder.forward.__code__.co_varnames else {}
-            _ = self.encoder(padded, return_context=True, **encoder_kwargs)
-            context_batch = self.encoder.get_context()
-            if context_batch is None:
-                raise RuntimeError("Encoder returned None context")
+            _ = self.encoder(seq_tensor, return_context=True, **encoder_kwargs)
+            context_batch = self.encoder.get_context(detach=detach)  # [B, H]
 
-            if detach:
-                context_batch = context_batch.detach()
+            # Safety: zero-length sequences
+            zero_mask = lengths == 0
+            if zero_mask.any():
+                context_batch[zero_mask] = 0.0
 
-            # Align context to sequence lengths: broadcast single context per sequence
-            aligned_contexts = []
-            for i, seq_len in enumerate(lengths):
-                ctx = context_batch[i].unsqueeze(0).expand(seq_len, -1).contiguous()
-                aligned_contexts.append(ctx)
+            # --- Broadcast context per sequence length ---
+            aligned_contexts = [
+                context_batch[i].unsqueeze(0).expand(lengths[i], -1).contiguous()
+                for i in range(B)
+            ]
 
         finally:
             if hasattr(self.encoder, "pool"):
@@ -477,12 +480,24 @@ class HSMM(nn.Module, ABC):
         chunk_size: int = 8,
     ) -> utils.Observations:
         """
-        Convert raw sequences + optional neural/contextual context into Observations.
-        Handles continuous (Independent), categorical, and Bernoulli emissions using dist_type.
+        Convert raw sequences + optional context into Observations.
+        Fully vectorized, supports continuous and discrete emissions.
+
+        Args:
+            X: [B, T, F] tensor or list of [T, F] tensors
+            theta: optional precomputed context
+            chunk_size: processing chunks for states (memory optimization)
+
+        Returns:
+            utils.Observations object with:
+                - sequence: list of [T, F] tensors
+                - log_probs: list of [T, K] log-probs
+                - context: list of [T, H] tensors (broadcasted per timestep)
+                - mask: list of [T, 1] boolean tensors
         """
         device = self.device
 
-        # --- Normalize sequences to list ---
+        # --- Normalize X to list of tensors ---
         if torch.is_tensor(X):
             X_list = [X[b] for b in range(X.shape[0])] if X.ndim == 3 else [X]
         elif isinstance(X, (list, tuple)):
@@ -492,75 +507,67 @@ class HSMM(nn.Module, ABC):
 
         B = len(X_list)
         lengths = [seq.shape[0] if seq.ndim > 1 else 1 for seq in X_list]
+        max_len = max(lengths)
         n_features = X_list[0].shape[-1] if X_list[0].ndim > 1 else 1
-        max_len = max(lengths) if lengths else 0
 
-        # --- Pad sequences into tensor ---
+        # --- Pad sequences to [B, max_len, F] ---
         seq_tensor = torch.zeros(B, max_len, n_features, device=device, dtype=DTYPE)
-        mask_list = []
+        mask_tensor = torch.zeros(B, max_len, 1, device=device, dtype=torch.bool)
         for b, seq in enumerate(X_list):
             seq = seq.to(device=device, dtype=DTYPE)
             if seq.ndim == 1:
                 seq = seq.unsqueeze(-1)
             seq_tensor[b, :seq.shape[0], :] = seq
-            mask_list.append(torch.ones(seq.shape[0], 1, dtype=torch.bool, device=device))
+            mask_tensor[b, :seq.shape[0], 0] = 1
 
-        # --- Encode or align context ---
+        # --- Encode context ---
         if theta is None:
             theta_list = self._encode_observations(X_list, store=False)
         else:
             theta_list = theta
+        theta_tensor = self._align_theta(theta_list, seq_len=max_len) if theta_list is not None else None  # [B, max_len, H]
 
-        theta_tensor = self._align_theta(theta_list, seq_len=max_len) if theta_list is not None else None
-
-        # --- Compute emission log-probs using dist_type ---
+        # --- Compute emission log-probs ---
         dist_type = self.emission_module.dist_type
-        dist = self.emission_module.forward(context=theta_tensor, return_dist=True)
-
         K = self.n_states
         log_probs_full = torch.empty(B, max_len, K, device=device, dtype=DTYPE)
 
         if dist_type in (torch.distributions.Categorical, torch.distributions.Bernoulli):
-            # Discrete emissions
-            logits = getattr(dist, "logits", None)
-            if logits is None:
-                raise RuntimeError("Emission distribution has no logits.")
-            seq_cat = seq_tensor[..., 0].long()
+            # Discrete emissions (vectorized)
+            logits = self.emission_module.forward(context=theta_tensor, return_dist=True).logits  # [B, K, F] or [K, F]
+            seq_cat = seq_tensor[..., 0].long()  # [B, T]
             for k_start in range(0, K, chunk_size):
                 k_end = min(K, k_start + chunk_size)
-                log_probs_chunk = torch.nn.functional.log_softmax(logits[k_start:k_end], dim=-1)
-                one_hot = torch.nn.functional.one_hot(seq_cat, num_classes=log_probs_chunk.shape[-1]).float()
-                log_probs_full[:, :, k_start:k_end] = torch.einsum("btf,kf->btk", one_hot, log_probs_chunk)
+                logit_chunk = logits[k_start:k_end] if logits.ndim == 2 else logits[:, k_start:k_end]
+                one_hot = torch.nn.functional.one_hot(seq_cat, num_classes=logit_chunk.shape[-1]).float()  # [B, T, F]
+                log_probs_full[:, :, k_start:k_end] = torch.einsum("btf,kf->btk", one_hot, logit_chunk)
 
         elif callable(dist_type) or dist_type == torch.distributions.Independent:
-            # Continuous emissions (Gaussian, Laplace, etc.)
-            means = self.emission_module._emission_means  # [K,D]
-            stds = self.emission_module._emission_covs.diagonal(dim1=-2, dim2=-1).sqrt()  # [K,D]
-            for k_start in range(0, K, chunk_size):
-                k_end = min(K, k_start + chunk_size)
-                seq_exp = seq_tensor.unsqueeze(2).expand(-1, max_len, k_end - k_start, n_features)
-                chunk_means = means[k_start:k_end].view(1, 1, -1, n_features)
-                chunk_stds = stds[k_start:k_end].view(1, 1, -1, n_features)
-                log_norm = -0.5 * torch.log(2 * torch.pi * chunk_stds**2)
-                log_exp = -0.5 * ((seq_exp - chunk_means) ** 2 / (chunk_stds**2))
-                log_probs_full[:, :, k_start:k_end] = (log_norm + log_exp).sum(-1)
+            # Continuous emissions (vectorized Gaussian)
+            means = self.emission_module._emission_means  # [K, D]
+            stds = self.emission_module._emission_covs.diagonal(dim1=-2, dim2=-1).sqrt()  # [K, D]
+            seq_exp = seq_tensor.unsqueeze(2).expand(-1, max_len, K, n_features)  # [B, T, K, F]
+            means_exp = means.view(1, 1, K, n_features)
+            stds_exp = stds.view(1, 1, K, n_features)
+            log_norm = -0.5 * torch.log(2 * math.pi * stds_exp**2)
+            log_exp = -0.5 * ((seq_exp - means_exp)**2 / (stds_exp**2))
+            log_probs_full = (log_norm + log_exp).sum(-1)  # [B, T, K]
 
         else:
-            # fallback per-sequence precomputed log_probs
-            log_probs_full = torch.stack([X.log_probs[b].to(device) for b in range(B)], dim=0)
+            raise NotImplementedError("Unsupported emission type")
 
-        # --- Split back into lists ---
-        sequences = [seq_tensor[b, :lengths[b]] for b in range(B)]
-        log_probs_list = [log_probs_full[b, :lengths[b]] for b in range(B)]
-        context_list = [theta_tensor[b, :lengths[b]] if theta_tensor is not None else None for b in range(B)]
-        masks = [mask_list[b][:lengths[b]] for b in range(B)]
+        # --- Split back into lists with original lengths ---
+        sequences_out = [seq_tensor[b, :lengths[b]] for b in range(B)]
+        log_probs_out = [log_probs_full[b, :lengths[b]] for b in range(B)]
+        context_out = [theta_tensor[b, :lengths[b]] if theta_tensor is not None else None for b in range(B)]
+        masks_out = [mask_tensor[b, :lengths[b]] for b in range(B)]
 
         return utils.Observations(
-            sequence=sequences,
+            sequence=sequences_out,
             lengths=lengths,
-            log_probs=log_probs_list,
-            context=context_list,
-            mask=masks,
+            log_probs=log_probs_out,
+            context=context_out,
+            mask=masks_out
         )
 
     def _forward(

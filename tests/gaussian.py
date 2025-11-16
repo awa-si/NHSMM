@@ -1,8 +1,14 @@
 import os
 import time
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 import numpy as np
 import polars as pl
+
+from typing import Optional
+
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import (
     confusion_matrix,
@@ -134,6 +140,106 @@ def print_duration_summary(model):
         else:
             logger.info(f" state {i}: mode={mode}, mean={mean_dur:.2f}")
 
+# -------------------------
+# CNN+LSTM Encoder
+# -------------------------
+
+class CNN_LSTM_Encoder(nn.Module):
+    """
+    CNN + LSTM feature encoder, fully future-safe.
+
+    Input:
+        x: [B, T, F]
+        mask: optional [B, T] (1 for valid, 0 for padding)
+
+    Output:
+        if return_mode="sequence": [B, T, out_dim]
+        if return_mode="last":     [B, out_dim]
+
+    Safe for:
+        - hierarchical encoders (stacked)
+        - neural context modules
+        - SAE-style state encoders
+        - variable-length sequences
+    """
+
+    def __init__(
+        self,
+        n_features: int,
+        hidden_dim: int = 16,
+        cnn_channels: int = 8,
+        kernel_size: int = 3,
+        dropout: float = 0.1,
+        bidirectional: bool = True,
+        return_mode: str = "sequence",  # "sequence" or "last"
+    ):
+        super().__init__()
+        assert return_mode in ("sequence", "last")
+        self.return_mode = return_mode
+        self._context: Optional[torch.Tensor] = None
+
+        # CNN
+        padding = kernel_size // 2
+        self.conv1 = nn.Conv1d(n_features, cnn_channels, kernel_size, padding=padding)
+        self.cnn_norm = nn.LayerNorm(cnn_channels)
+
+        # LSTM
+        self.lstm = nn.LSTM(
+            input_size=cnn_channels,
+            hidden_size=hidden_dim,
+            batch_first=True,
+            bidirectional=bidirectional,
+        )
+
+        self.dropout = nn.Dropout(dropout)
+        self.out_dim = hidden_dim * (2 if bidirectional else 1)
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        x: [B, T, F]
+        mask: optional [B, T], 1 for valid, 0 for padding
+        """
+        B, T, F_in = x.shape
+
+        # ---- CNN ----
+        x_cnn = x.transpose(1, 2)               # [B, F, T]
+        x_cnn = F.relu(self.conv1(x_cnn))       # [B, C, T]
+        x_cnn = x_cnn.transpose(1, 2)           # [B, T, C]
+        x_cnn = self.cnn_norm(x_cnn)
+        x_cnn = self.dropout(x_cnn)
+
+        # ---- LSTM ----
+        if mask is not None:
+            lengths = mask.sum(dim=1).cpu()
+            packed = nn.utils.rnn.pack_padded_sequence(x_cnn, lengths, batch_first=True, enforce_sorted=False)
+            out_packed, _ = self.lstm(packed)
+            out, _ = nn.utils.rnn.pad_packed_sequence(out_packed, batch_first=True, total_length=T)
+        else:
+            out, _ = self.lstm(x_cnn)
+        out = self.dropout(out)
+
+        # ---- Pooled context ----
+        if mask is not None:
+            mask_f = mask.unsqueeze(-1)
+            pooled = (out * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1)
+        else:
+            pooled = out.mean(dim=1)
+        self._context = pooled
+
+        # ---- Return ----
+        if self.return_mode == "last":
+            if mask is not None:
+                idx = mask.sum(dim=1).clamp_min(1) - 1
+                return out[torch.arange(B), idx]  # last valid timestep per sequence
+            return out[:, -1, :]
+        return out
+
+    def get_context(self, detach: bool = True) -> Optional[torch.Tensor]:
+        """Return pooled context [B, out_dim]"""
+        if self._context is None:
+            return None
+        return self._context.detach() if detach else self._context
+
 # ============================================================
 # Main execution
 # ============================================================
@@ -145,6 +251,7 @@ if __name__ == "__main__":
     MAX_DURATION = 50
     SYMBOL = "BTC/USDT:USDT"
     DATA_DIR = "/opt/trader/user_data/data/bybit/futures_"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- Load or generate data ---
     X, true_states, label_map = load_ohlcv_tensor(DATA_DIR, SYMBOL)
@@ -162,15 +269,20 @@ if __name__ == "__main__":
     X_scaled = scaler.fit_transform(X_torch)
     X_torch = torch.tensor(X_scaled, dtype=DTYPE)
 
+    # Build encoder and NHSMM
+    encoder = CNN_LSTM_Encoder(n_features=n_features, cnn_channels=5, hidden_dim=16)
+    encoder.to(device)
+
     # --- Initialize HSMM ---
     model = HSMM(
+        # encoder=encoder,
         n_states=n_states,
         n_features=n_features,
         max_duration=MAX_DURATION,
         seed=DEFAULT_RNG_SEED,
         min_covar=1e-3,
         alpha=1.0,
-    )
+    ).to(device)
     # model.emission_module.initialize(X=X_torch)
 
     print("[Init] Duration logits differentiated per state.")
@@ -260,5 +372,5 @@ if __name__ == "__main__":
             print("matplotlib not installed — skipping plot")
 
     # --- Save model ---
-    torch.save(model.state_dict(), "gaussianhsmm_debug_state.pt")
+    # torch.save(model.state_dict(), "gaussianhsmm_debug_state.pt")
     print("\n✅ Model state saved to gaussianhsmm_debug_state.pt")
