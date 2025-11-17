@@ -6,12 +6,12 @@ from typing import List, Optional, Union, Tuple
 @dataclass(frozen=False)
 class Observations:
     """Container for sequences, optional log-probs, context vectors, and masks."""
-
+    
     sequence: List[torch.Tensor]
     lengths: Optional[List[int]] = None
     log_probs: Optional[List[torch.Tensor]] = None
     context: Optional[List[Optional[torch.Tensor]]] = None
-    mask: Optional[List[torch.Tensor]] = None  # per-sequence mask
+    mask: Optional[List[torch.Tensor]] = None
 
     def __post_init__(self):
         if not self.sequence:
@@ -25,7 +25,7 @@ class Observations:
             raise ValueError("Mismatch between sequence lengths and `lengths`.")
         object.__setattr__(self, "lengths", seq_lengths)
 
-        # Log probabilities
+        # Log probs
         if self.log_probs is not None:
             if len(self.log_probs) != len(self.sequence):
                 raise ValueError("`log_probs` length must match `sequence` length.")
@@ -112,22 +112,24 @@ class Observations:
             mask=[m.clone() for m in self.mask] if self.mask else None
         )
 
+    # ---------------- Indexing ----------------
     def __getitem__(self, idx: Union[int, slice]) -> "Observations":
-        seqs = self.sequence[idx] if isinstance(idx, slice) else [self.sequence[idx]]
-        lens = self.lengths[idx] if isinstance(idx, slice) else [self.lengths[idx]]
-        logs = self.log_probs[idx] if self.log_probs is not None and isinstance(idx, slice) else \
-               ([self.log_probs[idx]] if self.log_probs is not None else None)
-        ctxs = self.context[idx] if self.context is not None and isinstance(idx, slice) else \
-               ([self.context[idx]] if self.context is not None else None)
-        masks = self.mask[idx] if self.mask is not None and isinstance(idx, slice) else \
-                ([self.mask[idx]] if self.mask is not None else None)
-        return Observations(seqs, lens, logs, ctxs, masks)
+        def _select(lst):
+            if lst is None:
+                return None
+            return lst[idx] if isinstance(idx, slice) else [lst[idx]]
+        return Observations(
+            sequence=_select(self.sequence),
+            lengths=_select(self.lengths),
+            log_probs=_select(self.log_probs),
+            context=_select(self.context),
+            mask=_select(self.mask)
+        )
 
     # ---------------- Normalization ----------------
     def normalize(self, mask: Optional[List[torch.Tensor]] = None, eps: float = 1e-6) -> "Observations":
-        """Normalize sequences per feature, respecting masks and padded entries."""
-        normed = []
         mask_list = mask or self.mask
+        normed = []
         for s, m in zip(self.sequence, mask_list):
             m = m.to(s.device)
             m_f = m.to(s.dtype)
@@ -137,6 +139,33 @@ class Observations:
             std = (var + eps).sqrt()
             normed.append(((s - mean) / std) * m_f + (~m) * s)
         return Observations(normed, self.lengths, self.log_probs, self.context, mask_list)
+
+    # ---------------- Batched Tensor Conversion ----------------
+    def to_tensor(self, key: str = "sequence") -> torch.Tensor:
+        """Return fully padded tensor [B, T_max, F] for batch operations."""
+        items = getattr(self, key)
+        H = items[0].shape[-1]
+        max_len = max(t.shape[0] for t in items)
+        B = len(items)
+        tensor = torch.zeros(B, max_len, H, device=self.device, dtype=self.dtype)
+        for i, t in enumerate(items):
+            tensor[i, :t.shape[0]] = t
+        return tensor
+
+    def expand_context(self) -> None:
+        """Broadcast context [B, H] to [B, T, H] for each sequence."""
+        if self.context is None:
+            return
+        for i, c in enumerate(self.context):
+            if c is not None and c.ndim == 1:
+                self.context[i] = c.unsqueeze(0).expand(self.sequence[i].shape[0], -1).contiguous()
+
+    def summary(self) -> str:
+        return (f"Observations(n_sequences={self.n_sequences}, "
+                f"total_length={self.total_length}, "
+                f"feature_dim={self.feature_dim}, "
+                f"device={self.device}, "
+                f"mask_coverage={[m.sum().item() for m in self.mask]})")
 
 
 @dataclass(frozen=False)

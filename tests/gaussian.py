@@ -143,7 +143,6 @@ def print_duration_summary(model):
 # -------------------------
 # CNN+LSTM Encoder
 # -------------------------
-
 class CNN_LSTM_Encoder(nn.Module):
     """
     CNN + LSTM feature encoder, fully future-safe.
@@ -156,11 +155,9 @@ class CNN_LSTM_Encoder(nn.Module):
         if return_mode="sequence": [B, T, out_dim]
         if return_mode="last":     [B, out_dim]
 
-    Safe for:
-        - hierarchical encoders (stacked)
-        - neural context modules
-        - SAE-style state encoders
-        - variable-length sequences
+    Notes:
+        - _context always holds pooled sequence-level representation [B, out_dim]
+        - Fully compatible with ContextEncoder wrapper
     """
 
     def __init__(
@@ -196,15 +193,24 @@ class CNN_LSTM_Encoder(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        x: [B, T, F]
-        mask: optional [B, T], 1 for valid, 0 for padding
+        Forward pass.
+
+        Args:
+            x: [B, T, F]
+            mask: optional [B, T], 1 for valid, 0 for padding
+
+        Returns:
+            [B, T, out_dim] if return_mode="sequence"
+            [B, out_dim] if return_mode="last"
         """
         B, T, F_in = x.shape
+        if T == 0:
+            raise ValueError("Input sequence has zero length")
 
         # ---- CNN ----
-        x_cnn = x.transpose(1, 2)               # [B, F, T]
-        x_cnn = F.relu(self.conv1(x_cnn))       # [B, C, T]
-        x_cnn = x_cnn.transpose(1, 2)           # [B, T, C]
+        x_cnn = x.transpose(1, 2)          # [B, F, T]
+        x_cnn = F.relu(self.conv1(x_cnn))  # [B, C, T]
+        x_cnn = x_cnn.transpose(1, 2)      # [B, T, C]
         x_cnn = self.cnn_norm(x_cnn)
         x_cnn = self.dropout(x_cnn)
 
@@ -224,7 +230,7 @@ class CNN_LSTM_Encoder(nn.Module):
             pooled = (out * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1)
         else:
             pooled = out.mean(dim=1)
-        self._context = pooled
+        self._context = pooled  # always [B, out_dim]
 
         # ---- Return ----
         if self.return_mode == "last":
@@ -247,7 +253,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     np.random.seed(0)
 
-    MAX_ITER = 9
+    MAX_ITER = 3
     MAX_DURATION = 50
     SYMBOL = "BTC/USDT:USDT"
     DATA_DIR = "/opt/trader/user_data/data/bybit/futures_"
@@ -374,3 +380,4 @@ if __name__ == "__main__":
     # --- Save model ---
     # torch.save(model.state_dict(), "gaussianhsmm_debug_state.pt")
     print("\n✅ Model state saved to gaussianhsmm_debug_state.pt")
+

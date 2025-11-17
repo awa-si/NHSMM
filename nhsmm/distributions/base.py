@@ -134,59 +134,56 @@ class DistributionBase(nn.Module):
     ):
         super().__init__()
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.dtype = DTYPE
         self.target_dim = target_dim
         self.context_dim = context_dim
         self.allow_projection = allow_projection
-        self.max_delta = max_delta
-        self.debug = debug
         self.layer_norm = layer_norm
         self.batch_norm = batch_norm
+        self.max_delta = max_delta
+        self.debug = debug
 
         # Activation functions
         self.activation_fn = self._get_activation(activation)
         self.final_activation_fn = self._get_activation(final_activation)
 
-        # Hidden dimension defaulting
         hidden_dim = hidden_dim or max(16, target_dim // 2, context_dim or target_dim)
 
         # Context network
         self.context_net: Optional[nn.Module] = None
         self._proj: Optional[nn.Linear] = None
-        if context_dim is not None:
+        if context_dim is not None and hidden_dim is not None:
             self.context_net = nn.Sequential(
-                nn.Linear(context_dim, hidden_dim, dtype=self.dtype),
-                nn.LayerNorm(hidden_dim, dtype=self.dtype),
+                nn.Linear(context_dim, hidden_dim, dtype=DTYPE, device=self.device),
+                nn.LayerNorm(hidden_dim, dtype=DTYPE),
                 self.activation_fn,
-                nn.Linear(hidden_dim, target_dim, dtype=self.dtype),
-            ).to(self.device, self.dtype)
+                nn.Linear(hidden_dim, target_dim, dtype=DTYPE, device=self.device),
+            )
             self._init_weights(self.context_net)
-        elif allow_projection:
-            # Predefine projection as identity for later lazy initialization
-            self._proj = None
 
         # Temporal & spatial adapters
         self.temporal_adapter = (
-            nn.Conv1d(target_dim, target_dim, kernel_size=3, padding=1, bias=False).to(self.device, self.dtype)
+            nn.Conv1d(target_dim, target_dim, kernel_size=3, padding=1, bias=False).to(self.device, DTYPE)
             if temporal_adapter else None
         )
         self.spatial_adapter = (
-            nn.Linear(target_dim, target_dim, bias=False).to(self.device, self.dtype)
+            nn.Linear(target_dim, target_dim, bias=False).to(self.device, DTYPE)
             if spatial_adapter else None
         )
         for adapter in (self.temporal_adapter, self.spatial_adapter):
             if adapter is not None:
                 nn.init.xavier_uniform_(adapter.weight)
 
-        # Delta scaling
+        # Delta scale
         if learnable_scale:
-            self.delta_scale = nn.Parameter(torch.tensor(0.1, dtype=self.dtype, device=self.device))
+            self.delta_scale = nn.Parameter(torch.tensor(0.1, dtype=DTYPE, device=self.device))
         else:
-            self.register_buffer("delta_scale", torch.tensor(0.1, dtype=self.dtype, device=self.device))
+            self.register_buffer("delta_scale", torch.tensor(0.1, dtype=DTYPE, device=self.device))
 
-        # BatchNorm placeholder (initialized dynamically if needed)
+        # BatchNorm placeholder
         self._batchnorm: Optional[nn.BatchNorm1d] = None
-        self.log_temperature = nn.Parameter(torch.tensor(0.0, dtype=self.dtype, device=self.device))
+
+        # Temperature parameter
+        self.log_temperature = nn.Parameter(torch.tensor(0.0, dtype=DTYPE, device=self.device))
 
         # Cache
         self.register_buffer("_param_version", torch.tensor(0, dtype=torch.int64))
@@ -196,7 +193,7 @@ class DistributionBase(nn.Module):
         self.cache_grad_safe = cache_grad_safe
 
         # Base logits
-        self.logits = nn.Parameter(torch.zeros(target_dim, dtype=self.dtype, device=self.device))
+        self.logits = nn.Parameter(torch.zeros(target_dim, dtype=DTYPE, device=self.device))
 
     # ---------------- Utilities ----------------
     def _get_activation(self, name: str) -> nn.Module:
@@ -215,21 +212,18 @@ class DistributionBase(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None: nn.init.zeros_(m.bias)
 
-    # ---------------- Hooks ----------------
+    # ---------------- Context hooks ----------------
     def _context_gate(self, context_flat: torch.Tensor) -> torch.Tensor:
-        return torch.zeros((context_flat.shape[0], self.target_dim), dtype=self.dtype, device=self.device)
+        return torch.zeros((context_flat.shape[0], self.target_dim), dtype=DTYPE, device=self.device)
 
     def _context_residual(self, context_flat: torch.Tensor) -> torch.Tensor:
-        return self._context_gate(context_flat)  # hook: override in subclass
+        return self._context_gate(context_flat)
 
     def _context_low_rank(self, context_flat: torch.Tensor) -> torch.Tensor:
-        return self._context_gate(context_flat)  # hook: override in subclass
+        return self._context_gate(context_flat)
 
     def _apply_constraints(self, logits: torch.Tensor) -> torch.Tensor:
         return logits
-
-    def _dist_params(self, logits: torch.Tensor, **kwargs) -> dict:
-        return {"logits": logits, **kwargs}
 
     def _validate_logits(self, logits: torch.Tensor) -> torch.Tensor:
         logits = torch.clamp(logits, -MAX_LOGITS, MAX_LOGITS)
@@ -240,7 +234,8 @@ class DistributionBase(nn.Module):
     # ---------------- Cache ----------------
     @torch.no_grad()
     def _context_hash(self, context: Optional[torch.Tensor]) -> str:
-        if context is None: return f"none-v{int(self._param_version.item())}"
+        if context is None:
+            return f"none-v{int(self._param_version.item())}"
         c = context.detach().float()
         return str((float(c.mean().item()), float(c.std().item()), int(c.numel()), int(self._param_version.item())))
 
@@ -248,21 +243,26 @@ class DistributionBase(nn.Module):
     def _cache_get(self, key: str) -> Optional[torch.Tensor]:
         if not self.cache_enabled: return None
         out = self._cache.get(key)
-        if out is not None: self._cache.move_to_end(key)
+        if out is not None:
+            self._cache.move_to_end(key)
         return out
 
     @torch.no_grad()
     def _cache_set(self, key: str, value: torch.Tensor):
         if not self.cache_enabled: return
         self._cache[key] = value.detach().clone()
-        while len(self._cache) > self.cache_limit: self._cache.popitem(last=False)
+        while len(self._cache) > self.cache_limit:
+            self._cache.popitem(last=False)
 
     @torch.no_grad()
     def _invalidate_cache(self):
         self._cache.clear()
         self._param_version += 1
 
-    # ---------------- Modulation ----------------
+    # ---------------- Context modulation ----------------
+    # Context shapes:
+    # [B, 1, F]   # pooled context
+    # [B, S, F]   # sequence-expanded context
     def _apply_context(
         self,
         base: torch.Tensor,
@@ -271,211 +271,139 @@ class DistributionBase(nn.Module):
         skip_adapters: bool = False,
         l2_normalize: bool = False,
     ) -> torch.Tensor:
-        """
-        Apply context modulation with optional normalization, adapters, and scaling.
-        Returns base + delta constrained by max_delta.
-        """
-        # No context: return base with zeros
+        device, dtype = base.device, base.dtype
+
+        # ------------------ Handle None context ------------------
         if context is None:
-            delta = torch.zeros_like(base, device=self.device, dtype=self.dtype)
+            delta = torch.zeros_like(base, device=device, dtype=dtype)
             return self._apply_constraints(base + delta)
 
-        # Flatten context for processing
-        context_flat = context.reshape(-1, context.shape[-1])
-        in_dim = context_flat.shape[-1]
+        # ------------------ Normalize context to [B, S, H] ------------------
+        if context.ndim == 1:
+            context = context.unsqueeze(0).unsqueeze(1)  # [1, 1, H]
+        elif context.ndim == 2:
+            context = context.unsqueeze(1)  # [B, 1, H]
+        elif context.ndim != 3:
+            raise ValueError(f"Unsupported context ndim {context.ndim}")
+        B, S, H = context.shape
 
-        # Lazy projection if needed
+        # ------------------ Optional projection ------------------
         if self.context_dim is None:
-            self.context_dim = in_dim
-        if in_dim != self.context_dim:
+            self.context_dim = H
+        if H != self.context_dim:
             if not self.allow_projection:
-                raise ValueError(f"Context dim mismatch: {self.context_dim} vs {in_dim}")
-            if self._proj is None or self._proj.in_features != in_dim:
-                self._proj = nn.Linear(in_dim, self.context_dim, device=self.device, dtype=self.dtype)
+                raise ValueError(f"Context dim mismatch: expected {self.context_dim}, got {H}")
+            if self._proj is None or self._proj.in_features != H:
+                self._proj = nn.Linear(H, self.context_dim, device=device, dtype=dtype)
                 nn.init.xavier_uniform_(self._proj.weight)
                 nn.init.zeros_(self._proj.bias)
                 self._invalidate_cache()
-            context_flat = self._proj(context_flat)
+            context = self._proj(context)
 
-        # Context network delta
-        delta = self.context_net(context_flat) if self.context_net else torch.zeros(
-            (context_flat.shape[0], self.target_dim), device=self.device, dtype=self.dtype
-        )
+        # ------------------ Compute delta ------------------
+        delta = torch.zeros((B, S, base.shape[-1]), device=device, dtype=dtype)
+        if self.context_net:
+            delta += self.context_net(context)
+        delta += self._context_gate(context)
+        delta += self._context_residual(context)
+        delta += self._context_low_rank(context)
 
-        # Add hooks
-        delta += self._context_gate(context_flat)
-        delta += self._context_residual(context_flat)
-        delta += self._context_low_rank(context_flat)
-
-        # Optional L2 normalization
         if l2_normalize:
             delta = F.normalize(delta, dim=-1, eps=EPS)
 
-        # Layer/Batch normalization
+        # ------------------ Norm layers ------------------
         if self.layer_norm:
             delta = F.layer_norm(delta, delta.shape[-1:])
         if self.batch_norm:
             flat = delta.flatten(0, -2)
             if self._batchnorm is None or self._batchnorm.num_features != flat.shape[-1]:
-                self._batchnorm = nn.BatchNorm1d(flat.shape[-1], affine=True, track_running_stats=False, eps=EPS).to(self.device, self.dtype)
+                self._batchnorm = nn.BatchNorm1d(flat.shape[-1], affine=True, track_running_stats=False, eps=EPS).to(device, dtype)
             delta = self._batchnorm(flat).view(delta.shape)
 
-        # Temporal/spatial adapters
+        # ------------------ Adapters ------------------
         if not skip_adapters:
             if self.temporal_adapter:
-                assert delta.ndim == 3, "Temporal adapter expects [batch, seq, target_dim]"
                 delta = self.temporal_adapter(delta.transpose(-2, -1)).transpose(-2, -1)
             if self.spatial_adapter:
                 delta = self.spatial_adapter(delta)
 
-        # Activation + scaling + clamp
-        delta = torch.clamp(self.final_activation_fn(delta) * self.delta_scale, -self.max_delta, self.max_delta)
+        # ------------------ Activation, scaling, clamping ------------------
+        delta = self.final_activation_fn(delta) * getattr(self, "delta_scale", 1.0)
+        delta = torch.clamp(delta, -getattr(self, "max_delta", 1e6), getattr(self, "max_delta", 1e6))
 
-        # Expand base to match delta
-        base_exp = base.unsqueeze(0) if base.ndim < delta.ndim else base
-        base_exp = base_exp.expand(delta.shape)
+        # ------------------ Broadcast delta to match base ------------------
+        if delta.shape != base.shape:
+            # Expand safely using expand_as
+            try:
+                delta = delta.expand_as(base)
+            except RuntimeError:
+                # fallback: broadcast with broadcasting semantics
+                delta = delta + torch.zeros_like(base)
 
-        # Apply optional gradient scaling
+        # ------------------ Apply grad scaling ------------------
         if grad_scale is not None:
             delta = delta * grad_scale
 
-        return self._apply_constraints(base_exp + delta)
+        return self._apply_constraints(base + delta)
 
+    # ---------------- Modulation w/ Temperature ----------------
     def _modulate(
         self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
         grad_safe: bool = False,
     ) -> torch.Tensor:
-        """
-        Compute context-modulated logits with optional temperature scaling.
-        Caches results for repeated contexts.
-        """
         key = self._context_hash(context)
         cached = self._cache_get(key)
         if cached is not None:
             return cached if grad_safe else cached.detach()
 
-        # Apply context
         mod = self._apply_context(self.logits, context)
 
-        # Temperature scaling
-        temp = torch.exp(self.log_temperature) if temperature is None else torch.as_tensor(temperature, device=self.device, dtype=self.dtype)
+        temp = torch.exp(self.log_temperature) if temperature is None else torch.as_tensor(temperature, device=self.device, dtype=DTYPE)
         mod = mod / temp.clamp_min(EPS)
-
-        # Normalize logits (log-sum-exp)
         mod = mod - mod.logsumexp(dim=-1, keepdim=True)
         mod = self._validate_logits(mod)
 
-        # Cache result
         self._cache_set(key, mod if grad_safe else mod.detach())
-
         return mod
 
     # ---------------- Forward / Distribution ----------------
-    def forward(
-        self,
-        log: bool = False,
-        return_dist: bool = False,
-        context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        **dist_kwargs: Any
-    ):
-        """
-        Return modulated probabilities or distribution object.
-        """
+    def forward(self, log: bool = False, return_dist: bool = False, context: Optional[torch.Tensor] = None, temperature: Optional[float] = None, **dist_kwargs: Any):
         mod = self._modulate(context, temperature)
         dist = self.dist_type(**self._dist_params(mod, **dist_kwargs))
         if return_dist:
             return dist
         return F.log_softmax(mod, dim=-1) if log else F.softmax(mod, dim=-1)
 
-    def log_matrix(
-        self,
-        context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        return_dist: bool = False,
-        **dist_kwargs: Any
-    ):
-        """
-        Return log-probabilities of each category or distribution.
-        """
+    def log_prob(self, x: torch.Tensor, context: Optional[torch.Tensor] = None, temperature: Optional[float] = None, **dist_kwargs: Any):
+        dist = self.dist_type(**self._dist_params(self._modulate(context, temperature), **dist_kwargs))
+        if isinstance(dist, Categorical):
+            return dist.log_prob(x.view(-1).long()).view(*x.shape)
+        return dist.log_prob(x)
+
+    def log_matrix(self, context: Optional[torch.Tensor] = None, temperature: Optional[float] = None, return_dist: bool = False, **dist_kwargs: Any):
         mod = self._modulate(context, temperature)
         dist = self.dist_type(**self._dist_params(mod, **dist_kwargs))
         if return_dist:
             return dist
         return F.log_softmax(mod, dim=-1)
 
-    def log_prob(
-        self,
-        x: torch.Tensor,
-        context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        **dist_kwargs: Any
-    ):
-        """
-        Compute log-probability of given samples x.
-        Handles Categorical, Independent, or generic distributions.
-        """
-        dist = self.dist_type(**self._dist_params(self._modulate(context, temperature), **dist_kwargs))
-
-        if isinstance(dist, torch.distributions.Categorical):
-            return dist.log_prob(x.view(-1).long()).view(*x.shape)
-
-        if isinstance(dist, torch.distributions.Independent):
-            return dist.log_prob(x).view(x.shape[:-dist.event_dim] if dist.event_dim > 0 else x.shape)
-
-        return dist.log_prob(x)
-
-    def expected_probs(
-        self,
-        context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        return_dist: bool = False,
-        **dist_kwargs: Any
-    ):
-        """
-        Return expected probabilities (softmax of modulated logits) or distribution.
-        """
+    def expected_probs(self, context: Optional[torch.Tensor] = None, temperature: Optional[float] = None, return_dist: bool = False, **dist_kwargs: Any):
         mod = self._modulate(context, temperature)
         dist = self.dist_type(**self._dist_params(mod, **dist_kwargs))
-        if return_dist:
-            return dist
-        return F.softmax(mod, dim=-1)
+        return dist if return_dist else F.softmax(mod, dim=-1)
 
-    def sample(
-        self,
-        context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        **dist_kwargs: Any
-    ):
-        """
-        Sample from the modulated distribution.
-        Uses rsample() if available for differentiable sampling.
-        """
+    def sample(self, context: Optional[torch.Tensor] = None, temperature: Optional[float] = None, **dist_kwargs: Any):
         dist = self.dist_type(**self._dist_params(self._modulate(context, temperature), **dist_kwargs))
         return dist.rsample() if getattr(dist, "has_rsample", False) else dist.sample()
 
-    def mode(
-        self,
-        context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        return_dist: bool = False,
-        **dist_kwargs: Any
-    ):
-        """
-        Compute mode (most probable value) of the modulated distribution.
-        Fallbacks to argmax if mode is unavailable.
-        """
+    def mode(self, context: Optional[torch.Tensor] = None, temperature: Optional[float] = None, return_dist: bool = False, **dist_kwargs: Any):
         dist = self.dist_type(**self._dist_params(self._modulate(context, temperature), **dist_kwargs))
-        if return_dist:
-            return dist
-        if hasattr(dist, "mode"):
-            return dist.mode
-        if hasattr(dist, "probs"):
-            return torch.argmax(dist.probs, dim=-1)
-        if hasattr(dist, "logits"):
-            return torch.argmax(F.softmax(dist.logits, dim=-1), dim=-1)
+        if return_dist: return dist
+        if hasattr(dist, "mode"): return dist.mode
+        if hasattr(dist, "probs"): return torch.argmax(dist.probs, dim=-1)
+        if hasattr(dist, "logits"): return torch.argmax(F.softmax(dist.logits, dim=-1), dim=-1)
         raise TypeError(f"Cannot compute mode for distribution type {type(dist)}")
 
     @property
@@ -485,6 +413,675 @@ class DistributionBase(nn.Module):
     def update(self, *args, **kwargs): pass
 
     def initialize(self, mode="uniform", **_): return self
+
+
+class Initial(DistributionBase):
+    """
+    Context-aware, differentiable Initial-state distribution for HSMMs.
+
+    Features:
+    - Compatible with ContextEncoder outputs ([B, F] or [B, 1, F])
+    - Supports adapters, layer/batch norm, L2 normalization
+    - Differentiable with gradient-safe caching
+    - EM-style updates via posterior or new_logits
+    - Temperature scaling
+    """
+
+    _dist_type = Categorical
+
+    def __init__(
+        self,
+        n_states: int,
+        context_dim: Optional[int] = None,
+        hidden_dim: int = 64,
+        init_mode: str = "uniform",
+        temperature: float = 1.0,
+        rank: Optional[int] = None,
+        cache_limit: int = 64,
+        debug: bool = False,
+    ):
+        super().__init__(
+            target_dim=n_states,
+            context_dim=context_dim,
+            hidden_dim=hidden_dim,
+            activation="tanh",
+            final_activation="tanh",
+            cache_enabled=True,
+            cache_limit=cache_limit,
+            debug=debug,
+        )
+        self.rank = rank
+        self.n_states = n_states
+        self.init_mode = init_mode
+        self.temperature = temperature
+
+        # Base logits
+        init_logits = self._init_logits(n_states, init_mode)
+        self.logits.data.copy_(init_logits)
+        self.register_buffer("_logits_buffer", init_logits.clone())
+        self.register_buffer("_mod_logits_buffer", init_logits.clone())
+
+        # Context-specific gates / low-rank factors
+        self.context_gate_net: Optional[nn.Module] = None
+        self.residual_gate_net: Optional[nn.Module] = None
+        self._U: Optional[nn.Linear] = None
+        self._V: Optional[nn.Linear] = None
+
+        if context_dim is not None and hidden_dim is not None:
+            self.context_gate_net = nn.Sequential(
+                nn.Linear(context_dim, hidden_dim, dtype=DTYPE, device=self.device),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, n_states, dtype=DTYPE, device=self.device),
+            )
+            self.residual_gate_net = nn.Sequential(
+                nn.Linear(context_dim, hidden_dim, dtype=DTYPE, device=self.device),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, n_states, dtype=DTYPE, device=self.device),
+            )
+            if rank is not None:
+                self._U = nn.Linear(context_dim, n_states * rank, dtype=DTYPE, device=self.device)
+                self._V = nn.Linear(context_dim, rank, dtype=DTYPE, device=self.device)
+
+    # ---------------- Initialization ----------------
+    def _init_logits(self, n_states: int, mode: str) -> torch.Tensor:
+        if mode == "uniform":
+            logits = torch.full((n_states,), -math.log(n_states), dtype=DTYPE, device=self.device)
+        elif mode == "biased":
+            w = torch.linspace(0.8, 0.2, n_states, dtype=DTYPE, device=self.device)
+            logits = torch.log(w / w.sum())
+        elif mode == "normal":
+            logits = torch.randn(n_states, dtype=DTYPE, device=self.device) * 0.1
+        else:
+            raise ValueError(f"Unknown init_mode '{mode}'")
+        return self._validate_logits(logits)
+
+    @torch.no_grad()
+    def initialize(self, mode: str = "uniform") -> Categorical:
+        logits = self._init_logits(self.n_states, mode)
+        self.logits.data.copy_(logits)
+        self._logits_buffer.copy_(logits)
+        self._mod_logits_buffer.copy_(logits)
+        self._invalidate_cache()
+        return self._dist_type(logits=logits)
+
+    # ---------------- Context hooks ----------------
+    def _context_gate(self, context_flat: torch.Tensor) -> torch.Tensor:
+        if self.context_gate_net is None:
+            return torch.zeros((context_flat.shape[0], self.n_states), device=self.device, dtype=DTYPE)
+        return self.context_gate_net(context_flat)
+
+    def _context_residual(self, context_flat: torch.Tensor) -> torch.Tensor:
+        if self.residual_gate_net is None:
+            return torch.zeros((context_flat.shape[0], self.n_states), device=self.device, dtype=DTYPE)
+        return self.residual_gate_net(context_flat)
+
+    def _context_low_rank(self, context_flat: torch.Tensor) -> torch.Tensor:
+        if self._U is None or self._V is None:
+            return torch.zeros((context_flat.shape[0], self.n_states), device=self.device, dtype=DTYPE)
+        B_T = context_flat.shape[0]
+        U = self._U(context_flat).view(B_T, self.n_states, self.rank)
+        V = self._V(context_flat).view(B_T, 1, self.rank)
+        return (U * V).sum(-1)
+
+    # ---------------- Modulate ----------------
+    def _modulate(
+        self,
+        context: Optional[torch.Tensor] = None,
+        temperature: Optional[float] = None,
+        grad_safe: bool = False,
+    ) -> torch.Tensor:
+        # Compute modulated logits using base class
+        mod = super()._modulate(context=context, temperature=temperature, grad_safe=grad_safe)
+        return mod
+
+    # ---------------- Distribution helpers ----------------
+    def _dist_params(self, logits: torch.Tensor, tau: Optional[float] = None) -> dict:
+        return {"logits": logits, "tau": tau or self.temperature}
+
+    def _get_dist(self, context=None, temperature=None) -> Categorical:
+        mod_logits = self._modulate(context=context, temperature=temperature)
+        tau = temperature or self.temperature
+        return self._dist_type(**self._dist_params(mod_logits, tau=tau))
+
+    # ---------------- Sampling / log-prob ----------------
+    def sample(self, context=None, temperature=None, **kwargs):
+        return self._get_dist(context=context, temperature=temperature).sample(**kwargs)
+
+    def log_prob(self, x, context=None, temperature=None):
+        return self._get_dist(context=context, temperature=temperature).log_prob(x)
+
+    def expected_probs(self, context=None, temperature=None):
+        dist = self._get_dist(context=context, temperature=temperature)
+        return dist.probs
+
+    def mode(self, context=None, temperature=None):
+        dist = self._get_dist(context=context, temperature=temperature)
+        if hasattr(dist, "mode"):
+            return dist.mode
+        if hasattr(dist, "probs"):
+            return dist.probs.argmax(-1)
+        return torch.argmax(F.softmax(dist.logits, dim=-1), dim=-1)
+
+    # ---------------- EM-style / Learnable update ----------------
+    @torch.no_grad()
+    def update(
+        self,
+        new_logits: Optional[torch.Tensor] = None,
+        posterior: Optional[torch.Tensor] = None,
+        from_probs: bool = False,
+        update_rate: Optional[float] = None,
+        temperature: Optional[float] = None,
+        context: Optional[torch.Tensor] = None,
+    ):
+        if new_logits is not None:
+            if from_probs:
+                new_logits = torch.log(new_logits.clamp_min(EPS))
+            if temperature is not None:
+                new_logits = new_logits / max(temperature, 1e-6)
+            new_logits = self._validate_logits(new_logits)
+            self.logits.data.copy_(new_logits)
+            self._logits_buffer.copy_(new_logits)
+            self._mod_logits_buffer.copy_(new_logits)
+            self._invalidate_cache()
+            return
+
+        if posterior is not None and any(p.requires_grad for p in self.parameters()):
+            lr = update_rate or 1.0
+            mod_logits = self._modulate(context=context, temperature=temperature)
+            log_probs = F.log_softmax(mod_logits, dim=-1)
+            loss = -(posterior * log_probs).sum() / (posterior.sum() + EPS)
+            self.zero_grad()
+            loss.backward()
+            with torch.no_grad():
+                for p in self.parameters():
+                    if p.grad is not None:
+                        p.data.add_(lr * p.grad)
+            self._invalidate_cache()
+
+
+class Duration(DistributionBase):
+    """
+    Context-aware categorical duration distribution per state for HSMMs.
+
+    Features:
+    - Differentiable, context-modulated logits
+    - Supports ContextEncoder outputs ([B, F] or [B, 1, F])
+    - Rank decomposition for low-rank context influence
+    - Gradient-safe caching and temperature scaling
+    - EM-style or learnable updates
+    """
+    _dist_type = Categorical
+
+    def __init__(
+        self,
+        n_states: int,
+        max_duration: int = 30,
+        context_dim: Optional[int] = None,
+        hidden_dim: int = 64,
+        min_temperature: float = 1e-6,
+        smooth_factor: float = 0.01,
+        rank: Optional[int] = None,
+        gate_factor: float = 0.5,
+        temperature: float = 1.0,
+        cache_limit: int = 32,
+        debug: bool = False,
+        init_mode: str = "uniform",
+    ):
+        target_dim = n_states * max_duration
+        super().__init__(
+            target_dim=target_dim,
+            context_dim=context_dim,
+            hidden_dim=hidden_dim,
+            activation="tanh",
+            final_activation="tanh",
+            cache_enabled=True,
+            cache_limit=cache_limit,
+            debug=debug,
+        )
+
+        self.n_states = n_states
+        self.max_duration = max_duration
+        self.rank = rank
+        self.gate_factor = gate_factor
+        self.smooth_factor = smooth_factor
+        self.temperature = temperature
+        self.min_temperature = min_temperature
+
+        self.register_buffer("_durations", torch.arange(1, max_duration + 1, dtype=DTYPE, device=self.device))
+
+        # Initialize logits
+        init_logits = self._init_logits(n_states, max_duration, init_mode)
+        self.logits = nn.Parameter(init_logits.clone())
+        self.register_buffer("_logits_buffer", init_logits.clone())
+        self.register_buffer("_mod_logits_buffer", init_logits.clone())
+
+        # Context gates / residuals / low-rank
+        self.context_gate: Optional[nn.Module] = None
+        self.residual_gate: Optional[nn.Module] = None
+        self._U: Optional[nn.Linear] = None
+        self._V: Optional[nn.Linear] = None
+
+        if context_dim is not None and hidden_dim is not None:
+            self.context_gate = nn.Sequential(
+                nn.Linear(context_dim, hidden_dim, dtype=DTYPE, device=self.device),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, n_states, dtype=DTYPE, device=self.device),
+            )
+            self.residual_gate = nn.Sequential(
+                nn.Linear(context_dim, hidden_dim, dtype=DTYPE, device=self.device),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, n_states, dtype=DTYPE, device=self.device),
+            )
+            if rank is not None:
+                self._U = nn.Linear(context_dim, n_states * rank, dtype=DTYPE, device=self.device)
+                self._V = nn.Linear(context_dim, rank, dtype=DTYPE, device=self.device)
+
+        # Optional low-rank context matrices
+        if context_dim is not None and rank is not None:
+            self._U = nn.Linear(context_dim, n_states * rank, dtype=DTYPE, device=self.device)
+            self._V = nn.Linear(context_dim, rank, dtype=DTYPE, device=self.device)
+
+    # ---------------- Initialization ----------------
+    def _init_logits(self, n_states: int, max_duration: int, mode: str) -> torch.Tensor:
+        if mode == "uniform":
+            logits = torch.full((n_states, max_duration), -math.log(max_duration), dtype=DTYPE, device=self.device)
+        elif mode == "short_bias":
+            w = torch.linspace(0.7, 0.3, max_duration, dtype=DTYPE, device=self.device)
+            w = w.unsqueeze(0).repeat(n_states, 1)
+            w /= w.sum(dim=1, keepdim=True)
+            logits = torch.log(w)
+        elif mode == "normal":
+            logits = torch.randn(n_states, max_duration, dtype=DTYPE, device=self.device) * 0.1
+            logits -= torch.arange(max_duration, dtype=DTYPE, device=self.device) * 0.05
+        else:
+            raise ValueError(f"Unknown init_mode '{mode}'")
+        return self._validate_logits(logits)
+
+    @torch.no_grad()
+    def initialize(self, mode: str = "uniform") -> Categorical:
+        logits = self._init_logits(self.n_states, self.max_duration, mode)
+        self.logits.data.copy_(logits)
+        self._logits_buffer.copy_(logits)
+        self._mod_logits_buffer.copy_(logits)
+        self._invalidate_cache()
+        return self._get_dist()
+
+    # ---------------- Context modulation ----------------
+    def _apply_context(self, base: torch.Tensor, context: Optional[torch.Tensor]) -> torch.Tensor:
+        n, Dmax = self.n_states, self.max_duration
+        device, dtype = base.device, base.dtype
+
+        # Base [K, Dmax] if 2D
+        if base.ndim == 1:
+            base = base.view(n, Dmax)
+        elif base.ndim == 2 and base.shape[0] == n and base.shape[1] == Dmax:
+            base = base
+        else:
+            raise ValueError(f"Unexpected base shape {base.shape}")
+
+        if context is None:
+            return base  # [K, Dmax]
+
+        # Context [B,T,H]
+        if context.ndim == 1:
+            context = context.unsqueeze(0).unsqueeze(1)
+        elif context.ndim == 2:
+            context = context.unsqueeze(1)
+        B, T, H = context.shape
+        ctx_flat = context.reshape(B*T, H)
+
+        # Compute delta: [B*T, K, Dmax]
+        delta = torch.zeros(B*T, n, Dmax, device=device, dtype=dtype)
+        if self.context_gate:
+            gate = self.context_gate(ctx_flat).unsqueeze(-1).expand(-1, -1, Dmax)
+            delta += gate
+        if self.residual_gate:
+            residual = self.residual_gate(ctx_flat).unsqueeze(-1).expand(-1, -1, Dmax)
+            delta += residual
+        if self.rank and self._U and self._V:
+            U = self._U(ctx_flat).view(B*T, n, self.rank)
+            V = self._V(ctx_flat).view(B*T, 1, self.rank)
+            delta += (U * V).sum(-1).unsqueeze(-1).expand(-1, -1, Dmax)
+
+        delta = delta.view(B, T, n, Dmax)
+        base_exp = base.unsqueeze(0).unsqueeze(0).expand(B, T, n, Dmax)
+
+        mod = base_exp + delta
+        if self.smooth_factor > 0:
+            mod = torch.log((1 - self.smooth_factor) * mod.exp() + self.smooth_factor / Dmax)
+
+        return self._validate_logits(mod)
+
+    def _modulate(self, context: Optional[torch.Tensor] = None, temperature: Optional[float | torch.Tensor] = None, grad_safe: bool = False) -> torch.Tensor:
+        temp = (
+            torch.full_like(self.logits, self.temperature)
+            if temperature is None
+            else (
+                torch.full_like(self.logits, temperature)
+                if isinstance(temperature, (float, int))
+                else temperature.clamp_min(self.min_temperature)
+            )
+        )
+
+        key = f"{self._context_hash(context)}-temp{float(temp.mean()):.6f}"
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
+
+        mod = self._apply_context(self.logits, context)
+        mod = mod / temp
+        mod = mod - mod.logsumexp(dim=-1, keepdim=True)
+        mod = self._validate_logits(mod)
+
+        self._cache_set(key, mod.detach() if not grad_safe else mod)
+        return mod
+
+    # ---------------- Distribution helpers ----------------
+    def _dist_params(self, logits: torch.Tensor, tau: Optional[float] = None) -> dict:
+        return {"logits": logits, "tau": tau or self.temperature}
+
+    def _get_dist(self, context=None, temperature=None) -> Categorical:
+        mod_logits = self._modulate(context=context, temperature=temperature)
+        tau = temperature or self.temperature
+        return self._dist_type(**self._dist_params(mod_logits, tau=tau))
+
+    # ---------------- Sampling / log-prob ----------------
+    def sample(self, context=None, temperature=None, hard=True, **kwargs):
+        return self._get_dist(context=context, temperature=temperature).sample(hard=hard)
+
+    def rsample(self, context=None, temperature=None, **kwargs):
+        return self._get_dist(context=context, temperature=temperature).rsample()
+
+    def log_prob(self, x, context=None, temperature=None, **kwargs):
+        return self._get_dist(context=context, temperature=temperature).log_prob(x)
+
+    def expected_probs(self, context=None, temperature=None, **kwargs):
+        return self._get_dist(context=context, temperature=temperature).probs
+
+    def mode(self, context=None, temperature=None, **kwargs):
+        dist = self._get_dist(context=context, temperature=temperature)
+        if hasattr(dist, "mode"):
+            return dist.mode
+        if hasattr(dist, "probs"):
+            return dist.probs.argmax(-1)
+        return torch.argmax(F.softmax(dist.logits, dim=-1), dim=-1)
+
+    # ---------------- EM / gradient update ----------------
+    @torch.no_grad()
+    def update(
+        self,
+        new_logits: Optional[torch.Tensor] = None,
+        posterior: Optional[torch.Tensor] = None,
+        from_probs: bool = False,
+        update_rate: Optional[float] = None,
+        temperature: Optional[float] = None,
+        context: Optional[torch.Tensor] = None,
+    ):
+        if new_logits is not None:
+            if from_probs:
+                new_logits = torch.log(new_logits.clamp_min(EPS))
+            if temperature is not None:
+                new_logits = new_logits / max(temperature, 1e-6)
+            new_logits = self._validate_logits(new_logits)
+            self.logits.data.copy_(new_logits)
+            self._logits_buffer.copy_(new_logits)
+            self._mod_logits_buffer.copy_(new_logits)
+            self._invalidate_cache()
+            return
+
+        if posterior is not None and any(p.requires_grad for p in self.parameters()):
+            mod_logits = self._modulate(context=context, temperature=temperature)
+            log_probs = F.log_softmax(mod_logits, dim=-1)
+            loss = -(posterior * log_probs).sum() / (posterior.sum() + EPS)
+            self.zero_grad()
+            loss.backward()
+            with torch.no_grad():
+                for p in self.parameters():
+                    if p.grad is not None:
+                        p.data.add_((update_rate or 1.0) * p.grad)
+            self._invalidate_cache()
+
+
+class Transition(DistributionBase):
+    """
+    Context-aware categorical transition distribution for HSMMs.
+
+    Features:
+    - Differentiable, context-modulated logits
+    - Supports ContextEncoder outputs ([B, F] or [B, 1, F])
+    - Rank decomposition for low-rank context influence
+    - Gradient-safe caching and temperature scaling
+    - Structural transition constraints (ergodic, semi, left-to-right)
+    - EM-style or learnable updates
+    """
+    _dist_type = Categorical
+
+    def __init__(
+        self,
+        n_states: int,
+        context_dim: Optional[int] = None,
+        hidden_dim: int = 64,
+        rank: Optional[int] = None,
+        transition_type: Union[str, constraints.Transitions] = "ergodic",
+        init_mode: str = "diag_bias",
+        temperature: float = 1.0,
+        gate_factor: float = 0.5,
+        smooth_factor: float = 0.0,
+        cache_limit: int = 32,
+        debug: bool = False,
+    ):
+        super().__init__(
+            target_dim=n_states * n_states,
+            context_dim=context_dim,
+            hidden_dim=hidden_dim,
+            activation="tanh",
+            final_activation="tanh",
+            cache_enabled=True,
+            cache_limit=cache_limit,
+            debug=debug,
+        )
+
+        self.n_states = n_states
+        self.rank = rank
+        self.transition_type = constraints._resolve_type(transition_type, constraints.Transitions)
+        self.gate_factor = gate_factor
+        self.smooth_factor = smooth_factor
+        self.temperature = temperature
+
+        # Base logits
+        init_logits = self._init_logits(n_states, init_mode)
+        self.logits = nn.Parameter(init_logits.clone())
+        self.register_buffer("_logits_buffer", init_logits.clone())
+        self.register_buffer("_mod_logits_buffer", init_logits.clone())
+
+        # Context gates / residuals / low-rank
+        self.context_gate: Optional[nn.Module] = None
+        self.residual_gate: Optional[nn.Module] = None
+        self._U: Optional[nn.Linear] = None
+        self._V: Optional[nn.Linear] = None
+
+        if context_dim is not None and hidden_dim is not None:
+            self.context_gate = nn.Sequential(
+                nn.Linear(context_dim, hidden_dim, dtype=DTYPE, device=self.device),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, n_states, dtype=DTYPE, device=self.device),
+            )
+            self.residual_gate = nn.Sequential(
+                nn.Linear(context_dim, hidden_dim, dtype=DTYPE, device=self.device),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, n_states, dtype=DTYPE, device=self.device),
+            )
+            if rank is not None:
+                self._U = nn.Linear(context_dim, n_states * rank, dtype=DTYPE, device=self.device)
+                self._V = nn.Linear(context_dim, rank, dtype=DTYPE, device=self.device)
+
+    # ---------------- Initialization ----------------
+    def _init_logits(self, n_states: int, mode: str) -> torch.Tensor:
+        if mode == "uniform":
+            logits = torch.full((n_states, n_states), -math.log(n_states), dtype=DTYPE, device=self.device)
+        elif mode == "diag_bias":
+            m = torch.full((n_states, n_states), 0.1, dtype=DTYPE, device=self.device)
+            m.fill_diagonal_(0.7)
+            m /= m.sum(dim=1, keepdim=True)
+            logits = torch.log(m)
+        elif mode == "normal":
+            logits = torch.randn(n_states, n_states, dtype=DTYPE, device=self.device) * 0.1
+        else:
+            raise ValueError(f"Unknown init_mode '{mode}'")
+        return self._apply_constraints(logits)
+
+    @torch.no_grad()
+    def initialize(self, mode: str = "diag_bias") -> Categorical:
+        logits = self._init_logits(self.n_states, mode)
+        logits = self._validate_logits(logits)
+        self.logits.data.copy_(logits)
+        self._logits_buffer.copy_(logits)
+        self._mod_logits_buffer.copy_(logits)
+        self._invalidate_cache()
+        return self._get_dist()
+
+    # ---------------- Context modulation ----------------
+    def _apply_context(self, base: torch.Tensor, context: Optional[torch.Tensor]) -> torch.Tensor:
+        """
+        Applies context modulation safely for Transition logits.
+        Reshapes [K*K] → [K,K] or [B,T,K,K] dynamically.
+        """
+        n = self.n_states
+        device, dtype = base.device, base.dtype
+
+        # Flatten base if necessary
+        base_flat = base.view(-1) if base.ndim == 2 else base
+
+        # If no context, just return base logits
+        if context is None:
+            return self._apply_constraints(base_flat.view(n, n) if base_flat.numel() == n*n else base_flat)
+
+        # Ensure context is [B, T, H]
+        if context.ndim == 1:
+            context = context.unsqueeze(0).unsqueeze(1)
+        elif context.ndim == 2:
+            context = context.unsqueeze(1)
+        B, T, H = context.shape
+        ctx_flat = context.reshape(B*T, H)
+
+        # Compute delta
+        delta = torch.zeros_like(base_flat, device=device, dtype=dtype).unsqueeze(0).expand(B*T, -1)
+        if self.context_gate:
+            delta += self.context_gate(ctx_flat)
+        if self.residual_gate:
+            delta += self.residual_gate(ctx_flat)
+        if self.rank is not None and self._U is not None and self._V is not None:
+            U = self._U(ctx_flat).view(B*T, n, self.rank)
+            V = self._V(ctx_flat).view(B*T, 1, self.rank)
+            delta += (U * V).sum(-1)
+
+        # Reshape delta back
+        target_dim_per_state = n
+        delta = delta.view(B, T, n, target_dim_per_state)
+        base_exp = base_flat.view(1, 1, n, n).expand(B, T, n, n)
+
+        mod = self._apply_constraints(base_exp + delta)
+        return mod
+
+    # ---------------- Unified modulation ----------------
+    def _modulate(
+        self,
+        context: Optional[torch.Tensor] = None,
+        temperature: Optional[float | torch.Tensor] = None,
+        grad_safe: bool = False,
+    ) -> torch.Tensor:
+        temp = (
+            torch.full_like(self.logits, self.temperature)
+            if temperature is None
+            else torch.full_like(self.logits, temperature)
+            if isinstance(temperature, (float, int))
+            else temperature.clamp_min(1e-6)
+        )
+        key = f"{self._context_hash(context)}-temp{float(temp.mean()):.6f}"
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
+
+        mod = self._apply_context(self.logits, context)
+        mod = mod / temp
+        mod = mod - mod.logsumexp(dim=-1, keepdim=True)
+        mod = self._validate_logits(mod)
+        self._cache_set(key, mod.detach() if not grad_safe else mod)
+        return mod
+
+    # ---------------- Structural constraints ----------------
+    def _apply_constraints(self, logits: torch.Tensor) -> torch.Tensor:
+        logits = logits.clone()
+        n = self.n_states
+        if self.transition_type == "semi":
+            mask = torch.eye(n, dtype=torch.bool, device=logits.device)
+            logits[..., mask] = -float("inf")
+        elif self.transition_type == "left-to-right":
+            tril_mask = torch.tril(torch.ones(n, n, dtype=torch.bool, device=logits.device), -1)
+            logits[..., tril_mask] = -float("inf")
+        return logits
+
+    # ---------------- Distribution helpers ----------------
+    def _dist_params(self, logits: torch.Tensor, tau: Optional[float] = None) -> dict:
+        return {"logits": logits, "tau": tau or self.temperature}
+
+    def _get_dist(self, context=None, temperature=None):
+        mod_logits = self._modulate(context=context, temperature=temperature)
+        tau = temperature or self.temperature
+        return self._dist_type(**self._dist_params(mod_logits, tau=tau))
+
+    # ---------------- Sampling / log-prob ----------------
+    def sample(self, context=None, temperature=None, hard=True, **kwargs):
+        return self._get_dist(context=context, temperature=temperature).sample(hard=hard)
+
+    def log_prob(self, x, context=None, temperature=None, **kwargs):
+        return self._get_dist(context=context, temperature=temperature).log_prob(x)
+
+    def expected_probs(self, context=None, temperature=None):
+        return self._get_dist(context=context, temperature=temperature).probs
+
+    def mode(self, context=None, temperature=None, **kwargs):
+        dist = self._get_dist(context=context, temperature=temperature)
+        if hasattr(dist, "mode"):
+            return dist.mode
+        if hasattr(dist, "probs"):
+            return dist.probs.argmax(-1)
+        return torch.argmax(F.softmax(dist.logits, dim=-1), dim=-1)
+
+    # ---------------- EM / Learnable update ----------------
+    @torch.no_grad()
+    def update(
+        self,
+        new_logits=None,
+        posterior=None,
+        from_probs=False,
+        update_rate=None,
+        temperature=None,
+        context=None,
+    ):
+        if new_logits is not None:
+            if from_probs:
+                new_logits = torch.log(new_logits.clamp_min(EPS))
+            if temperature is not None:
+                new_logits = new_logits / max(temperature, 1e-6)
+            new_logits = self._apply_constraints(new_logits)
+            self.logits.data.copy_(self._validate_logits(new_logits))
+            self._logits_buffer.copy_(self.logits)
+            self._mod_logits_buffer.copy_(self.logits)
+            self._invalidate_cache()
+            return
+
+        if posterior is not None and any(p.requires_grad for p in self.parameters()):
+            mod_logits = self._modulate(context=context, temperature=temperature)
+            log_probs = F.log_softmax(mod_logits, dim=-1)
+            loss = -(posterior * log_probs).sum() / (posterior.sum() + EPS)
+            self.zero_grad()
+            loss.backward()
+            with torch.no_grad():
+                for p in self.parameters():
+                    if p.grad is not None:
+                        p.data.add_((update_rate or 1.0) * p.grad)
+            self._invalidate_cache()
 
 
 class Emission(DistributionBase):
@@ -1094,570 +1691,4 @@ class Emission(DistributionBase):
                 return Independent(Bernoulli(logits=logits), 1)
             else:  # Poisson
                 return Independent(Poisson(rate=torch.exp(logits)), 1)
-
-
-class Initial(DistributionBase):
-    """
-    Initial-state distribution for HSMMs with neural/contextual modulation.
-    """
-    _dist_type = Categorical
-
-    def __init__(
-        self,
-        n_states: int,
-        context_dim: Optional[int] = None,
-        hidden_dim: Optional[int] = None,
-        init_mode: str = "uniform",
-        temperature: float = 1.0,
-        scale: float = 1.0,
-        rank: Optional[int] = None,
-        cache_limit: int = 32,
-        debug: bool = False,
-    ):
-        super().__init__(
-            target_dim=n_states,
-            context_dim=context_dim,
-            hidden_dim=hidden_dim,
-            activation="tanh",
-            final_activation="tanh",
-            cache_enabled=True,
-            cache_limit=cache_limit,
-            debug=debug,
-        )
-
-        self.n_states = n_states
-        self.scale = scale
-        self.rank = rank
-        self.temperature = temperature
-
-        init_logits = self._init_logits(n_states, init_mode)
-        self.logits = nn.Parameter(init_logits.clone())
-        self.register_buffer("_logits_buffer", init_logits.clone())
-        self.register_buffer("_mod_logits_buffer", init_logits.clone())
-
-        # Contextual gates
-        self.context_gate: Optional[nn.Module] = None
-        self.residual_gate: Optional[nn.Module] = None
-        self._U: Optional[nn.Linear] = None
-        self._V: Optional[nn.Linear] = None
-
-        if context_dim is not None:
-            h = hidden_dim or 64
-            self.context_gate = nn.Sequential(
-                nn.Linear(context_dim, h, dtype=self.dtype, device=self.device),
-                nn.ReLU(),
-                nn.Linear(h, n_states, dtype=self.dtype, device=self.device),
-            )
-            self.residual_gate = nn.Sequential(
-                nn.Linear(context_dim, h, dtype=self.dtype, device=self.device),
-                nn.ReLU(),
-                nn.Linear(h, n_states, dtype=self.dtype, device=self.device),
-            )
-            if rank is not None:
-                self._U = nn.Linear(context_dim, n_states * rank, dtype=self.dtype, device=self.device)
-                self._V = nn.Linear(context_dim, rank, dtype=self.dtype, device=self.device)
-
-    # ---------------- Initialization ----------------
-    def _init_logits(self, n_states: int, mode: str) -> torch.Tensor:
-        if mode == "uniform":
-            logits = torch.full((n_states,), -math.log(n_states), dtype=self.dtype, device=self.device)
-        elif mode == "biased":
-            w = torch.linspace(0.8, 0.2, n_states, dtype=self.dtype, device=self.device)
-            logits = torch.log(w / w.sum())
-        elif mode == "normal":
-            logits = torch.randn(n_states, dtype=self.dtype, device=self.device) * 0.1
-        else:
-            raise ValueError(f"Unknown init_mode: {mode}")
-        return self._validate_logits(logits)
-
-    @torch.no_grad()
-    def initialize(self, mode: str = "uniform") -> Categorical:
-        logits = self._init_logits(self.n_states, mode)
-        self.logits.data.copy_(logits)
-        self._logits_buffer.copy_(logits)
-        self._mod_logits_buffer.copy_(logits)
-        self._invalidate_cache()
-        return self.dist_type(logits=logits)
-
-    # ---------------- Context hooks ----------------
-    def _context_gate(self, context_flat: torch.Tensor) -> torch.Tensor:
-        if self.context_gate is None:
-            return torch.zeros((context_flat.shape[0], self.n_states), dtype=self.dtype, device=self.device)
-        return self.context_gate(context_flat)
-
-    def _context_residual(self, context_flat: torch.Tensor) -> torch.Tensor:
-        if self.residual_gate is None:
-            return torch.zeros((context_flat.shape[0], self.n_states), dtype=self.dtype, device=self.device)
-        return self.residual_gate(context_flat)
-
-    def _context_low_rank(self, context_flat: torch.Tensor) -> torch.Tensor:
-        if self.rank is None or self._U is None or self._V is None:
-            return torch.zeros((context_flat.shape[0], self.n_states), dtype=self.dtype, device=self.device)
-        U = self._U(context_flat).view(-1, self.n_states, self.rank)
-        V = self._V(context_flat).view(-1, 1, self.rank)
-        return (U * V).sum(-1)
-
-    # ---------------- Distribution helper ----------------
-    def _dist_params(self, logits: torch.Tensor, tau: Optional[float] = None, **kwargs) -> dict:
-        return {"logits": logits, "tau": tau or self.temperature}
-
-    def _get_dist(self, context: Optional[torch.Tensor] = None, temperature: Optional[float] = None) -> Categorical:
-        mod = self._modulate(context, temperature)
-        tau = temperature or self.temperature
-        return self.dist_type(**self._dist_params(mod, tau=tau))
-
-    # ---------------- Forward / Sampling ----------------
-    def forward(self, context: Optional[torch.Tensor] = None, temperature: Optional[float] = None,
-                log: bool = False, return_dist: bool = False, **kwargs):
-        return super().forward(log=log, return_dist=return_dist, context=context, temperature=temperature, **kwargs)
-
-    def sample(self, context=None, temperature=None, **kwargs) -> torch.Tensor:
-        return super().sample(context=context, temperature=temperature, **kwargs)
-
-    def rsample(self, context=None, temperature=None, **kwargs) -> torch.Tensor:
-        dist = self._get_dist(context, temperature)
-        return dist.rsample() if getattr(dist, "has_rsample", False) else dist.sample()
-
-    def log_prob(self, x, context=None, temperature=None, **kwargs):
-        return super().log_prob(x, context=context, temperature=temperature, **kwargs)
-
-    def expected_probs(self, context=None, temperature=None, **kwargs):
-        return super().expected_probs(context=context, temperature=temperature, **kwargs)
-
-    def mode(self, context=None, temperature=None, **kwargs):
-        return super().mode(context=context, temperature=temperature, **kwargs)
-
-    # ---------------- EM-style / gradient update ----------------
-    @torch.no_grad()
-    def update(
-        self,
-        new_logits: Optional[torch.Tensor] = None,
-        posterior: Optional[torch.Tensor] = None,
-        from_probs: bool = False,
-        update_rate: Optional[float] = None,
-        temperature: Optional[float] = None,
-        context: Optional[torch.Tensor] = None,
-    ):
-        """
-        Updates base logits using either new logits (EM) or posterior (gradient).
-        """
-        if new_logits is not None:
-            if from_probs:
-                new_logits = torch.log(new_logits.clamp_min(EPS))
-            if temperature is not None:
-                new_logits = new_logits / max(temperature, 1e-6)
-            new_logits = self._validate_logits(new_logits)
-            self.logits.data.copy_(new_logits)
-            self._logits_buffer.copy_(new_logits)
-            self._mod_logits_buffer.copy_(new_logits)
-            self._invalidate_cache()
-            return
-
-        if posterior is not None and any(p.requires_grad for p in self.parameters()):
-            lr = update_rate or 1.0
-            mod_logits = self._apply_context(self.logits.unsqueeze(0), context)
-            temp = temperature or self.temperature
-            log_probs = F.log_softmax(mod_logits / max(temp, 1e-6), dim=-1)
-            loss = -(posterior * log_probs).sum() / (posterior.sum() + EPS)
-            self.zero_grad()
-            loss.backward()
-            with torch.no_grad():
-                for p in self.parameters():
-                    if p.grad is not None:
-                        p.data.add_(lr * p.grad)
-            self._invalidate_cache()
-
-
-class Duration(DistributionBase):
-    """
-    Categorical duration distribution per state for HSMMs with neural/contextual modulation.
-    """
-    _dist_type = Categorical
-
-    def __init__(
-        self,
-        n_states: int,
-        max_duration: int = 30,
-        context_dim: Optional[int] = None,
-        hidden_dim: Optional[int] = None,
-        min_temperature: float = 1e-6,
-        smooth_factor: float = 0.01,
-        rank: Optional[int] = None,
-        gate_factor: float = 0.5,
-        temperature: float = 1.0,
-        cache_limit: int = 32,
-        scale: float = 1.0,
-        debug: bool = False,
-        init_mode: str = "uniform",
-    ):
-        super().__init__(
-            target_dim=n_states * max_duration,
-            context_dim=context_dim,
-            hidden_dim=hidden_dim,
-            activation="tanh",
-            final_activation="tanh",
-            cache_enabled=True,
-            cache_limit=cache_limit,
-            debug=debug,
-        )
-
-        self.n_states = n_states
-        self.max_duration = max_duration
-        self.rank = rank
-        self.gate_factor = gate_factor
-        self.smooth_factor = smooth_factor
-        self.temperature = temperature
-        self.min_temperature = min_temperature
-
-        self.register_buffer("_durations", torch.arange(1, max_duration + 1, dtype=self.dtype, device=self.device))
-
-        # Initialize logits
-        init_logits = self._init_logits(n_states, max_duration, init_mode)
-        self.logits = nn.Parameter(init_logits.clone())
-        self.register_buffer("_logits_buffer", init_logits.clone())
-        self.register_buffer("_mod_logits_buffer", init_logits.clone())
-
-        # Context gates
-        self.context_gate: Optional[nn.Module] = None
-        self.residual_gate: Optional[nn.Module] = None
-        self._U: Optional[nn.Linear] = None
-        self._V: Optional[nn.Linear] = None
-
-        if context_dim is not None:
-            h = hidden_dim or 64
-            self.context_gate = nn.Sequential(
-                nn.Linear(context_dim, h, dtype=self.dtype, device=self.device),
-                nn.ReLU(),
-                nn.Linear(h, n_states, dtype=self.dtype, device=self.device),
-            )
-            self.residual_gate = nn.Sequential(
-                nn.Linear(context_dim, h, dtype=self.dtype, device=self.device),
-                nn.ReLU(),
-                nn.Linear(h, n_states, dtype=self.dtype, device=self.device),
-            )
-            if rank is not None:
-                self._U = nn.Linear(context_dim, n_states * rank, dtype=self.dtype, device=self.device)
-                self._V = nn.Linear(context_dim, rank, dtype=self.dtype, device=self.device)
-
-    # ---------------- Initialization ----------------
-    def _init_logits(self, n_states: int, max_duration: int, mode: str) -> torch.Tensor:
-        if mode == "uniform":
-            logits = torch.full((n_states, max_duration), -math.log(max_duration), dtype=self.dtype, device=self.device)
-        elif mode == "short_bias":
-            w = torch.linspace(0.7, 0.3, max_duration, dtype=self.dtype, device=self.device).unsqueeze(0).repeat(n_states, 1)
-            w /= w.sum(dim=1, keepdim=True)
-            logits = torch.log(w)
-        elif mode == "normal":
-            logits = torch.randn(n_states, max_duration, dtype=self.dtype, device=self.device) * 0.1
-            logits -= torch.arange(max_duration, dtype=self.dtype, device=self.device) * 0.05
-        else:
-            raise ValueError(f"Unknown init_mode '{mode}'")
-        return self._validate_logits(logits)
-
-    @torch.no_grad()
-    def initialize(self, mode: str = "uniform") -> Categorical:
-        logits = self._init_logits(self.n_states, self.max_duration, mode)
-        self.logits.data.copy_(logits)
-        self._logits_buffer.copy_(logits)
-        self._mod_logits_buffer.copy_(logits)
-        self._invalidate_cache()
-        return self._get_dist()
-
-    # ---------------- Context modulation ----------------
-    def _apply_context(self, logits: torch.Tensor, context: Optional[torch.Tensor]) -> torch.Tensor:
-        mod = super()._apply_context(logits, context)
-        if context is not None and self.context_gate is not None:
-            B, T, D = context.shape if context.ndim == 3 else (1, 1, context.numel())
-            ctx_flat = context.reshape(B * T, D)
-            gate = self.context_gate(ctx_flat).view(B, T, self.n_states, 1)
-            residual = self.residual_gate(ctx_flat).view(B, T, self.n_states, 1)
-            mod = mod + gate * self.gate_factor + residual * self.gate_factor
-
-            if self.rank is not None and self._U is not None and self._V is not None:
-                U = self._U(ctx_flat).view(B, T, self.n_states, self.rank)
-                V = self._V(ctx_flat).view(B, T, 1, self.rank)
-                mod = mod + (U * V).sum(-1)
-
-        if self.smooth_factor > 0:
-            mod = torch.log((1 - self.smooth_factor) * mod.exp() + self.smooth_factor)
-
-        return self._validate_logits(mod)
-
-    # ---------------- modulation ----------------
-    def _modulate(self, context: Optional[torch.Tensor] = None, temperature: Optional[float | torch.Tensor] = None, grad_safe: bool = False) -> torch.Tensor:
-        temp = torch.full_like(self.logits, self.temperature) if temperature is None else (
-            torch.full_like(self.logits, temperature) if isinstance(temperature, (float, int)) else temperature.clamp_min(self.min_temperature)
-        )
-
-        key = f"{self._context_hash(context)}-temp{float(temp.mean()):.6f}"
-        cached = self._cache_get(key)
-        if cached is not None:
-            return cached
-
-        mod = self._apply_context(self.logits, context)
-        mod = mod / temp
-        mod = mod - mod.logsumexp(dim=-1, keepdim=True)
-        mod = self._validate_logits(mod)
-
-        self._cache_set(key, mod.detach() if not grad_safe else mod)
-        return mod
-
-    # ---------------- Distribution helpers ----------------
-    def _dist_params(self, logits: torch.Tensor, tau: Optional[float] = None) -> dict:
-        return {"logits": logits, "tau": tau or self.temperature}
-
-    def _get_dist(self, context=None, temperature=None):
-        mod_logits = self._modulate(context=context, temperature=temperature)
-        tau = temperature or self.temperature
-        return self._dist_type(**self._dist_params(mod_logits, tau=tau))
-
-    # ---------------- Sampling / log-prob ----------------
-    def sample(self, context=None, temperature=None, hard=True, **kwargs):
-        return self._get_dist(context=context, temperature=temperature).sample(hard=hard)
-
-    def rsample(self, context=None, temperature=None, **kwargs):
-        return self._get_dist(context=context, temperature=temperature).rsample()
-
-    def log_prob(self, x, context=None, temperature=None, **kwargs):
-        return self._get_dist(context=context, temperature=temperature).log_prob(x)
-
-    def expected_probs(self, context=None, temperature=None, **kwargs):
-        return self._get_dist(context=context, temperature=temperature).probs
-
-    def mode(self, context=None, temperature=None, **kwargs):
-        dist = self._get_dist(context=context, temperature=temperature)
-        if hasattr(dist, "mode"):
-            return dist.mode
-        if hasattr(dist, "probs"):
-            return dist.probs.argmax(-1)
-        return torch.argmax(F.softmax(dist.logits, dim=-1), dim=-1)
-
-    # ---------------- EM / gradient update ----------------
-    @torch.no_grad()
-    def update(
-        self,
-        new_logits: Optional[torch.Tensor] = None,
-        posterior: Optional[torch.Tensor] = None,
-        from_probs: bool = False,
-        update_rate: Optional[float] = None,
-        temperature: Optional[float] = None,
-        context: Optional[torch.Tensor] = None,
-    ):
-        if new_logits is not None:
-            if from_probs:
-                new_logits = torch.log(new_logits.clamp_min(EPS))
-            if temperature is not None:
-                new_logits = new_logits / max(temperature, 1e-6)
-            new_logits = self._validate_logits(new_logits)
-            self.logits.data.copy_(new_logits)
-            self._logits_buffer.copy_(new_logits)
-            self._mod_logits_buffer.copy_(new_logits)
-            self._invalidate_cache()
-            return
-
-        if posterior is not None and any(p.requires_grad for p in self.parameters()):
-            mod_logits = self._modulate(context=context, temperature=temperature)
-            log_probs = F.log_softmax(mod_logits, dim=-1)
-            loss = -(posterior * log_probs).sum() / (posterior.sum() + EPS)
-            self.zero_grad()
-            loss.backward()
-            with torch.no_grad():
-                for p in self.parameters():
-                    if p.grad is not None:
-                        p.data.add_((update_rate or 1.0) * p.grad)
-            self._invalidate_cache()
-
-
-class Transition(DistributionBase):
-    """
-    Categorical transition distribution for HSMMs with neural/contextual modulation.
-    """
-    _dist_type = Categorical
-
-    def __init__(
-        self,
-        n_states: int,
-        context_dim: Optional[int] = None,
-        hidden_dim: Optional[int] = None,
-        rank: Optional[int] = None,
-        transition_type: Union[str, constraints.Transitions] = "ergodic",
-        init_mode: str = "diag_bias",
-        temperature: float = 1.0,
-        gate_factor: float = 0.5,
-        smooth_factor: float = 0.0,
-        cache_limit: int = 32,
-        scale: float = 1.0,
-        debug: bool = False,
-    ):
-        super().__init__(
-            target_dim=n_states * n_states,
-            context_dim=context_dim,
-            hidden_dim=hidden_dim,
-            activation="tanh",
-            final_activation="tanh",
-            cache_enabled=True,
-            cache_limit=cache_limit,
-            debug=debug,
-        )
-
-        self.n_states = n_states
-        self.rank = rank
-        self.transition_type = constraints._resolve_type(transition_type, constraints.Transitions)
-        self.gate_factor = gate_factor
-        self.smooth_factor = smooth_factor
-        self.temperature = temperature
-        self.scale = scale
-
-        # Base logits
-        init_logits = self._init_logits(n_states, init_mode)
-        self.logits = nn.Parameter(init_logits.clone())
-        self.register_buffer("_logits_buffer", init_logits.clone())
-        self.register_buffer("_mod_logits_buffer", init_logits.clone())
-
-        # Context gates / residuals / low-rank
-        self.context_gate: Optional[nn.Module] = None
-        self.residual_gate: Optional[nn.Module] = None
-        self._U: Optional[nn.Linear] = None
-        self._V: Optional[nn.Linear] = None
-        if context_dim is not None:
-            h = hidden_dim or 64
-            self.context_gate = nn.Sequential(
-                nn.Linear(context_dim, h, dtype=DTYPE, device=self.device),
-                nn.ReLU(),
-                nn.Linear(h, n_states, dtype=DTYPE, device=self.device),
-            )
-            self.residual_gate = nn.Sequential(
-                nn.Linear(context_dim, h, dtype=DTYPE, device=self.device),
-                nn.ReLU(),
-                nn.Linear(h, n_states, dtype=DTYPE, device=self.device),
-            )
-            if rank is not None:
-                self._U = nn.Linear(context_dim, n_states * rank, dtype=DTYPE, device=self.device)
-                self._V = nn.Linear(context_dim, rank, dtype=DTYPE, device=self.device)
-
-    # ---------------- Initialization ----------------
-    def _init_logits(self, n_states: int, mode: str) -> torch.Tensor:
-        if mode == "uniform":
-            logits = torch.full((n_states, n_states), -math.log(n_states), dtype=DTYPE, device=self.device)
-        elif mode == "diag_bias":
-            m = torch.full((n_states, n_states), 0.1, dtype=DTYPE, device=self.device)
-            m.fill_diagonal_(0.7)
-            m /= m.sum(dim=1, keepdim=True)
-            logits = torch.log(m)
-        elif mode == "normal":
-            logits = torch.randn(n_states, n_states, dtype=DTYPE, device=self.device) * 0.1
-        else:
-            raise ValueError(f"Unknown init_mode '{mode}'")
-        return self._apply_constraints(logits)
-
-    @torch.no_grad()
-    def initialize(self, mode: str = "diag_bias") -> Categorical:
-        logits = self._init_logits(self.n_states, mode)
-        self.logits.data.copy_(self._validate_logits(logits))
-        self._logits_buffer.copy_(self.logits)
-        self._mod_logits_buffer.copy_(self.logits)
-        self._invalidate_cache()
-        return self._get_dist()
-
-    # ---------------- Context modulation ----------------
-    def _apply_context(self, logits: torch.Tensor, context: Optional[torch.Tensor]) -> torch.Tensor:
-        mod = super()._apply_context(logits, context)
-        if context is not None and self.context_gate is not None:
-            B, T, D = context.shape if context.ndim == 3 else (1, 1, context.numel())
-            ctx_flat = context.reshape(B * T, D)
-            gate = self.context_gate(ctx_flat).view(B, T, self.n_states, 1)
-            residual = self.residual_gate(ctx_flat).view(B, T, self.n_states, 1)
-            mod = mod + gate * self.gate_factor + residual * self.gate_factor
-
-            if self.rank is not None and self._U is not None and self._V is not None:
-                U = self._U(ctx_flat).view(B, T, self.n_states, self.rank)
-                V = self._V(ctx_flat).view(B, T, 1, self.rank)
-                mod = mod + (U * V).sum(-1)
-
-        if self.smooth_factor > 0:
-            mod = torch.log((1 - self.smooth_factor) * mod.exp() + self.smooth_factor / self.n_states)
-
-        return self._apply_constraints(self._validate_logits(mod))
-
-    # ---------------- Unified modulation ----------------
-    def _modulate(self, context: Optional[torch.Tensor] = None, temperature: Optional[float | torch.Tensor] = None, grad_safe: bool = False) -> torch.Tensor:
-        temp = torch.full_like(self.logits, self.temperature) if temperature is None else (
-            torch.full_like(self.logits, temperature) if isinstance(temperature, (float, int)) else temperature.clamp_min(1e-6)
-        )
-        key = f"{self._context_hash(context)}-temp{float(temp.mean()):.6f}"
-        cached = self._cache_get(key)
-        if cached is not None:
-            return cached
-
-        mod = self._apply_context(self.logits, context)
-        mod = mod / temp
-        mod = mod - mod.logsumexp(dim=-1, keepdim=True)
-        mod = self._validate_logits(mod)
-        self._cache_set(key, mod.detach() if not grad_safe else mod)
-        return mod
-
-    # ---------------- Structural constraints ----------------
-    def _apply_constraints(self, logits: torch.Tensor) -> torch.Tensor:
-        logits = logits.clone()
-        n = self.n_states
-        if self.transition_type == "semi":
-            mask = torch.eye(n, dtype=torch.bool, device=logits.device)
-            logits[..., mask] = -float("inf")
-        elif self.transition_type == "left-to-right":
-            tril_mask = torch.tril(torch.ones(n, n, dtype=torch.bool, device=logits.device), -1)
-            logits[..., tril_mask] = -float("inf")
-        return logits
-
-    # ---------------- Distribution helpers ----------------
-    def _dist_params(self, logits: torch.Tensor, tau: Optional[float] = None) -> dict:
-        return {"logits": logits, "tau": tau or self.temperature}
-
-    def _get_dist(self, context=None, temperature=None):
-        mod_logits = self._modulate(context=context, temperature=temperature)
-        tau = temperature or self.temperature
-        return self._dist_type(**self._dist_params(mod_logits, tau=tau))
-
-    # ---------------- Sampling / Log-prob ----------------
-    def sample(self, context=None, temperature=None, hard=True, **kwargs):
-        return self._get_dist(context=context, temperature=temperature).sample(hard=hard)
-
-    def log_prob(self, x, context=None, temperature=None, **kwargs):
-        return self._get_dist(context=context, temperature=temperature).log_prob(x)
-
-    def expected_probs(self, context=None, temperature=None):
-        return self._get_dist(context=context, temperature=temperature).probs
-
-    def mode(self, context=None, temperature=None, **kwargs):
-        dist = self._get_dist(context=context, temperature=temperature)
-        if hasattr(dist, "mode"):
-            return dist.mode
-        if hasattr(dist, "probs"):
-            return dist.probs.argmax(-1)
-        return torch.argmax(F.softmax(dist.logits, dim=-1), dim=-1)
-
-    # ---------------- EM / Learnable update ----------------
-    @torch.no_grad()
-    def update(self, new_logits=None, posterior=None, from_probs=False, update_rate=None, temperature=None, context=None):
-        if new_logits is not None:
-            if from_probs:
-                new_logits = torch.log(new_logits.clamp_min(EPS))
-            if temperature is not None:
-                new_logits = new_logits / max(temperature, 1e-6)
-            new_logits = self._apply_constraints(new_logits)
-            self.logits.data.copy_(self._validate_logits(new_logits))
-            self._logits_buffer.copy_(self.logits)
-            self._mod_logits_buffer.copy_(self.logits)
-            self._invalidate_cache()
-            return
-
-        if posterior is not None and any(p.requires_grad for p in self.parameters()):
-            mod_logits = self._modulate(context=context, temperature=temperature)
-            log_probs = F.log_softmax(mod_logits, dim=-1)
-            loss = -(posterior * log_probs).sum() / posterior.sum()
-            self.zero_grad()
-            loss.backward()
-            for p in self.parameters():
-                if p.grad is not None:
-                    p.data.add_((update_rate or 1.0) * p.grad)
-            self._invalidate_cache()
 
