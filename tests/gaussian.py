@@ -169,8 +169,8 @@ class CNN_LSTM_Encoder(nn.Module):
         use_packed: bool = True,
     ):
         super().__init__()
-        self.return_sequence = return_sequence
         self.use_packed = use_packed
+        self.return_sequence = return_sequence
         self._context: Optional[torch.Tensor] = None
 
         # CNN
@@ -284,7 +284,7 @@ if __name__ == "__main__":
 
     # --- Initialize HSMM ---
     model = HSMM(
-        encoder=encoder,
+        # encoder=encoder,
         n_states=n_states,
         n_features=n_features,
         max_duration=MAX_DURATION,

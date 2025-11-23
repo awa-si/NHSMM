@@ -1,12 +1,21 @@
 import torch
+import torch.nn.functional as F
 from dataclasses import dataclass
 from typing import List, Optional, Union, Tuple
 
 
 @dataclass(frozen=False)
 class Observations:
-    """Container for sequences, optional log-probs, context vectors, and masks."""
-    
+    """
+    Container for sequences, optional log-probs, context vectors, and masks.
+
+    Attributes:
+        sequence: List of [T,F] or [B,T,F] tensors.
+        lengths: List of sequence lengths.
+        log_probs: Optional per-sequence log-probabilities.
+        context: Optional per-sequence context ([T,H] or [B,T,H]).
+        mask: Optional per-sequence mask ([T,1] or [B,T,1]).
+    """
     sequence: List[torch.Tensor]
     lengths: Optional[List[int]] = None
     log_probs: Optional[List[torch.Tensor]] = None
@@ -19,20 +28,20 @@ class Observations:
         if not all(torch.is_tensor(s) for s in self.sequence):
             raise TypeError("All elements in `sequence` must be torch.Tensor.")
 
-        # Lengths
+        # Compute lengths
         seq_lengths = self.lengths or [s.shape[0] for s in self.sequence]
         if any(s.shape[0] != l for s, l in zip(self.sequence, seq_lengths)):
             raise ValueError("Mismatch between sequence lengths and `lengths`.")
         object.__setattr__(self, "lengths", seq_lengths)
 
-        # Log probs
+        # Validate log_probs
         if self.log_probs is not None:
             if len(self.log_probs) != len(self.sequence):
                 raise ValueError("`log_probs` length must match `sequence` length.")
             if not all(torch.is_tensor(lp) for lp in self.log_probs):
                 raise TypeError("All elements in `log_probs` must be torch.Tensor.")
 
-        # Context
+        # Validate context
         if self.context is not None:
             if len(self.context) != len(self.sequence):
                 raise ValueError("`context` length must match `sequence` length.")
@@ -41,7 +50,7 @@ class Observations:
         else:
             object.__setattr__(self, "context", [None] * len(self.sequence))
 
-        # Mask
+        # Validate mask
         if self.mask is not None:
             if len(self.mask) != len(self.sequence):
                 raise ValueError("`mask` length must match `sequence` length.")
@@ -83,7 +92,7 @@ class Observations:
     def dtype(self) -> torch.dtype:
         return self.sequence[0].dtype
 
-    # ---------------- Device / Clone Ops ----------------
+    # ---------------- Device / Clone Operations ----------------
     def to(self, device: Union[str, torch.device], dtype: Optional[torch.dtype] = None) -> "Observations":
         dtype = dtype or self.dtype
         return Observations(
@@ -153,7 +162,7 @@ class Observations:
         return tensor
 
     def expand_context(self) -> None:
-        """Broadcast context [B, H] to [B, T, H] for each sequence."""
+        """Broadcast context [B,H] or [H] to [T,H] for each sequence."""
         if self.context is None:
             return
         for i, c in enumerate(self.context):

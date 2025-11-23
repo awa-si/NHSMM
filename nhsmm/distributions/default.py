@@ -1,4 +1,5 @@
 # nhsmm/distributions/default.py
+# per timestep feature vector
 
 import math
 from collections import OrderedDict
@@ -1077,6 +1078,7 @@ class Emission(DistributionBase):
         allow_projection: bool = True,
         temperature: float = 1.0,
         debug: bool = False,
+        scale: float = 1.0,
         dof: float = 5.0,
         seed: int = 0,
     ):
@@ -1098,6 +1100,7 @@ class Emission(DistributionBase):
         self.modulate_var = modulate_var
         self.temperature = temperature
         self.min_covar = min_covar
+        self.scale = scale
         self.seed = seed
         self.dof = dof
 
@@ -1569,76 +1572,107 @@ class Emission(DistributionBase):
         return new_dist
 
     @torch.no_grad()
-    def initialize(self, X: Optional[torch.Tensor] = None, context: Optional[torch.Tensor] = None, mode: str = "data", iters: int = 15, theta: Optional[torch.Tensor] = None, theta_scale: float = 0.1, temperature: Optional[float] = None):
-        if X is None or mode == "default":
-            return self.forward(context=context, temperature=temperature, return_dist=True)
-
+    def initialize(
+        self,
+        X: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        theta: Optional[torch.Tensor] = None,
+        temperature: Optional[float] = None,
+        theta_scale: float = 0.1,
+        mode: str = "data",
+        iters: int = 15,
+    ):
+        """
+        Initialize emission distribution from data, optional theta/context modulation.
+        
+        Args:
+            X: [N,F] or [B,T,F] input data
+            context: Optional context tensor
+            mode: 'data' for global mean/cov, 'kmeans' for KMeans initialization
+            iters: iterations for KMeans
+            theta: optional additive context
+            theta_scale: scaling for theta
+            temperature: optional temperature scaling
+        """
         K, F = self.n_states, self.n_features
-        Xf = X.reshape(-1, F).to(dtype=DTYPE) if X.ndim == 3 else X.to(dtype=DTYPE)
-        device = Xf.device
+
+        # Flatten batch sequences
+        if X is None:
+            return self.forward(context=context, temperature=temperature, return_dist=True)
+        Xf = X.reshape(-1, F).to(dtype=DTYPE, device=self.device)
         N = Xf.shape[0]
 
+        # KMeans helper
         def run_kmeans(Xflat, K, iters):
-            idx = torch.randperm(Xflat.shape[0], device=device)[:K]
+            idx = torch.randperm(Xflat.shape[0], device=self.device)[:K]
             centers = Xflat[idx].clone()
             for _ in range(iters):
                 dist = torch.cdist(Xflat, centers)
                 labels = dist.argmin(dim=1)
                 for k in range(K):
                     pts = Xflat[labels == k]
-                    if pts.shape[0] >= 2:
+                    if pts.shape[0] > 0:
                         centers[k] = pts.mean(dim=0)
             return centers, labels
 
         # Initialize means/covariances
         if mode == "data":
             mean = Xf.mean(dim=0)
-            cov = (Xf - mean).T @ (Xf - mean) / max(N - 1, 1) + self.min_covar * torch.eye(F, device=device)
+            cov = (Xf - mean).T @ (Xf - mean) / max(N - 1, 1) + self.min_covar * torch.eye(F, device=self.device)
             means = mean.expand(K, F).clone()
             covs = cov.unsqueeze(0).expand(K, F, F).clone()
         elif mode == "kmeans":
             centers, labels = run_kmeans(Xf, K, iters)
             means = centers
-            covs = torch.stack([torch.cov(Xf[labels == k].T) + self.min_covar * torch.eye(F, device=device) for k in range(K)])
+            covs = torch.stack([
+                torch.cov(Xf[labels == k].T) + self.min_covar * torch.eye(F, device=self.device)
+                if (labels == k).sum() > 1 else torch.eye(F, device=self.device) * self.min_covar
+                for k in range(K)
+            ])
         else:
             raise ValueError(f"Unsupported initialization mode: {mode}")
 
-        # Theta & context modulation
+        # Apply theta modulation
         if theta is not None:
             theta_vec = theta.mean(dim=0) if theta.ndim > 1 else theta
             means += theta_scale * theta_vec.unsqueeze(0)
+
+        # Apply context & temperature modulation
         means = self._modulate(means, context=context, temperature=temperature)
 
         self._emission_means.copy_(means)
         self._emission_covs.copy_(covs)
 
-        # Construct distribution
+        # Construct distribution based on emission type
         if self.emission_type == "gaussian":
             self.mu.copy_(means)
             cov_diag = torch.diagonal(covs, dim1=-2, dim2=-1)
             cov_diag = cov_diag[:, :F] if cov_diag.shape != self.log_var.shape else cov_diag
             self.log_var.copy_(torch.log(torch.clamp(cov_diag, min=EPS)))
             return Independent(MultivariateNormal(means, covariance_matrix=covs), 1)
+
         elif self.emission_type in {"laplace", "studentt"}:
             scale = torch.sqrt(torch.diagonal(covs, dim1=-2, dim2=-1)).clamp_min(self.min_covar)
             self.loc.copy_(means)
             self.scale_param.copy_(scale)
             dist_cls = Laplace if self.emission_type == "laplace" else StudentT
             return Independent(dist_cls(loc=means, scale=scale), 1)
+
         else:  # Discrete
             if mode == "data":
                 logits = torch.log_softmax(Xf.mean(dim=0).expand(K, F), dim=-1)
             else:
-                logits = means
+                logits = means  # fallback
             logits = self._modulate(logits, context=context, temperature=temperature)
             param_attr = getattr(self, "logits", getattr(self, "log_rate", None))
             if param_attr is not None:
                 param_attr.copy_(logits)
             self._emission_params.copy_(logits)
+
             if self.emission_type == "categorical":
                 return Categorical(logits=logits)
             elif self.emission_type == "bernoulli":
                 return Independent(Bernoulli(logits=logits), 1)
-            else:
+            else:  # Poisson
                 return Independent(Poisson(rate=torch.exp(logits)), 1)
 
