@@ -145,40 +145,38 @@ def print_duration_summary(model):
 # -------------------------
 class CNN_LSTM_Encoder(nn.Module):
     """
-    CNN + LSTM feature encoder, fully future-safe.
+    CNN + LSTM sequence encoder with ContextEncoder-compatible context.
 
     Input:
         x: [B, T, F]
         mask: optional [B, T] (1 for valid, 0 for padding)
 
     Output:
-        if return_mode="sequence": [B, T, out_dim]
-        if return_mode="last":     [B, out_dim]
-
-    Notes:
-        - _context always holds pooled sequence-level representation [B, out_dim]
-        - Fully compatible with ContextEncoder wrapper
+        - sequence: [B, T, out_dim] if return_sequence=True
+        - last valid timestep: [B, out_dim] if return_sequence=False
+        - _context: always pooled sequence-level [B, 1, out_dim]
     """
 
     def __init__(
         self,
         n_features: int,
-        hidden_dim: int = 16,
-        cnn_channels: int = 8,
+        hidden_dim: int = 32,
+        cnn_channels: int = 16,
         kernel_size: int = 3,
         dropout: float = 0.1,
         bidirectional: bool = True,
-        return_mode: str = "sequence",  # "sequence" or "last"
+        return_sequence: bool = True,
+        use_packed: bool = True,
     ):
         super().__init__()
-        assert return_mode in ("sequence", "last")
-        self.return_mode = return_mode
+        self.return_sequence = return_sequence
+        self.use_packed = use_packed
         self._context: Optional[torch.Tensor] = None
 
         # CNN
         padding = kernel_size // 2
-        self.conv1 = nn.Conv1d(n_features, cnn_channels, kernel_size, padding=padding)
-        self.cnn_norm = nn.LayerNorm(cnn_channels)
+        self.conv = nn.Conv1d(n_features, cnn_channels, kernel_size, padding=padding)
+        self.norm = nn.LayerNorm(cnn_channels)
 
         # LSTM
         self.lstm = nn.LSTM(
@@ -191,60 +189,65 @@ class CNN_LSTM_Encoder(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.out_dim = hidden_dim * (2 if bidirectional else 1)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Forward pass.
-
-        Args:
-            x: [B, T, F]
-            mask: optional [B, T], 1 for valid, 0 for padding
-
-        Returns:
-            [B, T, out_dim] if return_mode="sequence"
-            [B, out_dim] if return_mode="last"
-        """
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
+        if x.ndim == 2:
+            x = x.unsqueeze(0)  # handle single sequence
         B, T, F_in = x.shape
         if T == 0:
             raise ValueError("Input sequence has zero length")
 
-        # ---- CNN ----
-        x_cnn = x.transpose(1, 2)          # [B, F, T]
-        x_cnn = F.relu(self.conv1(x_cnn))  # [B, C, T]
-        x_cnn = x_cnn.transpose(1, 2)      # [B, T, C]
-        x_cnn = self.cnn_norm(x_cnn)
-        x_cnn = self.dropout(x_cnn)
+        # --- CNN ---
+        x_c = x.transpose(1, 2)        # [B, F, T]
+        x_c = F.relu(self.conv(x_c))   # [B, C, T]
+        x_c = x_c.transpose(1, 2)      # [B, T, C]
+        x_c = self.norm(x_c)
+        x_c = self.dropout(x_c)
 
-        # ---- LSTM ----
-        if mask is not None:
-            lengths = mask.sum(dim=1).cpu()
-            packed = nn.utils.rnn.pack_padded_sequence(x_cnn, lengths, batch_first=True, enforce_sorted=False)
+        # --- LSTM ---
+        if mask is not None and self.use_packed:
+            mask = mask.bool()
+            lengths = mask.sum(dim=1).clamp_min(1)
+            packed = nn.utils.rnn.pack_padded_sequence(
+                x_c, lengths.cpu(), batch_first=True, enforce_sorted=False
+            )
             out_packed, _ = self.lstm(packed)
             out, _ = nn.utils.rnn.pad_packed_sequence(out_packed, batch_first=True, total_length=T)
         else:
-            out, _ = self.lstm(x_cnn)
-        out = self.dropout(out)
+            out, _ = self.lstm(x_c)
+        out = self.dropout(out)  # [B, T, D]
 
-        # ---- Pooled context ----
+        # --- Pooled context (mean over valid timesteps) ---
         if mask is not None:
             mask_f = mask.unsqueeze(-1)
-            pooled = (out * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp_min(1)
+            denom = mask_f.sum(dim=1).clamp_min(1)
+            pooled = (out * mask_f).sum(dim=1) / denom
         else:
             pooled = out.mean(dim=1)
-        self._context = pooled  # always [B, out_dim]
 
-        # ---- Return ----
-        if self.return_mode == "last":
+        self._context = pooled  # [B, D]
+
+        # --- Return ---
+        if self.return_sequence:
+            return out
+        else:
             if mask is not None:
                 idx = mask.sum(dim=1).clamp_min(1) - 1
-                return out[torch.arange(B), idx]  # last valid timestep per sequence
+                return out[torch.arange(B), idx]
             return out[:, -1, :]
-        return out
 
-    def get_context(self, detach: bool = True) -> Optional[torch.Tensor]:
-        """Return pooled context [B, out_dim]"""
+    # ---------------- Context Utilities ----------------
+    def get_context(self, n_states: Optional[int] = None, detach: bool = True):
+        """
+        Returns ContextEncoder-compatible context:
+          - canonical: [B, 1, F]
+          - per-state: [B, n_states, F] if n_states is given
+        """
         if self._context is None:
             return None
-        return self._context.detach() if detach else self._context
+        ctx = self._context.unsqueeze(1)  # [B, 1, F]
+        if n_states is not None:
+            ctx = ctx.expand(-1, n_states, -1)  # [B, n_states, F]
+        return ctx.detach() if detach else ctx
 
 # ============================================================
 # Main execution
@@ -276,20 +279,19 @@ if __name__ == "__main__":
     X_torch = torch.tensor(X_scaled, dtype=DTYPE)
 
     # Build encoder and NHSMM
-    encoder = CNN_LSTM_Encoder(n_features=n_features, cnn_channels=5, hidden_dim=16)
-    encoder.to(device)
+    hidden_dim = max(16, min(64, n_features * 2))
+    encoder = CNN_LSTM_Encoder(n_features=n_features, cnn_channels=5, hidden_dim=hidden_dim)
 
     # --- Initialize HSMM ---
     model = HSMM(
-        # encoder=encoder,
+        encoder=encoder,
         n_states=n_states,
         n_features=n_features,
         max_duration=MAX_DURATION,
         seed=DEFAULT_RNG_SEED,
         min_covar=1e-3,
         alpha=1.0,
-    ).to(device)
-    # model.emission_module.initialize(X=X_torch)
+    )
 
     print("[Init] Duration logits differentiated per state.")
 
