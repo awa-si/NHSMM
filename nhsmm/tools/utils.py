@@ -1,6 +1,6 @@
 import torch
 from dataclasses import dataclass
-from typing import List, Optional, Union, Tuple
+from typing import Dict, List, Optional, Union, Tuple
 
 
 @dataclass(frozen=False)
@@ -258,11 +258,6 @@ class Observations:
             f"feature_dim={self.feature_dim}, "
             f"mask_coverage={[m.sum().item() for m in self.mask]})"
         )
-
-
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union, Dict
-import torch
 
 
 @dataclass(frozen=False)

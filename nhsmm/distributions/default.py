@@ -132,7 +132,6 @@ class DistributionBase(nn.Module):
     ):
         super().__init__()
 
-        # Core dims
         self.target_dim = target_dim
         self.context_dim = context_dim
         self.allow_projection = allow_projection
@@ -199,8 +198,6 @@ class DistributionBase(nn.Module):
         # Base logits
         self.logits = nn.Parameter(torch.zeros(target_dim, dtype=DTYPE))
 
-
-    # ---------------- Helpers ----------------
     def _get_activation(self, name: str) -> nn.Module:
         return {
             "tanh": nn.Tanh(),
@@ -217,8 +214,7 @@ class DistributionBase(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-                    
-    # ---------------- Context modulation ----------------
+
     def _apply_context(
         self,
         base: torch.Tensor,
@@ -307,7 +303,6 @@ class DistributionBase(nn.Module):
 
         return self._apply_constraints(base_expanded + delta)
 
-    # ---------------- Unified modulate with caching ----------------
     def _modulate(self, context=None, temperature=None, grad_safe=False) -> torch.Tensor:
         tau = temperature if temperature is not None else getattr(self, "temperature", 1.0)
         tau_tensor = torch.as_tensor(float(tau), dtype=DTYPE, device=getattr(self, "logits", torch.tensor(0.0)).device)
@@ -324,7 +319,6 @@ class DistributionBase(nn.Module):
         self._cache_set(key, mod if grad_safe else mod.detach())
         return mod
 
-    # ---------------- Distribution parameters ----------------
     def _dist_params(self, logits: torch.Tensor, tau: Optional[float] = None, **kwargs) -> dict:
         tau_val = tau or torch.exp(self.log_temperature)
         mod_logits = logits / tau_val.clamp_min(EPS)
@@ -332,7 +326,6 @@ class DistributionBase(nn.Module):
         mod_logits = self._validate_logits(mod_logits)
         return {"logits": mod_logits, **kwargs}
 
-    # ---------------- Distribution API ----------------
     def forward(self, log=False, return_dist=False, context: Optional[torch.Tensor] = None, temperature: Optional[float] = None, **dist_kwargs):
         mod = self._modulate(context, temperature)
         dist = self.dist_type(**self._dist_params(mod, tau=temperature, **dist_kwargs))
@@ -369,7 +362,6 @@ class DistributionBase(nn.Module):
         if hasattr(dist, "probs"): return dist.probs.argmax(-1)
         return torch.argmax(F.softmax(dist.logits, dim=-1), dim=-1)
 
-    # ---------------- Utilities ----------------
     @torch.no_grad()
     def _context_hash(self, context: Optional[torch.Tensor]) -> str:
         if context is None:
@@ -394,8 +386,8 @@ class DistributionBase(nn.Module):
 
     @torch.no_grad()
     def _invalidate_cache(self):
-        self._cache.clear()
         self._param_version += 1
+        self._cache.clear()
 
     # ---------------- Placeholder methods ----------------
     def _apply_constraints(self, logits: torch.Tensor) -> torch.Tensor:
@@ -422,11 +414,12 @@ class DistributionBase(nn.Module):
     # --- Unified EM / learnable update ---
     @torch.no_grad()
     def update(self, new_logits: Optional[torch.Tensor] = None,
-               posterior: Optional[torch.Tensor] = None,
-               from_probs: bool = False,
-               update_rate: Optional[float] = None,
-               temperature: Optional[float] = None,
-               context: Optional[torch.Tensor] = None):
+        posterior: Optional[torch.Tensor] = None,
+        from_probs: bool = False,
+        update_rate: Optional[float] = None,
+        temperature: Optional[float] = None,
+        context: Optional[torch.Tensor] = None
+    ):
         # --- Direct replacement ---
         if new_logits is not None:
             while new_logits.ndim > 2: new_logits = new_logits.squeeze(0)
@@ -918,224 +911,282 @@ class Emission(DistributionBase):
                 nn.ReLU(),
                 nn.Linear(hidden_dim, n_states * n_features),
             )
-            self.context_proj_layer = nn.Linear(context_dim, n_features) if context_dim != n_features else None
         else:
             self.context_gate = None
-            self.context_proj_layer = None
 
     # ------------------- Context / Modulation -------------------
-    def _modulate(self, params: torch.Tensor, context: Optional[torch.Tensor] = None,
-                  temperature: Optional[float] = None, grad_safe: bool = False) -> torch.Tensor:
+    def _modulate(
+        self,
+        params: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+        temperature: Optional[float] = None,
+        grad_safe: bool = False,
+    ) -> torch.Tensor:
+        """
+        Modulate parameters using optional context and temperature.
+        Continuous emissions: additive context modulation.
+        Discrete emissions: scaled by temperature only.
+        Relies on DistributionBase._apply_context for broadcasting and adapters.
+        """
         tau = max(temperature or self.temperature, EPS)
+        etype = self.emission_type
 
-        if self.emission_type in {"gaussian", "laplace", "studentt"} and context is not None:
-            K, F = params.shape
-            if context.ndim == 1:
-                context = context.view(1, 1, -1)
-            elif context.ndim == 2:
-                context = context.unsqueeze(0)
-            B, T, H = context.shape
-
-            if self.context_gate:
-                context_mod = self.context_gate(context.reshape(B*T, H)).reshape(B, T, K, F)
-            elif self.context_proj_layer:
-                context_mod = self.context_proj_layer(context).unsqueeze(2).expand(B, T, K, F)
-            else:
-                if H != F:
-                    raise ValueError(f"Context dim {H} != feature dim {F}")
-                context_mod = context.unsqueeze(2).expand(B, T, K, F)
-
-            out = params.unsqueeze(0).unsqueeze(0).expand(B, T, K, F) + context_mod
+        if etype in {"gaussian", "laplace", "studentt"}:
+            # _apply_context handles batch/sequence/feature broadcasting internally
+            out = self._apply_context(params, context)
             out = out / tau
+
+        elif etype in {"categorical", "bernoulli", "poisson"}:
+            # Discrete emissions: scale by temperature only
+            out = params / tau
+
         else:
-            out = params / tau if self.emission_type in {"categorical", "bernoulli", "poisson"} else params
+            raise ValueError(f"Unsupported emission_type: {etype}")
 
         return out if grad_safe else out.detach()
 
     # ------------------- Distribution Construction -------------------
-    def _dist_params(self, tensor: torch.Tensor, temperature: Optional[float] = None,
-                     context: Optional[torch.Tensor] = None, grad_safe: bool = False, **kwargs) -> dict:
-        mod_tensor = self._modulate(tensor, context=context, temperature=temperature, grad_safe=grad_safe)
+    def _dist_params(
+        self,
+        tensor: torch.Tensor,
+        temperature: Optional[float] = None,
+        context: Optional[torch.Tensor] = None,
+        grad_safe: bool = False,
+        **kwargs
+    ) -> dict:
+        """
+        Construct distribution parameters using context modulation.
+        Continuous: modulate means/loc.
+        Discrete: modulate logits.
+        Variance/scale/covariance remains static.
+        """
         etype = self.emission_type
 
+        # Location/logit modulation
+        loc = self._modulate(tensor, context=context, temperature=temperature, grad_safe=grad_safe)
+
         if etype in {"categorical", "bernoulli", "poisson"}:
-            return {"logits": mod_tensor, **kwargs}
+            return {"logits": loc, **kwargs}
 
         if etype == "gaussian":
-            var = F.softplus(self.log_var).clamp_min(self.min_covar)
-            cov = torch.diag_embed(var)
-        else:
-            scale = self.scale_param.clamp_min(self.min_covar)
-            cov = torch.diag_embed(scale ** 2)
+            var = F.softplus(self.log_var).clamp_min(self.min_covar)  # [K, F]
+            cov = torch.diag_embed(var)                                 # [K, F, F]
 
-        return {"means": mod_tensor, "cov": cov, **kwargs}
+            # Broadcast to batch/time dims automatically handled by _apply_context
+            while cov.ndim < loc.ndim:
+                cov = cov.unsqueeze(0)
 
-    def _get_continuous_dist(self, X=None, theta=None, context=None, posterior=None,
-                             theta_scale=0.1, temperature=None, max_jitter=5):
+            return {"means": loc, "cov": cov, **kwargs}
+
+        if etype in {"laplace", "studentt"}:
+            scale = self.scale_param.clamp_min(self.min_covar)  # [K, F]
+            while scale.ndim < loc.ndim:
+                scale = scale.unsqueeze(0)
+            return {"loc": loc, "scale": scale, **kwargs}
+
+        raise ValueError(f"Unsupported emission_type: {etype}")
+
+    def _get_continuous_dist(
+        self,
+        X: Optional[torch.Tensor] = None,
+        theta: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        posterior: Optional[torch.Tensor] = None,
+        theta_scale: float = 0.1,
+        temperature: Optional[float] = None,
+        max_jitter: int = 5,
+    ):
         K, F = self.n_states, self.n_features
+
+        # ---------------- Base means ----------------
         means = self._emission_means.clone()
 
+        # Weighted mean with posterior
         if X is not None and posterior is not None:
             w = posterior.clamp_min(EPS)
             w_sum = w.sum(dim=0) + EPS
             means = (w.T @ X) / w_sum.unsqueeze(1)
 
+        # Theta modulation
         if theta is not None:
             theta_vec = theta.mean(dim=0) if theta.ndim > 1 else theta
             means = means + theta_scale * theta_vec.unsqueeze(0)
 
-        means = self._modulate(means, context=context, temperature=temperature)
+        # Context + temperature modulation
+        means_mod = self._modulate(means, context=context, temperature=temperature)
 
+        # ---------------- Gaussian ----------------
         if self.emission_type == "gaussian":
             covs = self._emission_covs.clone()
-            I = torch.eye(F)
+            I = torch.eye(F, dtype=covs.dtype, device=covs.device)
             for k in range(K):
                 jitter = self.min_covar
                 for _ in range(max_jitter):
                     _, info = torch.linalg.cholesky_ex(covs[k])
-                    if info == 0: break
+                    if info == 0:
+                        break
                     covs[k] += jitter * I
                     jitter *= 2
-            self._emission_means.copy_(means)
-            self._emission_covs.copy_(covs)
-            self.dist_type = lambda *a, **kw: Independent(MultivariateNormal(*a, **kw), 1)
-            return MultivariateNormal(means, covariance_matrix=covs)
 
+            self._emission_means.copy_(means_mod)
+            self._emission_covs.copy_(covs)
+            return MultivariateNormal(means_mod, covariance_matrix=covs)
+
+        # ---------------- Laplace / StudentT ----------------
         if X is not None and posterior is not None:
             scales = ((X[:, None, :] - means[None, :, :]).abs() * w[:, :, None]).sum(dim=0) / w_sum[:, None]
         else:
             scales = self._emission_covs.diagonal(dim1=-2, dim2=-1).sqrt()
         scales = scales.clamp_min(self.min_covar)
-        self._emission_means.copy_(means)
-        self._emission_covs.copy_(torch.diag_embed(scales ** 2))
-        dist_cls = Laplace if self.emission_type == "laplace" else lambda **kw: StudentT(df=self.dof, **kw)
-        self.dist_type = lambda *a, **kw: Independent(dist_cls(*a, **kw), 1)
-        return Independent(dist_cls(loc=means, scale=scales), 1)
 
-    def _get_discrete_dist(self, X=None, theta=None, context=None, posterior=None,
-                           theta_scale=0.1, temperature=None):
+        self._emission_means.copy_(means_mod)
+        self._emission_covs.copy_(torch.diag_embed(scales ** 2))
+
+        dist_params = self._dist_params(
+            tensor=means_mod,
+            context=context,
+            temperature=temperature,
+            grad_safe=False
+        )
+        dist_cls = Laplace if self.emission_type == "laplace" else StudentT
+        return Independent(dist_cls(loc=dist_params["loc"], scale=dist_params["scale"]), 1)
+
+    def _get_discrete_dist(
+        self,
+        X: Optional[torch.Tensor] = None,
+        theta: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        posterior: Optional[torch.Tensor] = None,
+        theta_scale: float = 0.1,
+        temperature: Optional[float] = None,
+    ):
         K, F = self.n_states, self.n_features
         etype = self.emission_type
 
+        # ---------------- Base logits ----------------
         if X is not None and posterior is not None:
             w = posterior.clamp_min(EPS)
             w_sum = w.sum(dim=0) + EPS
+
             if etype == "categorical":
-                logits = torch.zeros(K, F)
+                # Weighted counts per state
+                counts = torch.zeros((K, F), dtype=DTYPE, device=X.device)
                 for k in range(K):
-                    counts = torch.bincount(X.long(), weights=w[:, k], minlength=F)
-                    logits[k] = torch.log(counts.clamp_min(EPS) / counts.sum().clamp_min(EPS))
+                    counts[k] = torch.bincount(X.long(), weights=w[:, k], minlength=F)
+                logits = torch.log((counts / counts.sum(dim=-1, keepdim=True)).clamp_min(EPS))
             else:
+                # Bernoulli / Poisson: rate log
                 rate = (w.T @ X.float()) / w_sum.unsqueeze(1)
                 logits = torch.log(rate.clamp_min(EPS))
         else:
-            logits = torch.full((K, F), -math.log(F), dtype=DTYPE)
+            logits = torch.full((K, F), -math.log(F), dtype=DTYPE, device=getattr(self, "_emission_params", torch.zeros(1)).device)
 
+        # ---------------- Theta modulation ----------------
         if theta is not None:
             theta_vec = theta.mean(dim=0) if theta.ndim > 1 else theta
             logits = logits + theta_scale * theta_vec.unsqueeze(0)
 
-        logits = self._modulate(logits, context=context, temperature=temperature)
-        self._emission_params.copy_(logits)
+        # ---------------- Context + temperature modulation ----------------
+        logits_mod = self._modulate(logits, context=context, temperature=temperature)
 
+        # Update emission buffer safely
+        if hasattr(self, "_emission_params"):
+            self._emission_params.copy_(logits_mod)
+
+        # ---------------- Use _dist_params abstraction ----------------
+        dist_params = self._dist_params(
+            tensor=logits_mod,
+            context=context,
+            temperature=temperature,
+            grad_safe=False
+        )
+
+        # ---------------- Construct distribution ----------------
         if etype == "categorical":
             self.dist_type = Categorical
-            return Categorical(logits=logits)
-        elif etype == "bernoulli":
-            self.dist_type = lambda *a, **kw: Independent(Bernoulli(*a, **kw), 1)
-            return Independent(Bernoulli(logits=logits), 1)
-        else:
-            self.dist_type = lambda *a, **kw: Independent(Poisson(*a, **kw), 1)
-            return Independent(Poisson(rate=torch.exp(logits)), 1)
+            return Categorical(logits=dist_params["logits"])
 
-    def _get_dist(self, X=None, emission_type=None, theta=None, context=None,
-                  posterior=None, theta_scale=0.1, temperature=None, max_jitter=5):
+        if etype == "bernoulli":
+            self.dist_type = lambda *a, **kw: Independent(Bernoulli(*a, **kw), 1)
+            return Independent(Bernoulli(logits=dist_params["logits"]), 1)
+
+        if etype == "poisson":
+            self.dist_type = lambda *a, **kw: Independent(Poisson(*a, **kw), 1)
+            return Independent(Poisson(rate=torch.exp(dist_params["logits"])), 1)
+
+        raise ValueError(f"Unsupported discrete emission_type: {etype}")
+
+    def _get_dist(
+        self,
+        X: Optional[torch.Tensor] = None,
+        emission_type: Optional[str] = None,
+        theta: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        posterior: Optional[torch.Tensor] = None,
+        theta_scale: float = 0.1,
+        temperature: Optional[float] = None,
+        max_jitter: int = 5,
+    ):
+        """
+        Unified distribution constructor: continuous or discrete emissions.
+        """
         etype = emission_type or self.emission_type
         if etype in {"gaussian", "laplace", "studentt"}:
-            return self._get_continuous_dist(X=X, theta=theta, context=context,
-                                             posterior=posterior, theta_scale=theta_scale,
-                                             temperature=temperature, max_jitter=max_jitter)
+            return self._get_continuous_dist(
+                X=X, theta=theta, context=context, posterior=posterior,
+                theta_scale=theta_scale, temperature=temperature, max_jitter=max_jitter
+            )
         elif etype in {"categorical", "bernoulli", "poisson"}:
-            return self._get_discrete_dist(X=X, theta=theta, context=context,
-                                           posterior=posterior, theta_scale=theta_scale,
-                                           temperature=temperature)
+            return self._get_discrete_dist(
+                X=X, theta=theta, context=context, posterior=posterior,
+                theta_scale=theta_scale, temperature=temperature
+            )
         else:
             raise ValueError(f"Unsupported emission_type: {etype}")
 
-    # ------------------- Forward / Distribution -------------------
-    def forward(self, context: Optional[torch.Tensor] = None, temperature: Optional[float] = None, return_dist: bool = False):
+    def forward(
+        self,
+        context: Optional[torch.Tensor] = None,
+        temperature: Optional[float] = None,
+        return_dist: bool = False
+    ):
         """
-        Produce emission distribution or parameters.
-        Context and temperature modulation applied once.
+        Build and return an emission distribution or its parameters using
+        current learnable parameters, with optional context / temperature modulation.
+        Pure forward: does not mutate buffers.
         """
+        etype = self.emission_type
 
-        # 1) Produce distribution (also updates _emission_* via _get_dist)
-        dist = self._get_dist(
-            X=None,
-            context=context,
-            theta=None,
-            theta_scale=0.1,
-            temperature=temperature,
-            max_jitter=5,
-        )
+        # ---------------- Base tensor selection ----------------
+        if etype in {"gaussian", "laplace", "studentt"}:
+            base_tensor = self.mu if etype == "gaussian" else self.loc
+        else:
+            base_tensor = self.log_rate if etype == "poisson" else self.logits
 
-        # ------------------------------------------------------------------
-        # 2) SAFE BUFFER SYNCHRONIZATION (NO IN-PLACE ON LEAF GRAD TENSORS)
-        # ------------------------------------------------------------------
-        with torch.no_grad():
+        # ---------------- Apply context + temperature modulation ----------------
+        params = self._dist_params(base_tensor, context=context, temperature=temperature)
 
-            if self.emission_type in {"gaussian", "laplace", "studentt"}:
+        # ---------------- Construct distribution ----------------
+        if etype == "gaussian":
+            dist = MultivariateNormal(params["means"], covariance_matrix=params["cov"])
+            return dist if return_dist else (params["means"], params["cov"])
 
-                if self.emission_type == "gaussian":
-                    # mean
-                    if hasattr(self, "mu"):
-                        self.mu.copy_(self._emission_means.detach())
+        if etype in {"laplace", "studentt"}:
+            dist_cls = Laplace if etype == "laplace" else StudentT
+            dist = Independent(dist_cls(loc=params["loc"], scale=params["scale"]), 1)
+            return dist if return_dist else (params["loc"], torch.diag_embed(params["scale"] ** 2))
 
-                    # covariance -> log_var
-                    cov_diag = torch.diagonal(
-                        self._emission_covs, dim1=-2, dim2=-1
-                    ).clamp_min(self.min_covar)
-                    logv = torch.log(cov_diag)
+        # ---------------- Discrete emissions ----------------
+        if etype == "categorical":
+            dist = Categorical(logits=params["logits"])
+        elif etype == "bernoulli":
+            dist = Independent(Bernoulli(logits=params["logits"]), 1)
+        elif etype == "poisson":
+            dist = Independent(Poisson(rate=torch.exp(params["logits"])), 1)
+        else:
+            raise ValueError(f"Unsupported emission_type: {etype}")
 
-                    if hasattr(self, "log_var"):
-                        self.log_var.copy_(logv.detach())
-
-                else:
-                    # laplace / studentt
-                    scale = self.scale_param.clamp_min(self.min_covar)
-
-                    if hasattr(self, "loc"):
-                        self.loc.copy_(self._emission_means.detach())
-
-                    if hasattr(self, "scale_param"):
-                        self.scale_param.copy_(scale.detach())
-
-                    # maintain consistent covariance buffer
-                    if hasattr(self, "_emission_covs"):
-                        cov = torch.diag_embed((scale.detach()) ** 2)
-                        self._emission_covs.copy_(cov)
-
-            else:
-                # Discrete: categorical / bernoulli / poisson
-                if hasattr(self, "_emission_params"):
-                    self._emission_params.copy_(self._emission_params.detach())
-
-                # Update associated buffer (logits or log_rate)
-                if hasattr(self, "logits"):
-                    self.logits.copy_(self._emission_params.detach())
-                elif hasattr(self, "log_rate"):
-                    self.log_rate.copy_(self._emission_params.detach())
-
-        # ------------------------------------------------------------------
-        # 3) RETURN VALUES
-        # ------------------------------------------------------------------
-        if return_dist:
-            return dist
-
-        if self.emission_type in {"gaussian", "laplace", "studentt"}:
-            return self._emission_means, self._emission_covs
-
-        return self._emission_params
+        return dist if return_dist else params["logits"]
 
     @torch.no_grad()
     def update(
@@ -1150,9 +1201,13 @@ class Emission(DistributionBase):
         max_jitter: int = 5,
     ):
         """
-        Update emission parameters via EMA based on new data/posterior.
-        Ensures numerical stability and clamps variances/scales.
+        Update emission parameters via EMA using new data/posterior.
+        Supports Gaussian, Laplace, StudentT, and discrete distributions.
+        Ensures numerical stability by clamping variances/scales.
+        Returns the updated distribution.
         """
+
+        # 1) Compute the modulated distribution (pure, no buffer mutation)
         new_dist = self._get_dist(
             X=X,
             posterior=posterior,
@@ -1165,94 +1220,113 @@ class Emission(DistributionBase):
 
         etype = self.emission_type
 
+        # ---------------- Continuous emissions ----------------
         if etype == "gaussian":
-            new_means = self._emission_means.clone()
-            new_covs = self._emission_covs.clone()
-            # EMA update
-            self._emission_means.mul_(1 - update_rate).add_(update_rate * new_means)
-            self._emission_covs.mul_(1 - update_rate).add_(update_rate * new_covs)
-            # Sync learnable parameters with clamping
+            # EMA update for means and covariances
+            self._emission_means.mul_(1 - update_rate).add_(update_rate * new_dist.mean)
+            self._emission_covs.mul_(1 - update_rate).add_(update_rate * new_dist.covariance_matrix)
+
+            # Sync learnable parameters
             self.mu.copy_(self._emission_means)
-            cov_diag = torch.diagonal(self._emission_covs, dim1=-2, dim2=-1)
-            self.log_var.copy_(torch.log(torch.clamp(cov_diag, min=EPS)))
+            diag = torch.diagonal(self._emission_covs, dim1=-2, dim2=-1).clamp_min(EPS)
+            self.log_var.copy_(torch.log(diag))
 
         elif etype in {"laplace", "studentt"}:
-            new_loc = self.loc.clone()
-            new_scale = self.scale_param.clone()
-            self._emission_means.mul_(1 - update_rate).add_(update_rate * new_loc)
-            diag = (1 - update_rate) * self._emission_covs.diagonal(dim1=-2, dim2=-1) + update_rate * new_scale**2
-            diag = diag.clamp_min(EPS)  # ensure numerical stability
+            loc, scale = new_dist.mean if hasattr(new_dist, "mean") else new_dist.loc, new_dist.scale
+
+            # EMA update for location and scale
+            self._emission_means.mul_(1 - update_rate).add_(update_rate * loc)
+            diag = (1 - update_rate) * self._emission_covs.diagonal(dim1=-2, dim2=-1) + update_rate * scale**2
+            diag = diag.clamp_min(EPS)
+
             self._emission_covs.copy_(torch.diag_embed(diag))
             self.loc.copy_(self._emission_means)
             self.scale_param.copy_(torch.sqrt(diag))
 
-        else:  # categorical / bernoulli / poisson
-            new_params = getattr(self, "logits", getattr(self, "log_rate", self._emission_params)).clone()
-            self._emission_params.mul_(1 - update_rate).add_(update_rate * new_params)
-            param_attr = getattr(self, "logits", getattr(self, "log_rate", None))
-            if param_attr is not None:
-                param_attr.copy_(self._emission_params)
+        else:  # Discrete emissions: categorical, bernoulli, poisson
+            base_attr = "logits" if etype in {"categorical", "bernoulli"} else "log_rate"
+            params = getattr(self, base_attr, self._emission_params)
+
+            # EMA update
+            self._emission_params.mul_(1 - update_rate).add_(update_rate * params)
+            getattr(self, base_attr, self._emission_params).copy_(self._emission_params)
 
         return new_dist
 
-    def sample(self, n_samples: int = 1, context: Optional[torch.Tensor] = None, temperature: Optional[float] = None) -> torch.Tensor:
+    def sample(
+        self,
+        n_samples: int = 1,
+        context: Optional[torch.Tensor] = None,
+        temperature: Optional[float] = None
+    ) -> torch.Tensor:
+        """
+        Sample from the emission distribution, optionally conditioned on context.
+        Automatically uses rsample for reparameterizable distributions.
+        Returns a tensor of shape [n_samples, K, F] for continuous or [n_samples, K, F] for discrete.
+        """
         dist = self.forward(context=context, temperature=temperature, return_dist=True)
 
+        # Prefer reparameterized sampling if available
         if getattr(dist, "has_rsample", False):
             samples = dist.rsample((n_samples,))
         else:
             samples = dist.sample((n_samples,))
 
+        # Flatten batch/time dims if needed (continuous vs independent discrete)
+        if isinstance(dist, Independent):
+            samples = samples.view(n_samples, *samples.shape[-2:])
+
+        # Ensure consistent dtype
         return samples.to(dtype=DTYPE)
 
-    def log_prob(self, x: torch.Tensor, context: Optional[torch.Tensor] = None, temperature: Optional[float] = None) -> torch.Tensor:
+    def log_prob(
+        self,
+        x: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+        temperature: Optional[float] = None,
+    ) -> torch.Tensor:
+        """
+        Compute log-probability of input `x` under the emission distribution,
+        optionally conditioned on `context` and scaled by `temperature`.
+        Supports continuous and discrete emissions.
+        """
 
-        dist = self.forward(context=context, temperature=temperature, return_dist=True)
-        N, K, D = x.shape[0], self.n_states, self.n_features
         etype = self.emission_type
+        dist = self.forward(context=context, temperature=temperature, return_dist=True)
+        N = x.shape[0]  # batch size
+        K, D = self.n_states, self.n_features
 
-        # ---- unified expand helper ----
-        def expand_x(x):
-            return x.unsqueeze(1).expand(-1, K, -1)
+        # Helper to ensure x has shape [N, K, D]
+        def expand_x(x_tensor):
+            return x_tensor.unsqueeze(1).expand(-1, K, -1)
 
-        # -------------------------------
         if etype in {"gaussian", "laplace", "studentt"}:
+            # Continuous emissions
             x_exp = expand_x(x) if x.ndim == 2 else x
             return dist.log_prob(x_exp)
 
         elif etype == "categorical":
-            # prefer logits from the actual dist if provided
             logits = getattr(dist, "logits", getattr(self, "logits", self._emission_params))
-            logits = logits.unsqueeze(0).expand(N, K, -1, D) if logits.ndim == 3 else logits
-
+            if logits.ndim == 3:  # [K, D, V] -> broadcast to [N, K, D, V]
+                logits = logits.unsqueeze(0).expand(N, K, -1, -1)
             x_exp = expand_x(x.long()) if x.ndim == 2 else x.long()
             log_probs = F.log_softmax(logits, dim=-1)
-
             return torch.gather(log_probs, -1, x_exp.unsqueeze(-1)).squeeze(-1)
 
         elif etype == "bernoulli":
             logits = getattr(dist, "logits", getattr(self, "logits", self._emission_params))
-            x_exp = expand_x(x)
+            x_exp = expand_x(x) if x.ndim == 2 else x
             logits_exp = logits.unsqueeze(0).expand(N, K, D)
-            return -F.binary_cross_entropy_with_logits(
-                logits_exp, x_exp, reduction="none"
-            ).sum(-1)
+            return -F.binary_cross_entropy_with_logits(logits_exp, x_exp, reduction="none").sum(-1)
 
         elif etype == "poisson":
             log_rate = getattr(dist, "log_rate", getattr(self, "log_rate", self._emission_params))
             rate = torch.exp(log_rate)
-
-            x_exp = expand_x(x)
+            x_exp = expand_x(x) if x.ndim == 2 else x
             rate_exp = rate.unsqueeze(0).expand(N, K, D)
-
-            # x * log(rate) is undefined for x=0 unless masked
             log_probs = (
                 -rate_exp
-                + torch.where(
-                    x_exp > 0,
-                    x_exp * torch.log(rate_exp.clamp_min(EPS)),
-                    torch.zeros_like(x_exp),
-                )
+                + x_exp * torch.log(rate_exp.clamp_min(EPS))
                 - torch.lgamma(x_exp + 1)
             )
             return log_probs.sum(-1)
@@ -1285,17 +1359,20 @@ class Emission(DistributionBase):
         mode: str = "data",
         iters: int = 15,
     ):
+        """
+        Initialize emission parameters from data, k-means, or zeros.
+        Applies optional context and theta modulation.
+        Supports continuous (Gaussian, Laplace, StudentT) and discrete emissions.
+
+        Returns:
+            A distribution object corresponding to the initialized emission.
+        """
         K, F = self.n_states, self.n_features
 
-        # Flatten input
-        if X is not None:
-            Xf = X.reshape(-1, F).to(dtype=DTYPE)
-            N = Xf.shape[0]
-        else:
-            Xf = None
-            N = 0
+        # Flatten input if provided
+        Xf = X.reshape(-1, F).to(dtype=DTYPE) if X is not None else None
 
-        # KMeans helper
+        # -------------------- Helper: k-means --------------------
         def run_kmeans(Xflat, K, iters):
             idx = torch.randperm(Xflat.shape[0])[:K]
             centers = Xflat[idx].clone()
@@ -1308,12 +1385,12 @@ class Emission(DistributionBase):
                         centers[k] = pts.mean(0)
             return centers, labels
 
-        # Base initialization
+        # -------------------- Base initialization --------------------
         if Xf is not None:
             if mode == "data":
                 mean = Xf.mean(0)
-                cov = (Xf - mean).T @ (Xf - mean) / max(N - 1, 1)
-                cov = cov + self.min_covar * torch.eye(F, dtype=DTYPE)
+                cov = (Xf - mean).T @ (Xf - mean) / max(Xf.shape[0] - 1, 1)
+                cov += self.min_covar * torch.eye(F, dtype=DTYPE)
                 means = mean.expand(K, F).clone()
                 covs = cov.unsqueeze(0).expand(K, F, F).clone()
             elif mode == "kmeans":
@@ -1331,21 +1408,21 @@ class Emission(DistributionBase):
             means = torch.zeros(K, F, dtype=DTYPE)
             covs = torch.eye(F, dtype=DTYPE).unsqueeze(0).repeat(K, 1, 1) * self.min_covar
 
-        # Theta modulation
+        # -------------------- Theta modulation --------------------
         if theta is not None:
             theta_vec = theta.mean(0) if theta.ndim > 1 else theta
             means = means + theta_scale * theta_vec.to(dtype=DTYPE).unsqueeze(0)
 
-        # Context modulation
+        # -------------------- Context modulation --------------------
         means_mod = self._modulate(means, context=context, temperature=temperature)
-        if means_mod.ndim == 4 and means_mod.shape[0] == 1 and means_mod.shape[1] == 1:
-            means_mod = means_mod.squeeze(0).squeeze(0)
+        while means_mod.ndim > 2:
+            means_mod = means_mod.squeeze(0)
 
-        # Store buffers safely
+        # -------------------- Store buffers safely --------------------
         self._emission_means.copy_(means_mod)
         self._emission_covs.copy_(covs)
 
-        # Continuous emissions
+        # -------------------- Continuous emissions --------------------
         if self.emission_type == "gaussian":
             self.mu.copy_(means_mod)
             cov_diag = torch.diagonal(covs, dim1=-2, dim2=-1)
@@ -1359,22 +1436,21 @@ class Emission(DistributionBase):
             dist_cls = Laplace if self.emission_type == "laplace" else StudentT
             return Independent(dist_cls(loc=means_mod, scale=scale), 1)
 
-        # Discrete emissions
+        # -------------------- Discrete emissions --------------------
         if Xf is not None and mode == "data":
             logits = torch.log_softmax(Xf.mean(0).expand(K, F), -1)
         else:
             logits = means_mod
 
-        logits = self._modulate(logits, context=context, temperature=temperature)
-
+        logits_mod = self._modulate(logits, context=context, temperature=temperature)
         param_attr = getattr(self, "logits", getattr(self, "log_rate", None))
         if param_attr is not None:
-            param_attr.copy_(logits)
-        self._emission_params.copy_(logits)
+            param_attr.copy_(logits_mod)
+        self._emission_params.copy_(logits_mod)
 
         if self.emission_type == "categorical":
-            return Categorical(logits=logits)
+            return Categorical(logits=logits_mod)
         if self.emission_type == "bernoulli":
-            return Independent(Bernoulli(logits=logits), 1)
-        return Independent(Poisson(rate=torch.exp(logits)), 1)
+            return Independent(Bernoulli(logits=logits_mod), 1)
+        return Independent(Poisson(rate=torch.exp(logits_mod)), 1)
 
