@@ -257,7 +257,7 @@ if __name__ == "__main__":
     np.random.seed(0)
 
     MAX_ITER = 3
-    MAX_DURATION = 50
+    MAX_DURATION = 10
     SYMBOL = "BTC/USDT:USDT"
     DATA_DIR = "/opt/trader/user_data/data/bybit/futures_"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -284,7 +284,7 @@ if __name__ == "__main__":
 
     # --- Initialize HSMM ---
     model = HSMM(
-        # encoder=encoder,
+        encoder=encoder,
         n_states=n_states,
         n_features=n_features,
         max_duration=MAX_DURATION,
