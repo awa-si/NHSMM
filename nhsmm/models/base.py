@@ -173,7 +173,7 @@ class HSMM(nn.Module, ABC):
         init_mode_transition: str = "diag_bias",
         init_mode_duration: str = "uniform",
         init_mode_initial: str = "uniform",
-        init_mode_emission: str = "data",
+        init_mode_emission: str = "kmeans",
         transition_type: str = "ergodic",
         emission_type: str = "gaussian",
         cache_limit: int = 32,
@@ -397,13 +397,11 @@ class HSMM(nn.Module, ABC):
         self,
         X: torch.Tensor,
         theta: Optional[torch.Tensor] = None,
-    ) -> Observations:
+    ) -> SequenceSet:
         # Ensure batch dimension
-        if X.ndim == 2:
-            X = X.unsqueeze(0)
+        dtype, device = X.dtype, X.device
+        if X.ndim == 2: X = X.unsqueeze(0)
         B, T, F = X.shape
-        dtype = X.dtype
-        device = X.device
 
         # Build masks
         mask = torch.ones(B, T, 1, dtype=torch.bool, device=device)
@@ -461,12 +459,12 @@ class HSMM(nn.Module, ABC):
 
             log_probs_list.append(log_probs)
 
-        return utils.Observations(
-            sequence=[X[b] for b in range(B)],
+        return utils.SequenceSet(
+            sequences=[X[b] for b in range(B)],
             lengths=[T] * B,
             log_probs=log_probs_list,
-            context=context_aligned,
-            mask=[mask[b] for b in range(B)],
+            contexts=context_aligned,
+            masks=[mask[b] for b in range(B)],
         )
 
     def _ensure_time_dim(self, x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -484,14 +482,14 @@ class HSMM(nn.Module, ABC):
 
     def _forward(
         self,
-        X: utils.Observations,
+        X: utils.SequenceSet,
         theta: Optional[list[Optional[torch.Tensor]] | torch.Tensor] = None
     ) -> list[torch.Tensor]:
         """
         Vectorized, device-agnostic forward pass for HSMM with context-modulated logits.
 
         Args:
-            X: Observations container
+            X: SequenceSet container
             theta: Optional per-sequence or per-timestep context
 
         Returns:
@@ -575,7 +573,7 @@ class HSMM(nn.Module, ABC):
 
     def _backward(
         self,
-        X: utils.Observations,
+        X: utils.SequenceSet,
         theta: Optional[list[Optional[torch.Tensor]] | torch.Tensor] = None
     ) -> list[torch.Tensor]:
         """
@@ -678,8 +676,8 @@ class HSMM(nn.Module, ABC):
 
     def _compute_state_posteriors(
         self,
-        X: utils.Observations,
-        theta: Optional[ContextualVariables] = None
+        X: utils.SequenceSet,
+        theta: Optional[ContextFeatures] = None
     ) -> Tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
         """
         Compute context-modulated state-duration posteriors for each sequence.
@@ -690,7 +688,7 @@ class HSMM(nn.Module, ABC):
             eta_list: [T, K, Dmax] state-duration posteriors
         """
         K, Dmax = self.n_states, self.max_duration
-        B = len(X.sequence)
+        B = len(X.sequences)
 
         gamma_list, xi_list, eta_list = [], [], []
 
@@ -724,7 +722,7 @@ class HSMM(nn.Module, ABC):
             duration_logits = self.duration_module.log_matrix(context=ctx_aligned)  # [K,Dmax] or [L,K,Dmax]
 
             # ---------------- Forward / Backward ----------------
-            obs_seq = utils.Observations(sequence=[logp], log_probs=[logp], lengths=[L])
+            obs_seq = utils.SequenceSet(sequences=[logp], log_probs=[logp], lengths=[L])
             alpha = self._forward(obs_seq, theta=ctx_aligned)[0]  # [L, K, Dmax]
             beta = self._backward(obs_seq, theta=ctx_aligned)[0]  # [L, K, Dmax]
 
@@ -762,7 +760,7 @@ class HSMM(nn.Module, ABC):
 
     def _model_params(
         self,
-        X: Optional[utils.Observations] = None,
+        X: Optional[utils.SequenceSet] = None,
         theta: Optional[torch.Tensor] = None,
         theta_scale: float = 0.1,
         mode: str = "estimate",
@@ -781,7 +779,7 @@ class HSMM(nn.Module, ABC):
 
         # ---------------- Flatten sequences ----------------
         if X is not None:
-            all_X = torch.cat([s for s in getattr(X, "sequence", [X]) if s.numel() > 0], dim=0)
+            all_X = torch.cat([s for s in getattr(X, "sequences", [X]) if s.numel() > 0], dim=0)
             if all_X.numel() == 0:
                 all_X = torch.zeros(1, self.n_features, dtype=DTYPE, device=device)
         else:
@@ -850,8 +848,8 @@ class HSMM(nn.Module, ABC):
 
         # ---------------- Mode: estimate ----------------
         elif mode == "estimate":
-            if X is None or not isinstance(X, utils.Observations):
-                raise RuntimeError("Observations X required for estimate mode.")
+            if X is None or not isinstance(X, utils.SequenceSet):
+                raise RuntimeError("SequenceSet X required for estimate mode.")
 
             gamma_list, xi_list, eta_list = self._compute_state_posteriors(X, theta=aligned_theta)
 
@@ -910,7 +908,7 @@ class HSMM(nn.Module, ABC):
 
     def _viterbi(
         self,
-        X: utils.Observations,
+        X: utils.SequenceSet,
         theta: Optional[torch.Tensor] = None,
         duration_weight: float = 0.0
     ) -> list[torch.Tensor]:
@@ -919,7 +917,7 @@ class HSMM(nn.Module, ABC):
         """
         K, Dmax = self.n_states, self.max_duration
         neg_inf = torch.finfo(DTYPE).min / 2.0
-        B = len(X.sequence)
+        B = len(X.sequences)
 
         predicted_sequences: list[torch.Tensor] = []
         durations_full = torch.arange(1, Dmax + 1, dtype=torch.int64)
@@ -934,7 +932,7 @@ class HSMM(nn.Module, ABC):
                 return logits.squeeze(0)
             return logits
 
-        for b, seq in enumerate(X.sequence):
+        for b, seq in enumerate(X.sequences):
             L = seq.shape[0]
             device = seq.device
 
@@ -1004,9 +1002,7 @@ class HSMM(nn.Module, ABC):
 
                 state_idx = torch.arange(K, device=device)
                 prev_arg_selected = prev_arg[best_d_idx, state_idx]
-                back_ptr[t] = torch.where(best_durations[t] == 1,
-                                          torch.full_like(prev_arg_selected, -1),
-                                          prev_arg_selected)
+                back_ptr[t] = torch.where(best_durations[t] == 1, torch.full_like(prev_arg_selected, -1), prev_arg_selected)
 
             # --- Backtrace ---
             t_cursor = L - 1
@@ -1022,8 +1018,7 @@ class HSMM(nn.Module, ABC):
                 cur_st = prev_state if prev_state >= 0 else cur_st
 
             segments.reverse()
-            seq_path = torch.cat([torch.full((end - start + 1,), st, dtype=torch.int64, device=device)
-                                  for start, end, st in segments])
+            seq_path = torch.cat([torch.full((end - start + 1,), st, dtype=torch.int64, device=device) for start, end, st in segments])
             predicted_sequences.append(seq_path[:L])
 
         return predicted_sequences
@@ -1033,7 +1028,7 @@ class HSMM(nn.Module, ABC):
     @torch.no_grad()
     def _compute_emit_log(
         self,
-        X: utils.Observations,
+        X: utils.SequenceSet,
         theta: Optional[torch.Tensor] = None,
         verbose: bool = False,
         device_output: Optional[torch.device] = None,
@@ -1043,7 +1038,7 @@ class HSMM(nn.Module, ABC):
         Handles variable-length sequences and zero-length sequences robustly.
 
         Args:
-            X: Observations object containing sequences and lengths.
+            X: SequenceSet object containing sequences and lengths.
             theta: Optional context tensor for sequences.
             verbose: If True, logs min/max/mean of log-likelihoods.
             device_output: Optional device for output tensor.
@@ -1052,7 +1047,7 @@ class HSMM(nn.Module, ABC):
             Tensor of shape [B], one log-likelihood per sequence.
         """
         device_output = device_output or torch.device("cpu")
-        B = len(X.sequence)
+        B = len(X.sequences)
         neg_inf = torch.finfo(DTYPE).min / 2.0
 
         # Handle empty batch
@@ -1134,15 +1129,15 @@ class HSMM(nn.Module, ABC):
         X_valid = self._prepare_observations(X, theta=theta)
         aligned_theta = self._align_theta(theta, sum(X_valid.lengths)) if theta is not None else None
 
-        B = len(X_valid.sequence)
+        B = len(X_valid.sequences)
         max_len = max(X_valid.lengths) if B > 0 else 0
-        F_dim = X_valid.sequence[0].shape[-1] if B > 0 else 0
-        device = X_valid.sequence[0].device if B > 0 else torch.device("cpu")
+        F_dim = X_valid.sequences[0].shape[-1] if B > 0 else 0
+        device = X_valid.sequences[0].device if B > 0 else torch.device("cpu")
 
         # ---------------- Prepare padded tensors ----------------
         seq_tensor = torch.zeros((B, max_len, F_dim), dtype=DTYPE, device=device)
         mask = torch.zeros(B, max_len, dtype=DTYPE, device=device)
-        for b, seq in enumerate(X_valid.sequence):
+        for b, seq in enumerate(X_valid.sequences):
             L = seq.shape[0]
             seq_tensor[b, :L] = seq
             mask[b, :L] = 1.0
@@ -1280,7 +1275,7 @@ class HSMM(nn.Module, ABC):
 
         return self
 
-    def _map(self, X: utils.Observations) -> list[torch.Tensor]:
+    def _map(self, X: utils.SequenceSet) -> list[torch.Tensor]:
         """
         MAP decoding of HSMM sequences using posterior state marginals.
         Returns a list of tensors, each of shape [T].
@@ -1319,20 +1314,20 @@ class HSMM(nn.Module, ABC):
 
         # --- Prepare observations ---
         obs = self._prepare_observations(X, theta=context)
-        B = len(obs.sequence)
-        lengths = [seq.shape[0] for seq in obs.sequence]
+        B = len(obs.sequences)
+        lengths = [seq.shape[0] for seq in obs.sequences]
         max_len = max(lengths) if lengths else 0
 
         if max_len == 0:
             return [torch.empty(0, dtype=torch.int64, device=device_output) for _ in range(B)]
 
         # --- Batch tensors ---
-        n_features = obs.sequence[0].shape[1] if obs.sequence[0].ndim > 1 else 1
+        n_features = obs.sequences[0].shape[1] if obs.sequences[0].ndim > 1 else 1
         seq_tensor = torch.zeros(B, max_len, n_features, dtype=DTYPE)
         log_probs_tensor = torch.zeros(B, max_len, self.n_states, dtype=DTYPE)
         mask = torch.zeros(B, max_len, dtype=torch.bool)
 
-        for b, seq in enumerate(obs.sequence):
+        for b, seq in enumerate(obs.sequences):
             L = seq.shape[0]
             seq_tensor[b, :L] = seq
             log_probs_tensor[b, :L] = obs.log_probs[b]
@@ -1424,7 +1419,7 @@ class HSMM(nn.Module, ABC):
         # Split emission log-probs per sequence
         seq_lengths = [seq.shape[0] for seq in X_list]
         log_probs_split = list(torch.split(log_B, seq_lengths, dim=0))
-        obs = utils.Observations(X_list, log_probs=log_probs_split)
+        obs = utils.SequenceSet(X_list, log_probs=log_probs_split)
 
         # --- Global context for uniform modules ---
         global_ctx = None

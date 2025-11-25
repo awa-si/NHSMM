@@ -1,33 +1,34 @@
+# nhsmm/tools/utils.py
+
 import torch
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union, Tuple
 
 
 @dataclass(frozen=False)
-class Observations:
+class SequenceSet:
     """
-    Container for sequences, optional log-probs, context vectors, and masks.
+    Container for sequences, optional log-probabilities, context tensors, and masks.
 
-    Accepts inputs as:
-        - single-sequence: [T,F] or [T]
-        - batched: [B,T,F] or [B,T]
-        - context: [T,H], [1,H], [B,T,H], [B,H]
-        - mask: [T], [T,1], [B,T], [B,T,1]
+    Supports:
+        - Single sequence: [T,F] or [T]
+        - Batched sequences: [B,T,F] or [B,T]
+        - Context: [T,H], [1,H], [B,T,H], [B,H]
+        - Mask: [T], [T,1], [B,T], [B,T,1]
     """
 
-    sequence: List[torch.Tensor]
+    sequences: List[torch.Tensor]
     lengths: Optional[List[int]] = None
     log_probs: Optional[List[torch.Tensor]] = None
-    context: Optional[List[Optional[torch.Tensor]]] = None
-    mask: Optional[List[torch.Tensor]] = None
+    contexts: Optional[List[Optional[torch.Tensor]]] = None
+    masks: Optional[List[torch.Tensor]] = None
 
     # ---------------- Post Init ----------------
     def __post_init__(self):
-        # Normalize all inputs into list-of-tensors form
-        self.sequence = self._canonicalize_list(self.sequence, "sequence")
-        seqs = self.sequence
+        self.sequences = self._canonicalize_list(self.sequences, "sequences")
+        seqs = self.sequences
 
-        # Infer lengths if missing
+        # Infer sequence lengths if missing
         if self.lengths is None:
             self.lengths = [s.shape[0] for s in seqs]
         else:
@@ -35,151 +36,94 @@ class Observations:
                 raise ValueError("`lengths` must match number of sequences.")
             for s, l in zip(seqs, self.lengths):
                 if s.shape[0] != l:
-                    raise ValueError("Mismatch between sequence and provided length.")
+                    raise ValueError("Sequence length mismatch.")
 
-        # Canonicalize log_probs
+        # Canonicalize log probabilities
         if self.log_probs is not None:
             self.log_probs = self._canonicalize_list(self.log_probs, "log_probs", allow_none=False)
             if len(self.log_probs) != len(seqs):
                 raise ValueError("`log_probs` length mismatch.")
+            self.log_probs = [self._ensure_2d_time_major(lp, L) for lp, L in zip(self.log_probs, self.lengths)]
 
-            # Normalize per-sequence shapes
-            new_lp = []
-            for lp, L in zip(self.log_probs, self.lengths):
-                lp = self._ensure_2d_time_major(lp, L)
-                new_lp.append(lp)
-            self.log_probs = new_lp
-
-        # Canonicalize context
-        if self.context is None:
-            self.context = [None] * len(seqs)
+        # Canonicalize contexts
+        if self.contexts is None:
+            self.contexts = [None] * len(seqs)
         else:
-            self.context = self._canonicalize_list(self.context, "context", allow_none=True)
-            if len(self.context) != len(seqs):
-                raise ValueError("`context` length mismatch.")
+            self.contexts = self._canonicalize_list(self.contexts, "contexts", allow_none=True)
+            if len(self.contexts) != len(seqs):
+                raise ValueError("`contexts` length mismatch.")
+            self.contexts = [self._normalize_context(c, L) if c is not None else None
+                             for c, L in zip(self.contexts, self.lengths)]
 
-            new_ctx = []
-            for c, L in zip(self.context, self.lengths):
-                if c is None:
-                    new_ctx.append(None)
-                    continue
-                new_ctx.append(self._normalize_context(c, L))
-            self.context = new_ctx
-
-        # Canonicalize mask
-        if self.mask is None:
-            self.mask = [torch.ones(L, 1, dtype=torch.bool) for L in self.lengths]
+        # Canonicalize masks
+        if self.masks is None:
+            self.masks = [torch.ones(L, 1, dtype=torch.bool) for L in self.lengths]
         else:
-            self.mask = self._canonicalize_list(self.mask, "mask", allow_none=False)
-            if len(self.mask) != len(seqs):
-                raise ValueError("`mask` length mismatch.")
-
-            new_mask = []
-            for m, L in zip(self.mask, self.lengths):
-                new_mask.append(self._normalize_mask(m, L))
-            self.mask = new_mask
+            self.masks = self._canonicalize_list(self.masks, "masks", allow_none=False)
+            if len(self.masks) != len(seqs):
+                raise ValueError("`masks` length mismatch.")
+            self.masks = [self._normalize_mask(m, L) for m, L in zip(self.masks, self.lengths)]
 
     # ---------------- Internal helpers ----------------
-    def _canonicalize_list(self, x, name, allow_none=False):
-        # If given a single tensor, wrap as list
-        if torch.is_tensor(x):
-            return [x]
-
-        # If x is a batch tensor [B,...]
-        if isinstance(x, list):
+    def _canonicalize_list(self, items, name, allow_none=False):
+        if torch.is_tensor(items):
+            return [items]
+        if isinstance(items, list):
             if allow_none:
-                # allow sequences with None
-                return [t if t is None else t for t in x]
-            return [t for t in x]
+                return [t if t is None else t for t in items]
+            return [t for t in items]
+        raise TypeError(f"`{name}` must be a tensor or list of tensors.")
 
-        raise TypeError(f"`{name}` must be tensor or list of tensors.")
-
-    def _ensure_2d_time_major(self, t, L):
+    def _ensure_2d_time_major(self, tensor, T):
         """
-        Ensures:
-            - 1D -> [T,1]
-            - [1,T] -> squeeze to [T]
-            - [T] -> [T,1]
-            - [T,F] stays
+        Ensures tensor shape is [T, F] or [T, 1] for log_probs.
         """
-        if t.ndim == 1:
-            if t.shape[0] == L:
-                return t.unsqueeze(1)
-            raise ValueError("1D tensor must have length T.")
-        if t.ndim == 2:
-            # could be [1,T] or [T,1] or [T,F]
-            if t.shape[0] == 1 and t.shape[1] == L:
-                return t.squeeze(0).unsqueeze(1)
-            if t.shape[0] == L:
-                return t
-        raise ValueError(f"Invalid log-prob shape {t.shape} for T={L}")
+        if tensor.ndim == 1 and tensor.shape[0] == T:
+            return tensor.unsqueeze(1)
+        if tensor.ndim == 2:
+            if tensor.shape[0] == 1 and tensor.shape[1] == T:
+                return tensor.squeeze(0).unsqueeze(1)
+            if tensor.shape[0] == T:
+                return tensor
+        raise ValueError(f"Invalid tensor shape {tensor.shape} for T={T}")
 
-    def _normalize_context(self, c, L):
+    def _normalize_context(self, ctx, T):
         """
-        Accepts:
-            [H] -> expand to [T,H]
-            [1,H] -> expand to [T,H]
-            [T,H] -> OK
-            [B,H] -> only accept B=1 -> squeeze -> [H]
-            [B,T,H] -> only accept B=1 -> squeeze -> [T,H]
+        Normalize context tensor to shape [T, H].
         """
-        if c.ndim == 1:
-            return c.unsqueeze(0).expand(L, -1)
-
-        if c.ndim == 2:
-            # [1,H]
-            if c.shape[0] == 1:
-                return c.expand(L, -1)
-            # [T,H]
-            if c.shape[0] == L:
-                return c
-            raise ValueError(f"Invalid context shape {c.shape} for T={L}")
-
-        if c.ndim == 3:
-            # [B,T,H]
-            if c.shape[0] == 1:
-                return c.squeeze(0)
+        if ctx.ndim == 1:
+            return ctx.unsqueeze(0).expand(T, -1)
+        if ctx.ndim == 2:
+            if ctx.shape[0] == 1 or ctx.shape[0] == T:
+                return ctx.expand(T, -1) if ctx.shape[0] == 1 else ctx
+            raise ValueError(f"Invalid context shape {ctx.shape} for T={T}")
+        if ctx.ndim == 3:
+            if ctx.shape[0] == 1:
+                return ctx.squeeze(0)
             raise ValueError("Context batch >1 not supported per sequence.")
+        raise ValueError(f"Unsupported context shape {ctx.shape}")
 
-        raise ValueError(f"Unsupported context shape {c.shape}")
-
-    def _normalize_mask(self, m, L):
+    def _normalize_mask(self, mask, T):
         """
-        Accept mask as:
-            [T]
-            [T,1]
-            [1,T]
-            [B,T] (B=1)
-            [B,T,1] (B=1)
-        Always returns [T,1] bool mask.
+        Normalize mask to shape [T, 1] boolean.
         """
-        if m.ndim == 1:
-            if m.shape[0] == L:
-                return m.bool().unsqueeze(1)
-
-        if m.ndim == 2:
-            # [T,1]
-            if m.shape == (L, 1):
-                return m.bool()
-            # [1,T]
-            if m.shape[0] == 1 and m.shape[1] == L:
-                return m.squeeze(0).unsqueeze(1).bool()
-
-            # [B,T], B=1
-            if m.shape[0] == 1 and m.shape[1] == L:
-                return m.squeeze(0).unsqueeze(1).bool()
-
-        if m.ndim == 3:
-            # [1,T,1]
-            if m.shape[0] == 1 and m.shape[1] == L:
-                return m.squeeze(0).bool()
-
-        raise ValueError(f"Invalid mask shape {m.shape} for T={L}")
+        if mask.ndim == 1 and mask.shape[0] == T:
+            return mask.bool().unsqueeze(1)
+        if mask.ndim == 2:
+            if mask.shape == (T, 1):
+                return mask.bool()
+            if mask.shape[0] == 1 and mask.shape[1] == T:
+                return mask.squeeze(0).unsqueeze(1).bool()
+            if mask.shape[0] == 1 and mask.shape[1] == T:
+                return mask.squeeze(0).unsqueeze(1).bool()
+        if mask.ndim == 3 and mask.shape[0] == 1 and mask.shape[1] == T:
+            return mask.squeeze(0).bool()
+        raise ValueError(f"Invalid mask shape {mask.shape} for T={T}")
 
     # ---------------- Properties ----------------
     @property
     def n_sequences(self):
-        return len(self.sequence)
+        return len(self.sequences)
 
     @property
     def total_length(self):
@@ -187,36 +131,36 @@ class Observations:
 
     @property
     def feature_dim(self):
-        f = {s.shape[-1] for s in self.sequence}
-        if len(f) != 1:
-            raise ValueError("Feature dimension mismatch.")
-        return f.pop()
+        dims = {s.shape[-1] for s in self.sequences}
+        if len(dims) != 1:
+            raise ValueError("Feature dimension mismatch across sequences.")
+        return dims.pop()
 
     @property
     def device(self):
-        return self.sequence[0].device
+        return self.sequences[0].device
 
     @property
     def dtype(self):
-        return self.sequence[0].dtype
+        return self.sequences[0].dtype
 
-    # ---------------- Clone / detach ----------------
+    # ---------------- Clone / Detach ----------------
     def detach(self):
-        return Observations(
-            sequence=[s.detach() for s in self.sequence],
+        return SequenceSet(
+            sequences=[s.detach() for s in self.sequences],
             lengths=list(self.lengths),
             log_probs=[lp.detach() for lp in self.log_probs] if self.log_probs is not None else None,
-            context=[c.detach() if c is not None else None for c in self.context],
-            mask=[m.clone() for m in self.mask],
+            contexts=[c.detach() if c is not None else None for c in self.contexts],
+            masks=[m.clone() for m in self.masks],
         )
 
     def clone(self):
-        return Observations(
-            sequence=[s.clone() for s in self.sequence],
+        return SequenceSet(
+            sequences=[s.clone() for s in self.sequences],
             lengths=list(self.lengths),
             log_probs=[lp.clone() for lp in self.log_probs] if self.log_probs is not None else None,
-            context=[c.clone() if c is not None else None for c in self.context],
-            mask=[m.clone() for m in self.mask],
+            contexts=[c.clone() if c is not None else None for c in self.contexts],
+            masks=[m.clone() for m in self.masks],
         )
 
     # ---------------- Indexing ----------------
@@ -227,17 +171,16 @@ class Observations:
             if isinstance(idx, slice):
                 return lst[idx]
             return [lst[idx]]
-
-        return Observations(
-            sequence=pick(self.sequence),
+        return SequenceSet(
+            sequences=pick(self.sequences),
             lengths=pick(self.lengths),
             log_probs=pick(self.log_probs),
-            context=pick(self.context),
-            mask=pick(self.mask),
+            contexts=pick(self.contexts),
+            masks=pick(self.masks),
         )
 
-    # ---------------- to_tensor ----------------
-    def to_tensor(self, key="sequence"):
+    # ---------------- Convert to tensor ----------------
+    def to_tensor(self, key="sequences"):
         items = getattr(self, key)
         if items is None:
             raise ValueError(f"{key} is None.")
@@ -253,238 +196,157 @@ class Observations:
     # ---------------- Summary ----------------
     def summary(self):
         return (
-            f"Observations(n_sequences={self.n_sequences}, "
+            f"SequenceSet(n_sequences={self.n_sequences}, "
             f"total_length={self.total_length}, "
             f"feature_dim={self.feature_dim}, "
-            f"mask_coverage={[m.sum().item() for m in self.mask]})"
+            f"mask_coverage={[m.sum().item() for m in self.masks]})"
         )
 
 
 @dataclass(frozen=False)
-class ContextualVariables:
+class ContextFeatures:
     """
-    Batch- and time-aware container for context tensors.
+    Container for batch- and time-aware context tensors.
 
-    Supported input tensor shapes for each context:
-      - [H]
-      - [T, H]
-      - [B, H]
-      - [B, T, H]
+    Each tensor can have shape:
+      - [H]       : feature-only
+      - [T, H]    : time-dependent
+      - [B, H]    : batch-dependent
+      - [B, T, H] : batch + time-dependent
 
-    Important rules:
-      - If `time_dependent=True`, 2-D tensors are interpreted as [T, H].
-        Otherwise, 2-D tensors are interpreted as [B, H].
-      - If any provided tensor has explicit batch (B) or time (T) dimensions,
-        the class will attempt to infer global B and T and broadcast other
-        contexts to (B, T, H) where appropriate.
-      - Cache keys include (B, T) so different batch/time shapes don't reuse
-        cached concatenations.
+    Rules:
+      - `time_dependent=True` interprets 2D tensors as [T, H].
+        Otherwise, 2D tensors are interpreted as [B, H].
+      - Explicit batch (B) or time (T) dimensions are inferred from tensors,
+        and all other tensors are broadcast to [B, T, H].
+      - Cached concatenations use (B, T) as part of the key.
     """
 
     n_context: int
-    X: List[torch.Tensor]
+    tensors: List[torch.Tensor]
     time_dependent: bool = False
     names: Optional[List[str]] = None
-
-    # internal cache mapping (cache_key, B, T) -> tensor
     _cache: Optional[Dict] = None
 
     def __post_init__(self):
-        if not isinstance(self.X, list) or len(self.X) == 0:
-            raise ValueError("`X` must be a non-empty list of torch.Tensor")
-        if len(self.X) != self.n_context:
-            raise ValueError(f"n_context ({self.n_context}) != len(X) ({len(self.X)})")
-        if self.names is not None and len(self.names) != self.n_context:
-            raise ValueError("`names` length must match `n_context`")
+        if not self.tensors or len(self.tensors) != self.n_context:
+            raise ValueError(f"Expected {self.n_context} tensors, got {len(self.tensors)}")
+        if self.names and len(self.names) != self.n_context:
+            raise ValueError("Length of `names` must match `n_context`")
+        if not all(torch.is_tensor(t) for t in self.tensors):
+            raise TypeError("All elements of tensors must be torch.Tensor")
 
-        if not all(torch.is_tensor(x) for x in self.X):
-            raise TypeError("All elements of X must be torch.Tensor")
-
-        # Validate dtypes / devices uniformity (helpful early)
-        devs = {x.device for x in self.X}
-        dtypes = {x.dtype for x in self.X}
-        if len(devs) > 1:
+        # Check devices and dtypes are consistent
+        devices = {t.device for t in self.tensors}
+        dtypes = {t.dtype for t in self.tensors}
+        if len(devices) > 1:
             raise ValueError("All context tensors must be on the same device")
         if len(dtypes) > 1:
             raise ValueError("All context tensors must have the same dtype")
 
-        # initialize cache
         self._cache = {}
-
-        # Validate feature dim consistency (where determinable)
-        feature_dims = {self._infer_feature_dim(x) for x in self.X if x.ndim >= 1}
+        feature_dims = {self._feature_dim(t) for t in self.tensors if t.ndim >= 1}
         if len(feature_dims) > 1:
             raise ValueError("Inconsistent feature dimensions across context tensors")
-        # ok if single context only; feature dim will be derived later as needed
 
     @staticmethod
-    def _infer_feature_dim(x: torch.Tensor) -> int:
-        if x.ndim == 1:
-            return x.shape[0]
-        return x.shape[-1]
+    def _feature_dim(t: torch.Tensor) -> int:
+        return t.shape[-1] if t.ndim >= 1 else 1
 
-    def _extract_BT(self, x: torch.Tensor) -> Tuple[Optional[int], Optional[int]]:
+    def _infer_BT(self, t: torch.Tensor) -> Tuple[Optional[int], Optional[int]]:
         """
-        Returns (B, T) candidate for tensor x; None if not present.
-        - ndim==3 -> (B, T)
-        - ndim==2 -> (B, None) if time_dependent==False else (None, T)
-        - ndim==1 -> (None, None)
+        Return candidate (B, T) from tensor shape.
         """
-        if x.ndim == 3:
-            return x.shape[0], x.shape[1]
-        if x.ndim == 2:
-            if self.time_dependent:
-                return None, x.shape[0]   # interpret as [T,H]
-            else:
-                return x.shape[0], None   # interpret as [B,H]
-        if x.ndim == 1:
+        if t.ndim == 3:
+            return t.shape[0], t.shape[1]
+        if t.ndim == 2:
+            return (None, t.shape[0]) if self.time_dependent else (t.shape[0], None)
+        if t.ndim == 1:
             return None, None
-        raise ValueError(f"Unsupported tensor ndim {x.ndim}")
+        raise ValueError(f"Unsupported tensor ndim {t.ndim}")
 
     def infer_global_BT(self) -> Tuple[Optional[int], Optional[int]]:
         """
-        Infer global B and T from available contexts using deterministic rules:
-         - If any tensor has explicit batch (ndim==3 or 2 when time_dependent==False),
-           take max batch size among those tensors as B.
-         - If any tensor has explicit time (ndim==3 or 2 when time_dependent==True),
-           take max time length among those tensors as T.
-        Returns (B, T) with None if neither found.
+        Determine global batch (B) and time (T) dimensions from all tensors.
         """
-        B_candidates = []
-        T_candidates = []
-        for x in self.X:
-            b, t = self._extract_BT(x)
-            if b is not None:
-                B_candidates.append(b)
-            if t is not None:
-                T_candidates.append(t)
+        B_candidates, T_candidates = [], []
+        for t in self.tensors:
+            b, temp = self._infer_BT(t)
+            if b is not None: B_candidates.append(b)
+            if temp is not None: T_candidates.append(temp)
+        return (max(B_candidates) if B_candidates else None,
+                max(T_candidates) if T_candidates else None)
 
-        B = max(B_candidates) if B_candidates else None
-        T = max(T_candidates) if T_candidates else None
-        return B, T
-
-    def _broadcast_to_B_T_H(self, x: torch.Tensor, B: Optional[int], T: Optional[int]) -> torch.Tensor:
+    def _broadcast(self, t: torch.Tensor, B: Optional[int], T: Optional[int]) -> torch.Tensor:
         """
-        Broadcast a single context tensor x into shape:
-          - [B, T, H] if both B and T provided,
-          - [B, 1, H] if only B provided,
-          - [1, T, H] if only T provided,
-          - [1, 1, H] if neither provided.
-
-        Rules for input shapes:
-          - [B, T, H] -> validated and returned
-          - [T, H]     -> if time_dependent True, becomes [1, T, H] or [B, T, H] when B known
-          - [B, H]     -> if time_dependent False, becomes [B, 1, H] or [B, T, H] when T known
-          - [H]        -> broadcast to all dims present
+        Broadcast a tensor to [B, T, H] shape.
         """
-        h = self._infer_feature_dim(x)
+        H = self._feature_dim(t)
 
-        # full 3D
-        if x.ndim == 3:
-            bx, tx, hx = x.shape
-            if B is not None and bx != B:
-                raise ValueError(f"Context batch mismatch: tensor has B={bx} but expected B={B}")
-            if T is not None and tx != T:
-                raise ValueError(f"Context time mismatch: tensor has T={tx} but expected T={T}")
-            return x
-
-        # 2D case: interpret by time_dependent flag
-        if x.ndim == 2:
+        if t.ndim == 3:
+            b, temp, h = t.shape
+            if B is not None and b != B: raise ValueError(f"B mismatch: {b} vs {B}")
+            if T is not None and temp != T: raise ValueError(f"T mismatch: {temp} vs {T}")
+            return t
+        if t.ndim == 2:
             if self.time_dependent:
-                # treat as [T, H]
-                tx, hx = x.shape
-                if T is not None and tx != T:
-                    raise ValueError(f"Context time length {tx} != global T {T}")
-                if B is None:
-                    # return [1, T, H]
-                    return x.unsqueeze(0)
-                # return [B, T, H]
-                return x.unsqueeze(0).expand(B, tx, hx)
+                temp, h = t.shape
+                if T is not None and temp != T: raise ValueError(f"T mismatch: {temp} vs {T}")
+                return t.unsqueeze(0).expand(B or 1, temp, h)
             else:
-                # treat as [B, H]
-                bx, hx = x.shape
-                if B is not None and bx != B:
-                    raise ValueError(f"Context batch size {bx} != global B {B}")
-                if T is None:
-                    # return [B, 1, H]
-                    return x.unsqueeze(1)
-                # return [B, T, H]
-                return x.unsqueeze(1).expand(bx, T, hx)
+                b, h = t.shape
+                if B is not None and b != B: raise ValueError(f"B mismatch: {b} vs {B}")
+                return t.unsqueeze(1).expand(b, T or 1, h)
+        if t.ndim == 1:
+            return t.view(1, 1, H).expand(B or 1, T or 1, H)
+        raise ValueError(f"Unsupported tensor ndim {t.ndim}")
 
-        # 1D case: [H]
-        if x.ndim == 1:
-            hx = x.shape[0]
-            if B is not None and T is not None:
-                return x.view(1, 1, hx).expand(B, T, hx)
-            if B is not None:
-                return x.view(1, hx).expand(B, hx).unsqueeze(1)  # [B,1,H]
-            if T is not None:
-                return x.view(1, hx).expand(T, hx).unsqueeze(0)  # [1,T,H]
-            return x.view(1, 1, hx)  # [1,1,H]
-
-        raise ValueError(f"Unsupported tensor ndim {x.ndim}")
-
-    def cat(self, dim: int = -1, normalize: bool = False, eps: float = 1e-6) -> torch.Tensor:
+    def concatenate(self, dim: int = -1, normalize: bool = False, eps: float = 1e-6) -> torch.Tensor:
         """
-        Concatenate all context tensors into a single tensor.
-
-        Output shape:
-          - If global B or T inferred: returns [B, T, H_combined] (missing dims broadcasted)
-          - If no B/T found: returns [1, 1, H_combined]
-
-        Caches result with key (dim, normalize, B, T).
+        Concatenate all context tensors to shape [B, T, H_combined].
         """
         B, T = self.infer_global_BT()
-        cache_key = (dim, normalize, B, T)
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+        key = (dim, normalize, B, T)
+        if key in self._cache:
+            return self._cache[key]
 
-        # Broadcast each X to (B,T,H) semantics
-        Xb = [self._broadcast_to_B_T_H(x, B, T) for x in self.X]
+        broadcasted = [self._broadcast(t, B, T) for t in self.tensors]
 
-        # Concatenate along requested dim: for convenience, allow dim in {-1, -2, -3} relative to [B,T,H]
-        # normalize to positive dim
-        # we always concatenate on feature dim (last) unless user explicitly passed different value
-        if dim < 0:
-            dim_adj = 3 + dim  # -1 -> 2, -2 -> 1, -3 -> 0
-        else:
-            dim_adj = dim
+        dim_adj = 3 + dim if dim < 0 else dim
+        if dim_adj not in {0, 1, 2}:
+            raise ValueError("`dim` must be in [-3, 2]")
 
-        # we expect user normally wants to concat features (dim_adj==2)
-        if dim_adj not in (0, 1, 2):
-            raise ValueError("`dim` must be -3..2 for the resulting [B,T,H] tensor")
-
-        out = Xb[0] if len(Xb) == 1 else torch.cat(Xb, dim=dim_adj)
+        out = broadcasted[0] if len(broadcasted) == 1 else torch.cat(broadcasted, dim=dim_adj)
 
         if normalize:
-            # normalize per-feature across batch+time: preserve per-feature statistics
-            mean = out.mean(dim=(0, 1), keepdim=True)
-            std = out.std(dim=(0, 1), keepdim=True).clamp_min(eps)
+            mean = out.mean((0, 1), keepdim=True)
+            std = out.std((0, 1), keepdim=True).clamp_min(eps)
             out = (out - mean) / std
 
-        self._cache[cache_key] = out
+        self._cache[key] = out
         return out
 
-    def to(self, device, dtype=None) -> "ContextualVariables":
-        X = [x.to(device=device, dtype=dtype) if dtype is not None else x.to(device=device) for x in self.X]
-        return ContextualVariables(self.n_context, X, self.time_dependent, self.names)
+    # ---------------- Utility ----------------
+    def to(self, device, dtype=None) -> "ContextFeatures":
+        tensors = [t.to(device=device, dtype=dtype) if dtype else t.to(device) for t in self.tensors]
+        return ContextFeatures(self.n_context, tensors, self.time_dependent, self.names)
 
-    def detach(self) -> "ContextualVariables":
-        X = [x.detach() for x in self.X]
-        return ContextualVariables(self.n_context, X, self.time_dependent, self.names)
+    def detach(self) -> "ContextFeatures":
+        return ContextFeatures(self.n_context, [t.detach() for t in self.tensors],
+                                   self.time_dependent, self.names)
 
-    def clone(self) -> "ContextualVariables":
-        X = [x.clone() for x in self.X]
-        return ContextualVariables(self.n_context, X, self.time_dependent, self.names)
+    def clone(self) -> "ContextFeatures":
+        return ContextFeatures(self.n_context, [t.clone() for t in self.tensors],
+                                   self.time_dependent, self.names)
 
-    def __getitem__(self, idx: Union[int, slice]) -> "ContextualVariables":
-        Xsel = [x[idx] for x in self.X]
-        return ContextualVariables(self.n_context, Xsel, self.time_dependent,
-                                   None if self.names is None else [self.names[i] for i in range(len(self.names))][idx])
+    def __getitem__(self, idx: Union[int, slice]) -> "ContextFeatures":
+        tensors = [t[idx] for t in self.tensors]
+        names = None if self.names is None else [self.names[i] for i in range(len(self.names))][idx]
+        return ContextFeatures(self.n_context, tensors, self.time_dependent, names)
 
     def __repr__(self):
-        names = self.names or [f"ctx{i}" for i in range(self.n_context)]
-        specs = ", ".join(f"{n}:{tuple(x.shape)}" for n, x in zip(names, self.X))
-        td = "time-vary" if self.time_dependent else "static"
-        return f"<ContextualVariables[{td}] {specs}>"
+        names = self.names or [f"context{i}" for i in range(self.n_context)]
+        shapes = ", ".join(f"{n}:{tuple(t.shape)}" for n, t in zip(names, self.tensors))
+        td_flag = "time-varying" if self.time_dependent else "static"
+        return f"<ContextFeatures[{td_flag}] {shapes}>"
 

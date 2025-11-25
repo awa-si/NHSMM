@@ -1,4 +1,6 @@
 import torch
+from torch.distributions import Categorical, Bernoulli, Poisson
+
 from enum import Enum
 from typing import Union
 from nhsmm.constants import DTYPE, EPS, logger
@@ -98,11 +100,13 @@ def init_covars(base_cov: torch.Tensor, cov_type: Union[str, CovarianceType], n_
     elif base_cov.ndim == 1 and base_cov.numel() == n_features:
         base_cov = torch.diag(base_cov)
     base_cov = base_cov.to(device=device, dtype=DTYPE)
+    
     if c == "spherical":
         val = base_cov.mean().clamp_min(eps)
         return val.repeat(n_states)
     if c == "diag":
-        return torch.diag(base_cov).clamp_min(eps).unsqueeze(0).expand(n_states, -1)
+        diag_vals = torch.diagonal(base_cov).clamp_min(eps)
+        return diag_vals.unsqueeze(0).expand(n_states, -1)
     if c == "tied":
         _assert_spd(base_cov, "TIED", eps)
         return base_cov
@@ -123,7 +127,7 @@ def fill_covars(covars: torch.Tensor, cov_type: Union[str, CovarianceType], n_st
     if c == "spherical":
         val = covars.clamp_min(eps)
         eye = torch.eye(n_features, dtype=val.dtype, device=val.device)
-        return eye.unsqueeze(0).expand(n_states, -1, -1) * val.view(-1, 1, 1)
+        return eye.unsqueeze(0).expand(n_states, -1, -1) * val[:, None, None]
     raise NotImplementedError(f"Unsupported cov_type: {c}")
 
 def validate_lambdas(lambdas: torch.Tensor, n_states: int, n_features: int, eps: float = EPS) -> torch.Tensor:
@@ -132,3 +136,67 @@ def validate_lambdas(lambdas: torch.Tensor, n_states: int, n_features: int, eps:
     if not torch.isfinite(lambdas).all() or (lambdas <= eps).any():
         raise ValueError(f"Lambdas must be > {eps} and finite.")
     return lambdas
+
+def validate_emissions(
+    x: torch.Tensor,
+    emission_type: str,
+    n_states: int,
+    n_features: int,
+    clamp: bool = False,
+    allow_nan: bool = False,
+    eps: float = EPS
+) -> torch.Tensor:
+    """
+    Validate emission tensor `x` for supported emission types.
+
+    Args:
+        x: Observation tensor, shape [N, D] or [N, K, D]
+        emission_type: One of {"gaussian", "laplace", "studentt", "categorical", "bernoulli", "poisson"}
+        n_states: Number of states (K)
+        n_features: Number of features (D)
+        clamp: Clamp continuous out-of-support values if True
+        allow_nan: Allow NaN/Inf if True
+        eps: Small constant for stability
+
+    Returns:
+        Validated tensor, broadcasted to [N, K, D] for continuous emissions or [N, K, D] for discrete.
+    """
+    etype = emission_type.lower()
+    x_out = x.clone()
+
+    # --- Shape check ---
+    if x_out.ndim == 2:
+        x_out = x_out.unsqueeze(1).expand(-1, n_states, -1)
+    elif x_out.ndim == 3:
+        if x_out.shape[1] != n_states or x_out.shape[2] != n_features:
+            raise ValueError(f"Emission shape mismatch: expected [N, {n_states}, {n_features}], got {x_out.shape}")
+    else:
+        raise ValueError(f"Unsupported emission tensor ndim: {x_out.ndim}")
+
+    # --- NaN / Inf check ---
+    if not allow_nan and not torch.isfinite(x_out).all():
+        bad_vals = x_out[~torch.isfinite(x_out)].unique()
+        raise ValueError(f"NaN or Inf detected in emissions: {bad_vals}")
+
+    # --- Continuous clamping ---
+    if etype in {"gaussian", "laplace", "studentt"}:
+        if clamp:
+            x_out = x_out.clamp(-1e6, 1e6)
+
+    # --- Discrete type range checks ---
+    elif etype == "categorical":
+        if (x_out < 0).any() or (x_out >= n_features).any():
+            raise ValueError(f"Categorical emissions must be in [0, {n_features-1}]")
+        x_out = x_out.long()
+    elif etype == "bernoulli":
+        if (x_out < 0).any() or (x_out > 1).any():
+            raise ValueError("Bernoulli emissions must be 0 or 1")
+        x_out = x_out.float()
+    elif etype == "poisson":
+        if (x_out < 0).any():
+            raise ValueError("Poisson emissions must be non-negative")
+        x_out = x_out.long()
+    else:
+        raise NotImplementedError(f"Unsupported emission_type: {etype}")
+
+    return x_out
