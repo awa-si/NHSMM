@@ -500,8 +500,8 @@ class HSMM(nn.Module, ABC):
             # First try per-timestep context; fallback to canonical
             try:
                 emission_dist = self.emission_module.forward(context=ctx_b, return_dist=True)
-            except Exception:
-                logger.warning(f"Emission module failed forward pass: {e}, forward...")
+            except Exception as err:
+                logger.warning(f"Emission module failed forward pass: {err}, forward...")
                 emission_dist = self.emission_module.forward(context=ctx_canonical[b], return_dist=True)
 
             T_seq = seq_b.shape[0]
