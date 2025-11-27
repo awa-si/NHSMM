@@ -8,22 +8,21 @@ from typing import Dict, List, Optional, Union, Tuple
 @dataclass(frozen=False)
 class SequenceSet:
     """
-    Container for sequences, optional log-probabilities, context tensors, and masks.
+    Container for sequences, log-probabilities, context tensors, and masks.
 
     Supports:
-        - Single sequence: [T,F] or [T]
-        - Batched sequences: [B,T,F] or [B,T]
-        - Context: [T,H], [1,H], [B,T,H], [B,H]
-        - Mask: [T], [T,1], [B,T], [B,T,1]
+        - Single sequence: [timesteps, features] or [timesteps]
+        - Batched sequences: [batch, timesteps, features]
+        - Contexts: [timesteps, hidden], [1, hidden], [batch, timesteps, hidden], [batch, hidden]
+        - Masks: [timesteps], [timesteps, 1], [batch, timesteps], [batch, timesteps, 1]
     """
 
     sequences: List[torch.Tensor]
     lengths: Optional[List[int]] = None
+    masks: Optional[List[torch.Tensor]] = None
     log_probs: Optional[List[torch.Tensor]] = None
     contexts: Optional[List[Optional[torch.Tensor]]] = None
-    masks: Optional[List[torch.Tensor]] = None
 
-    # ---------------- Post Init ----------------
     def __post_init__(self):
         self.sequences = self._canonicalize_list(self.sequences, "sequences")
         seqs = self.sequences
@@ -43,7 +42,7 @@ class SequenceSet:
             self.log_probs = self._canonicalize_list(self.log_probs, "log_probs", allow_none=False)
             if len(self.log_probs) != len(seqs):
                 raise ValueError("`log_probs` length mismatch.")
-            self.log_probs = [self._ensure_2d_time_major(lp, L) for lp, L in zip(self.log_probs, self.lengths)]
+            self.log_probs = [self._normalize_log_probs(lp, timesteps) for lp, timesteps in zip(self.log_probs, self.lengths)]
 
         # Canonicalize contexts
         if self.contexts is None:
@@ -52,17 +51,17 @@ class SequenceSet:
             self.contexts = self._canonicalize_list(self.contexts, "contexts", allow_none=True)
             if len(self.contexts) != len(seqs):
                 raise ValueError("`contexts` length mismatch.")
-            self.contexts = [self._normalize_context(c, L) if c is not None else None
-                             for c, L in zip(self.contexts, self.lengths)]
+            self.contexts = [self._normalize_context(ctx, timesteps) if ctx is not None else None
+                             for ctx, timesteps in zip(self.contexts, self.lengths)]
 
         # Canonicalize masks
         if self.masks is None:
-            self.masks = [torch.ones(L, 1, dtype=torch.bool) for L in self.lengths]
+            self.masks = [torch.ones(timesteps, 1, dtype=torch.bool) for timesteps in self.lengths]
         else:
             self.masks = self._canonicalize_list(self.masks, "masks", allow_none=False)
             if len(self.masks) != len(seqs):
                 raise ValueError("`masks` length mismatch.")
-            self.masks = [self._normalize_mask(m, L) for m, L in zip(self.masks, self.lengths)]
+            self.masks = [self._normalize_mask(mask, timesteps) for mask, timesteps in zip(self.masks, self.lengths)]
 
     # ---------------- Internal helpers ----------------
     def _canonicalize_list(self, items, name, allow_none=False):
@@ -74,51 +73,58 @@ class SequenceSet:
             return [t for t in items]
         raise TypeError(f"`{name}` must be a tensor or list of tensors.")
 
-    def _ensure_2d_time_major(self, tensor, T):
+    def _normalize_log_probs(self, tensor, timesteps):
         """
-        Ensures tensor shape is [T, F] or [T, 1] for log_probs.
+        Ensures log_probs tensor shape is [timesteps, features]
+        Handles outputs from default distributions: [timesteps], [timesteps, F], [timesteps,1,F], [1,timesteps,F]
         """
-        if tensor.ndim == 1 and tensor.shape[0] == T:
+        if tensor.ndim == 1 and tensor.shape[0] == timesteps:
             return tensor.unsqueeze(1)
         if tensor.ndim == 2:
-            if tensor.shape[0] == 1 and tensor.shape[1] == T:
-                return tensor.squeeze(0).unsqueeze(1)
-            if tensor.shape[0] == T:
+            if tensor.shape[0] == timesteps:
                 return tensor
-        raise ValueError(f"Invalid tensor shape {tensor.shape} for T={T}")
+            if tensor.shape[0] == 1 and tensor.shape[1] == timesteps:
+                return tensor.squeeze(0).unsqueeze(1)
+        if tensor.ndim == 3:
+            if tensor.shape[0] == 1 and tensor.shape[1] == timesteps:
+                return tensor.squeeze(0)
+            if tensor.shape[1] == 1 and tensor.shape[0] == timesteps:
+                return tensor.squeeze(1)
+        raise ValueError(f"Invalid log_probs shape {tensor.shape} for timesteps={timesteps}")
 
-    def _normalize_context(self, ctx, T):
+    def _normalize_context(self, ctx, timesteps):
         """
-        Normalize context tensor to shape [T, H].
+        Normalize context tensor to [timesteps, hidden]
+        Handles [timesteps,H], [1,H], [timesteps,1,H], [batch,timesteps,H], [batch,H]
         """
         if ctx.ndim == 1:
-            return ctx.unsqueeze(0).expand(T, -1)
+            return ctx.unsqueeze(0).expand(timesteps, -1)
         if ctx.ndim == 2:
-            if ctx.shape[0] == 1 or ctx.shape[0] == T:
-                return ctx.expand(T, -1) if ctx.shape[0] == 1 else ctx
-            raise ValueError(f"Invalid context shape {ctx.shape} for T={T}")
+            if ctx.shape[0] == timesteps or ctx.shape[0] == 1:
+                return ctx.expand(timesteps, -1)
         if ctx.ndim == 3:
-            if ctx.shape[0] == 1:
+            if ctx.shape[0] == 1 and ctx.shape[1] == timesteps:
                 return ctx.squeeze(0)
-            raise ValueError("Context batch >1 not supported per sequence.")
-        raise ValueError(f"Unsupported context shape {ctx.shape}")
+            if ctx.shape[1] == 1 and ctx.shape[0] == timesteps:
+                return ctx.squeeze(1)
+        raise ValueError(f"Unsupported context shape {ctx.shape} for timesteps={timesteps}")
 
-    def _normalize_mask(self, mask, T):
+    def _normalize_mask(self, mask, timesteps):
         """
-        Normalize mask to shape [T, 1] boolean.
+        Normalize mask to [timesteps,1] boolean
+        Handles [timesteps], [timesteps,1], [batch,timesteps], [batch,timesteps,1]
         """
-        if mask.ndim == 1 and mask.shape[0] == T:
+        if mask.ndim == 1 and mask.shape[0] == timesteps:
             return mask.bool().unsqueeze(1)
         if mask.ndim == 2:
-            if mask.shape == (T, 1):
+            if mask.shape == (timesteps, 1):
                 return mask.bool()
-            if mask.shape[0] == 1 and mask.shape[1] == T:
+            if mask.shape[0] == 1 and mask.shape[1] == timesteps:
                 return mask.squeeze(0).unsqueeze(1).bool()
-            if mask.shape[0] == 1 and mask.shape[1] == T:
-                return mask.squeeze(0).unsqueeze(1).bool()
-        if mask.ndim == 3 and mask.shape[0] == 1 and mask.shape[1] == T:
-            return mask.squeeze(0).bool()
-        raise ValueError(f"Invalid mask shape {mask.shape} for T={T}")
+        if mask.ndim == 3:
+            if mask.shape[0] == 1 and mask.shape[1] == timesteps:
+                return mask.squeeze(0).bool()
+        raise ValueError(f"Invalid mask shape {mask.shape} for timesteps={timesteps}")
 
     # ---------------- Properties ----------------
     @property
@@ -126,7 +132,7 @@ class SequenceSet:
         return len(self.sequences)
 
     @property
-    def total_length(self):
+    def total_timesteps(self):
         return sum(self.lengths)
 
     @property
@@ -144,26 +150,6 @@ class SequenceSet:
     def dtype(self):
         return self.sequences[0].dtype
 
-    # ---------------- Clone / Detach ----------------
-    def detach(self):
-        return SequenceSet(
-            sequences=[s.detach() for s in self.sequences],
-            lengths=list(self.lengths),
-            log_probs=[lp.detach() for lp in self.log_probs] if self.log_probs is not None else None,
-            contexts=[c.detach() if c is not None else None for c in self.contexts],
-            masks=[m.clone() for m in self.masks],
-        )
-
-    def clone(self):
-        return SequenceSet(
-            sequences=[s.clone() for s in self.sequences],
-            lengths=list(self.lengths),
-            log_probs=[lp.clone() for lp in self.log_probs] if self.log_probs is not None else None,
-            contexts=[c.clone() if c is not None else None for c in self.contexts],
-            masks=[m.clone() for m in self.masks],
-        )
-
-    # ---------------- Indexing ----------------
     def __getitem__(self, idx):
         def pick(lst):
             if lst is None:
@@ -171,6 +157,7 @@ class SequenceSet:
             if isinstance(idx, slice):
                 return lst[idx]
             return [lst[idx]]
+
         return SequenceSet(
             sequences=pick(self.sequences),
             lengths=pick(self.lengths),
@@ -179,28 +166,27 @@ class SequenceSet:
             masks=pick(self.masks),
         )
 
-    # ---------------- Convert to tensor ----------------
-    def to_tensor(self, key="sequences"):
+    def to_tensor(self, key="sequences", pad_value=0.0):
         items = getattr(self, key)
         if items is None:
             raise ValueError(f"{key} is None.")
-        B = len(items)
-        T_max = max(t.shape[0] for t in items)
-        H = items[0].shape[-1]
 
-        out = torch.zeros(B, T_max, H, dtype=self.dtype, device=self.device)
+        batch_size = len(items)
+        timesteps_max = max(t.shape[0] for t in items)
+        feature_dim = items[0].shape[-1] if items[0].ndim > 1 else 1
+
+        out = torch.full((batch_size, timesteps_max, feature_dim),
+                         fill_value=pad_value,
+                         dtype=self.dtype,
+                         device=self.device)
+
         for i, t in enumerate(items):
-            out[i, :t.shape[0]] = t
-        return out
+            if t.ndim == 1:  # Single feature
+                out[i, :t.shape[0], 0] = t
+            else:
+                out[i, :t.shape[0], :t.shape[1]] = t
 
-    # ---------------- Summary ----------------
-    def summary(self):
-        return (
-            f"SequenceSet(n_sequences={self.n_sequences}, "
-            f"total_length={self.total_length}, "
-            f"feature_dim={self.feature_dim}, "
-            f"mask_coverage={[m.sum().item() for m in self.masks]})"
-        )
+        return out
 
 
 @dataclass(frozen=False)

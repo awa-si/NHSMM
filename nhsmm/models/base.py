@@ -431,90 +431,84 @@ class HSMM(nn.Module, ABC):
         self,
         X: torch.Tensor,
         theta: Optional[torch.Tensor] = None,
-    ) -> SequenceSet:
+    ) -> utils.SequenceSet:
         """
-        Prepares SequenceSet:
+        Prepares SequenceSet with fully batch-aligned tensors:
             - Computes aligned + canonical context (via encoder or provided theta)
             - Computes log-probs per timestep and state
             - Builds masks + lengths
+
+        Returns:
+            SequenceSet with:
+                - sequences: list of [T,F] tensors
+                - lengths: list of sequence lengths
+                - log_probs: list of [T,K] tensors
+                - contexts: [B,T,H] tensor
+                - masks: [B,T,1] tensor
         """
-        # ---- Ensure batch dimension ----
+        # Ensure batch dimension
         if X.ndim == 2:
             X = X.unsqueeze(0)
         B, T, F = X.shape
+        device = X.device
 
-        # ---- Masks: [B,T,1] ----
-        mask = torch.ones(B, T, 1, dtype=torch.bool)
+        # Masks
+        mask = torch.ones(B, T, 1, dtype=torch.bool, device=device)
 
-        # ---- Context computation ----
-        if theta is None:
-            context_aligned = []
-            ctx_canonical = []
-            for b in range(B):
-                ctx_t, ctx_c = self._encode_observations(X[b])
-                context_aligned.append(ctx_t)    # [T,H]
-                ctx_canonical.append(ctx_c)      # [1,H]
+        # Context
+        if theta is not None:
+            aligned_theta = self._align_theta(theta, seq_len=T)  # [B,T,H] or [1,T,H]
+            context_aligned = aligned_theta.expand(B, T, -1)
+            ctx_canonical = context_aligned[:, :1, :]
         else:
-            aligned_theta = self._align_theta(theta, seq_len=T)  # [B,T,H]
-            context_aligned = [aligned_theta[b] for b in range(B)]
-            ctx_canonical = [aligned_theta[b, :1, :] for b in range(B)]
+            context_aligned, ctx_canonical = self._encode_observations(X)  # [B,T,H], [B,1,H]
+            if context_aligned is None:
+                context_aligned = torch.zeros(B, T, self.context_dim, device=device)
+                ctx_canonical = torch.zeros(B, 1, self.context_dim, device=device)
 
-        # ---- Emission parameters ----
+        # Emission parameters
         dist_type = self.emission_module.dist_type
         K = self.n_states
-
-        if not dist_type in (torch.distributions.Categorical, torch.distributions.Bernoulli):
-            means = self.emission_module._emission_means
-            covs = self.emission_module._emission_covs
-            stds = covs.diagonal(dim1=-2, dim2=-1).sqrt()
-
-        # ---- Log-probs per batch ----
         log_probs_list = []
 
-        for b in range(B):
-            seq_b = X[b]                  # [T,F]
-            ctx_b = context_aligned[b]    # [T,H]
+        if dist_type in (torch.distributions.Categorical, torch.distributions.Bernoulli):
+            # Categorical or Bernoulli emissions
+            emission_dist = self.emission_module.forward(context=context_aligned, return_dist=True)
+            logits = emission_dist.logits  # [B,K,F]
+            seq_cat = X[..., 0].long()     # [B,T]
+            log_probs_all = F.log_softmax(logits, dim=-1)  # [B,K,F]
 
-            # Try per-timestep context; fallback to canonical
-            try:
-                emission_dist = self.emission_module.forward(context=ctx_b, return_dist=True)
-            except Exception as err:
-                logger.warning(f"Emission module failed forward pass: {err}, using canonical context")
-                emission_dist = self.emission_module.forward(context=ctx_canonical[b], return_dist=True)
-
-            T_seq = seq_b.shape[0]
-
-            # ---- Categorical/Bernoulli ----
-            if dist_type in (torch.distributions.Categorical, torch.distributions.Bernoulli):
-                logits = emission_dist.logits       # [K,F]
-                seq_cat = seq_b[:, 0].long()        # [T]
-
-                log_probs_all = F.log_softmax(logits, dim=-1)  # [K,F]
-                log_probs = torch.gather(
-                    log_probs_all.unsqueeze(0).expand(T_seq, K, -1),
+            # Gather log-probs per sequence
+            for b in range(B):
+                seq_log = torch.gather(
+                    log_probs_all[b].unsqueeze(0).expand(T, K, -1),
                     -1,
-                    seq_cat.view(T_seq, 1, 1).expand(-1, K, 1)
+                    seq_cat[b].view(T, 1, 1).expand(-1, K, 1)
                 ).squeeze(-1)  # [T,K]
+                log_probs_list.append(seq_log)
+        else:
+            # Gaussian / Independent emissions
+            means = self.emission_module._emission_means  # [K,F]
+            covs = self.emission_module._emission_covs
+            stds = covs.diagonal(dim1=-2, dim2=-1).sqrt()  # [K,F]
 
-            # ---- Gaussian/Independent ----
-            else:
-                seq_exp  = seq_b.unsqueeze(1).expand(T_seq, K, F)
-                means_exp = means.unsqueeze(0).expand(T_seq, K, F)
-                stds_exp  = stds.unsqueeze(0).expand(T_seq, K, F)
+            means_exp = means.unsqueeze(0).expand(T, K, F)
+            stds_exp = stds.unsqueeze(0).expand(T, K, F)
 
+            for b in range(B):
+                seq_exp = X[b].unsqueeze(1).expand(T, K, F)
                 log_probs = -0.5 * torch.log(2 * torch.pi * stds_exp**2)
                 log_probs -= 0.5 * ((seq_exp - means_exp)**2 / (stds_exp**2))
                 log_probs = log_probs.sum(-1)  # [T,K]
+                log_probs_list.append(log_probs)
 
-            log_probs_list.append(log_probs)
-
-        # ---- Pack result ----
+        # Build SequenceSet
         return utils.SequenceSet(
-            sequences=[X[b] for b in range(B)],
+            sequences=[X[b] for b in range(B)],       # list of [T,F]
             lengths=[T] * B,
-            log_probs=log_probs_list,
-            contexts=context_aligned,
-            masks=[mask[b] for b in range(B)],
+            log_probs=log_probs_list,                 # list of [T,K]
+            contexts=context_aligned,                 # [B,T,H]
+            masks=mask                                # [B,T,1]
         )
 
     def _ensure_dim(self, module, context: Optional[torch.Tensor] = None) -> torch.Tensor:
