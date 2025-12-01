@@ -1,20 +1,21 @@
 # nhsmm/tools/utils.py
 
 import torch
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union, Tuple
 
 
 @dataclass(frozen=False)
 class SequenceSet:
     """
-    Container for sequences, log-probabilities, context tensors, and masks.
+    Modern container for sequences, log-probabilities, contexts, and masks.
 
     Supports:
         - Single sequence: [timesteps, features] or [timesteps]
         - Batched sequences: [batch, timesteps, features]
         - Contexts: [timesteps, hidden], [1, hidden], [batch, timesteps, hidden], [batch, hidden]
         - Masks: [timesteps], [timesteps, 1], [batch, timesteps], [batch, timesteps, 1]
+        - Log-probs: [timesteps, features], [timesteps], or [timesteps, 1, features]
     """
 
     sequences: List[torch.Tensor]
@@ -24,83 +25,77 @@ class SequenceSet:
     contexts: Optional[List[Optional[torch.Tensor]]] = None
 
     def __post_init__(self):
-        self.sequences = self._canonicalize_list(self.sequences, "sequences")
-        seqs = self.sequences
+        # Canonicalize sequences to list of tensors
+        self.sequences = self._ensure_list(self.sequences, "sequences")
+        batch_size = len(self.sequences)
 
-        # Infer sequence lengths if missing
+        # Infer lengths
         if self.lengths is None:
-            self.lengths = [s.shape[0] for s in seqs]
+            self.lengths = [s.shape[0] for s in self.sequences]
+        elif len(self.lengths) != batch_size:
+            raise ValueError("`lengths` must match number of sequences.")
         else:
-            if len(self.lengths) != len(seqs):
-                raise ValueError("`lengths` must match number of sequences.")
-            for s, l in zip(seqs, self.lengths):
+            for s, l in zip(self.sequences, self.lengths):
                 if s.shape[0] != l:
-                    raise ValueError("Sequence length mismatch.")
+                    raise ValueError(f"Sequence length mismatch: {s.shape[0]} vs {l}")
 
-        # Canonicalize log probabilities
+        # Canonicalize log_probs
         if self.log_probs is not None:
-            self.log_probs = self._canonicalize_list(self.log_probs, "log_probs", allow_none=False)
-            if len(self.log_probs) != len(seqs):
-                raise ValueError("`log_probs` length mismatch.")
-            self.log_probs = [self._normalize_log_probs(lp, timesteps) for lp, timesteps in zip(self.log_probs, self.lengths)]
+            self.log_probs = self._ensure_list(self.log_probs, "log_probs", allow_none=False)
+            if len(self.log_probs) != batch_size:
+                raise ValueError("`log_probs` length mismatch")
+            self.log_probs = [self._normalize_log_probs(lp, l) for lp, l in zip(self.log_probs, self.lengths)]
 
         # Canonicalize contexts
         if self.contexts is None:
-            self.contexts = [None] * len(seqs)
+            self.contexts = [None] * batch_size
         else:
-            self.contexts = self._canonicalize_list(self.contexts, "contexts", allow_none=True)
-            if len(self.contexts) != len(seqs):
-                raise ValueError("`contexts` length mismatch.")
-            self.contexts = [self._normalize_context(ctx, timesteps) if ctx is not None else None
-                             for ctx, timesteps in zip(self.contexts, self.lengths)]
+            self.contexts = self._ensure_list(self.contexts, "contexts", allow_none=True)
+            if len(self.contexts) != batch_size:
+                raise ValueError("`contexts` length mismatch")
+            self.contexts = [
+                self._normalize_context(ctx, l) if ctx is not None else None
+                for ctx, l in zip(self.contexts, self.lengths)
+            ]
 
         # Canonicalize masks
         if self.masks is None:
-            self.masks = [torch.ones(timesteps, 1, dtype=torch.bool) for timesteps in self.lengths]
+            self.masks = [torch.ones(l, 1, dtype=torch.bool, device=self.sequences[0].device) for l in self.lengths]
         else:
-            self.masks = self._canonicalize_list(self.masks, "masks", allow_none=False)
-            if len(self.masks) != len(seqs):
-                raise ValueError("`masks` length mismatch.")
-            self.masks = [self._normalize_mask(mask, timesteps) for mask, timesteps in zip(self.masks, self.lengths)]
+            self.masks = self._ensure_list(self.masks, "masks", allow_none=False)
+            if len(self.masks) != batch_size:
+                raise ValueError("`masks` length mismatch")
+            self.masks = [self._normalize_mask(m, l) for m, l in zip(self.masks, self.lengths)]
 
     # ---------------- Internal helpers ----------------
-    def _canonicalize_list(self, items, name, allow_none=False):
+    def _ensure_list(self, items: Union[torch.Tensor, List[torch.Tensor], None], name: str, allow_none=False):
         if torch.is_tensor(items):
             return [items]
         if isinstance(items, list):
             if allow_none:
                 return [t if t is None else t for t in items]
-            return [t for t in items]
+            return list(items)
         raise TypeError(f"`{name}` must be a tensor or list of tensors.")
 
-    def _normalize_log_probs(self, tensor, timesteps):
-        """
-        Ensures log_probs tensor shape is [timesteps, features]
-        Handles outputs from default distributions: [timesteps], [timesteps, F], [timesteps,1,F], [1,timesteps,F]
-        """
-        if tensor.ndim == 1 and tensor.shape[0] == timesteps:
-            return tensor.unsqueeze(1)
-        if tensor.ndim == 2:
-            if tensor.shape[0] == timesteps:
-                return tensor
-            if tensor.shape[0] == 1 and tensor.shape[1] == timesteps:
-                return tensor.squeeze(0).unsqueeze(1)
-        if tensor.ndim == 3:
-            if tensor.shape[0] == 1 and tensor.shape[1] == timesteps:
-                return tensor.squeeze(0)
-            if tensor.shape[1] == 1 and tensor.shape[0] == timesteps:
-                return tensor.squeeze(1)
-        raise ValueError(f"Invalid log_probs shape {tensor.shape} for timesteps={timesteps}")
+    def _normalize_log_probs(self, lp: torch.Tensor, timesteps: int) -> torch.Tensor:
+        # Remove unnecessary singleton dimensions and ensure [timesteps, features]
+        if lp.ndim == 1 and lp.shape[0] == timesteps:
+            return lp.unsqueeze(-1)
+        if lp.ndim == 2 and lp.shape[0] == timesteps:
+            return lp
+        if lp.ndim == 3:
+            if lp.shape[0] == 1 and lp.shape[1] == timesteps:
+                return lp.squeeze(0)
+            if lp.shape[1] == 1 and lp.shape[0] == timesteps:
+                return lp.squeeze(1)
+        raise ValueError(f"Unsupported log_probs shape {lp.shape} for timesteps={timesteps}")
 
-    def _normalize_context(self, ctx, timesteps):
-        """
-        Normalize context tensor to [timesteps, hidden]
-        Handles [timesteps,H], [1,H], [timesteps,1,H], [batch,timesteps,H], [batch,H]
-        """
+    def _normalize_context(self, ctx: torch.Tensor, timesteps: int) -> torch.Tensor:
+        # Normalize to [timesteps, hidden]
         if ctx.ndim == 1:
             return ctx.unsqueeze(0).expand(timesteps, -1)
         if ctx.ndim == 2:
-            if ctx.shape[0] == timesteps or ctx.shape[0] == 1:
+            if ctx.shape[0] in (1, timesteps):
                 return ctx.expand(timesteps, -1)
         if ctx.ndim == 3:
             if ctx.shape[0] == 1 and ctx.shape[1] == timesteps:
@@ -109,22 +104,15 @@ class SequenceSet:
                 return ctx.squeeze(1)
         raise ValueError(f"Unsupported context shape {ctx.shape} for timesteps={timesteps}")
 
-    def _normalize_mask(self, mask, timesteps):
-        """
-        Normalize mask to [timesteps,1] boolean
-        Handles [timesteps], [timesteps,1], [batch,timesteps], [batch,timesteps,1]
-        """
+    def _normalize_mask(self, mask: torch.Tensor, timesteps: int) -> torch.Tensor:
+        # Normalize to [timesteps,1] boolean
         if mask.ndim == 1 and mask.shape[0] == timesteps:
-            return mask.bool().unsqueeze(1)
-        if mask.ndim == 2:
-            if mask.shape == (timesteps, 1):
-                return mask.bool()
-            if mask.shape[0] == 1 and mask.shape[1] == timesteps:
-                return mask.squeeze(0).unsqueeze(1).bool()
-        if mask.ndim == 3:
-            if mask.shape[0] == 1 and mask.shape[1] == timesteps:
-                return mask.squeeze(0).bool()
-        raise ValueError(f"Invalid mask shape {mask.shape} for timesteps={timesteps}")
+            return mask.bool().unsqueeze(-1)
+        if mask.ndim == 2 and mask.shape in [(timesteps, 1), (1, timesteps)]:
+            return mask.view(timesteps, 1).bool()
+        if mask.ndim == 3 and mask.shape[0] == 1 and mask.shape[1] == timesteps:
+            return mask.squeeze(0).bool()
+        raise ValueError(f"Unsupported mask shape {mask.shape} for timesteps={timesteps}")
 
     # ---------------- Properties ----------------
     @property
@@ -137,7 +125,7 @@ class SequenceSet:
 
     @property
     def feature_dim(self):
-        dims = {s.shape[-1] for s in self.sequences}
+        dims = {s.shape[-1] if s.ndim > 1 else 1 for s in self.sequences}
         if len(dims) != 1:
             raise ValueError("Feature dimension mismatch across sequences.")
         return dims.pop()
@@ -150,22 +138,22 @@ class SequenceSet:
     def dtype(self):
         return self.sequences[0].dtype
 
+    # ---------------- Indexing ----------------
     def __getitem__(self, idx):
         def pick(lst):
             if lst is None:
                 return None
-            if isinstance(idx, slice):
-                return lst[idx]
-            return [lst[idx]]
+            return lst[idx] if isinstance(idx, slice) else [lst[idx]]
 
         return SequenceSet(
             sequences=pick(self.sequences),
             lengths=pick(self.lengths),
             log_probs=pick(self.log_probs),
             contexts=pick(self.contexts),
-            masks=pick(self.masks),
+            masks=pick(self.masks)
         )
 
+    # ---------------- Tensor conversion ----------------
     def to_tensor(self, key="sequences", pad_value=0.0):
         items = getattr(self, key)
         if items is None:
@@ -181,11 +169,8 @@ class SequenceSet:
                          device=self.device)
 
         for i, t in enumerate(items):
-            if t.ndim == 1:  # Single feature
-                out[i, :t.shape[0], 0] = t
-            else:
-                out[i, :t.shape[0], :t.shape[1]] = t
-
+            t_ = t if t.ndim > 1 else t.unsqueeze(-1)
+            out[i, :t_.shape[0], :t_.shape[1]] = t_
         return out
 
 

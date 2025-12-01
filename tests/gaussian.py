@@ -6,7 +6,6 @@ import torch.nn.functional as F
 
 import numpy as np
 import polars as pl
-
 from typing import Optional
 
 from sklearn.preprocessing import LabelEncoder, StandardScaler
@@ -256,8 +255,8 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     np.random.seed(0)
 
-    MAX_ITER = 5
-    MAX_DURATION = 30
+    MAX_ITER = 9
+    MAX_DURATION = 35
     SYMBOL = "BTC/USDT:USDT"
     DATA_DIR = "/opt/trader/user_data/data/bybit/futures_"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -8,10 +8,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nhsmm.context import ContextEncoder
-from nhsmm.constants import DEBUG, DTYPE, EPS, HSMMError, logger, MAX_LOGITS
-from nhsmm.tools import utils, constraints, SeedGenerator, ConvergenceTracker
 from nhsmm.distributions import Categorical, Initial, Emission, Duration, Transition
+from nhsmm.constants import DEBUG, DTYPE, EPS, HSMMError, logger, MAX_LOGITS
+from nhsmm import utils, constraints, SeedGenerator, ConvergenceTracker
+from nhsmm.context import ContextEncoder
 
 
 class HSMM(nn.Module):
@@ -109,7 +109,7 @@ class HSMM(nn.Module):
                     n_heads=n_heads,
                     dropout=dropout,
                     debug=debug,
-                )
+                ).to(device=self.device, dtype=DTYPE)
 
             # --- Infer context/output dimension ---
             if hasattr(self.encoder, "out_dim") and getattr(self.encoder, "out_dim") is not None:
@@ -153,7 +153,7 @@ class HSMM(nn.Module):
             device=self.device,
         )
 
-        self.to(self.device)
+        self.to(device=self.device, dtype=DTYPE)
 
     def _init_modules(
         self,
@@ -178,13 +178,24 @@ class HSMM(nn.Module):
         cache_limit: int = 32,
         debug: bool = False,
     ):
-        """Initialize all HSMM modules with consistent device, context, and precomputation."""
 
         device, debug = self.device, self.debug
 
-        # ---------------- Initial ----------------
+        self.emission_module = Emission(
+            n_states=self.n_states,
+            n_features=self.n_features,
+            adaptive_scale=adaptive_scale,
+            emission_type=emission_type,
+            context_dim=self.context_dim,
+            hidden_dim=self.hidden_dim,
+            modulate_var=modulate_var,
+            temperature=temperature,
+            min_covar=min_covar,
+        ).to(device)
+
         self.initial_module = Initial(
             n_states=self.n_states,
+            n_features=self.n_features,
             init_mode=init_mode_initial,
             context_dim=self.context_dim,
             hidden_dim=self.hidden_dim,
@@ -193,27 +204,9 @@ class HSMM(nn.Module):
             debug=debug
         ).to(device)
 
-        # ---------------- Emission ----------------
-        self.emission_module = Emission(
-            n_states=self.n_states,
-            n_features=self.n_features,
-            temporal_adapter=temporal_adapter,
-            spatial_adapter=spatial_adapter,
-            adaptive_scale=adaptive_scale,
-            emission_type=emission_type,
-            modulate_var=modulate_var,
-            context_dim=self.context_dim,
-            hidden_dim=self.hidden_dim,
-            temperature=temperature,
-            min_covar=min_covar,
-            seed=self.seed,
-            scale=scale,
-            dof=dof,
-        ).to(device)
-
-        # ---------------- Duration ----------------
         self.duration_module = Duration(
             n_states=self.n_states,
+            n_features=self.n_features,
             init_mode=init_mode_duration,
             max_duration=max_duration,
             context_dim=self.context_dim,
@@ -223,9 +216,9 @@ class HSMM(nn.Module):
             debug=debug,
         ).to(device)
 
-        # ---------------- Transition ----------------
         self.transition_module = Transition(
             n_states=self.n_states,
+            n_features=self.n_features,
             init_mode=init_mode_transition,
             transition_type=transition_type,
             context_dim=self.context_dim,
@@ -247,10 +240,10 @@ class HSMM(nn.Module):
         # ---------------- Initialize PDFs ----------------
         try:
             self._params.update({
-                "initial_pdf": self.initial_module.initialize(mode=init_mode_initial),
-                "duration_pdf": self.duration_module.initialize(mode=init_mode_duration),
-                "transition_pdf": self.transition_module.initialize(mode=init_mode_transition),
-                "emission_pdf": self.emission_module.initialize(mode=init_mode_emission),
+                "initial_dist": self.initial_module.initialize(mode=init_mode_initial),
+                "duration_dist": self.duration_module.initialize(mode=init_mode_duration),
+                "transition_dist": self.transition_module.initialize(mode=init_mode_transition),
+                "emission_dist": self.emission_module.initialize(mode=init_mode_emission),
             })
         except Exception as e:
             raise RuntimeError(f"Failed to initialize HSMM PDFs: {e}") from e
@@ -267,22 +260,20 @@ class HSMM(nn.Module):
     def _ensure_dim(self, module, context: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Ensure that a distribution module returns a properly shaped log-matrix
-        expanded to match batch and time dimensions. Adds debug logging instead of print.
+        expanded to match batch and time dimensions. Supports scalars, 1D, 2D, and 3D+ outputs.
         """
         if module is None:
             raise ValueError("_ensure_dim called with module=None")
 
         module_type = type(module).__name__
-        if isinstance(module, (Initial, Transition, Duration, Emission, Categorical)) and getattr(self, "debug", False):
+        if getattr(self, "debug", False):
             logger.debug(f"[_ensure_dim] Processing module type: {module_type}")
 
         # ---------------- Prepare context ----------------
         ctx = context
         if ctx is not None:
-            if ctx.ndim == 1:
-                ctx = ctx[None, None, :]
-            elif ctx.ndim == 2:
-                ctx = ctx[None, :, :]
+            if ctx.ndim == 1: ctx = ctx[None, None, :]  # [1,1,H]
+            elif ctx.ndim == 2: ctx = ctx[None, :, :]   # [1,T,H]
             if getattr(self, "debug", False):
                 logger.debug(f"[_ensure_dim] Input context shape: {context.shape}, standardized to {ctx.shape}")
 
@@ -291,12 +282,11 @@ class HSMM(nn.Module):
         if not torch.is_tensor(x):
             raise TypeError(f"log_matrix must return tensor, got {type(x)}")
         if getattr(self, "debug", False):
-            logger.debug(f"[_ensure_dim] log_matrix output shape: {x.shape}")
+            logger.debug(f"[_ensure_dim] {module_type}.log_matrix output shape: {x.shape}")
 
         # ---------------- Match feature dims ----------------
-        expected = getattr(module, "_shape", None)
-        if expected is not None:
-            feat_dims = expected if isinstance(expected, (list, tuple)) else [expected]
+        if module._shape is not None:
+            feat_dims = module._shape if isinstance(module._shape, (list, tuple)) else [module._shape]
             while x.shape[-len(feat_dims):] != tuple(feat_dims):
                 x = x.unsqueeze(0)
                 if getattr(self, "debug", False):
@@ -305,131 +295,116 @@ class HSMM(nn.Module):
         # ---------------- Expand along batch/time if needed ----------------
         if ctx is not None:
             B, T = ctx.shape[0], ctx.shape[1]
+
+            # Ensure x has at least 2 dims for batch/time
+            while x.ndim < 2:
+                x = x.unsqueeze(0)
+
+            # Build target shape: [B, T, ...features...]
             expand_shape = [B, T] + list(x.shape[2:])
-            if x.shape[:2] == (1, 1):
+
+            if x.shape[0] == 1 and x.shape[1] == 1:
                 x = x.expand(*expand_shape)
             elif x.shape[0] == 1:
                 x = x.expand(B, *x.shape[1:])
             elif x.shape[1] == 1:
                 x = x.expand(x.shape[0], T, *x.shape[2:])
+
             if getattr(self, "debug", False):
                 logger.debug(f"[_ensure_dim] Expanded along batch/time to: {x.shape}")
-
+    
         return x
 
-    def _encode_observations(
+    def _encode(
         self,
         sequences: torch.Tensor,
         mask: Optional[torch.BoolTensor] = None,
-        pool: Optional[str] = None,
         detach: bool = True,
+        pool: Optional[str] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Encode sequences via the HSMM encoder (if any) and produce:
-            - context_aligned: per-timestep context [B, T, H]
-            - ctx_canonical: canonical context [B, 1, H]
+        Encode sequences via the HSMM encoder and produce:
+          - context_aligned: per-timestep context [B, T, H]
+          - ctx_canonical: pooled canonical context [B, 1, H]
 
-        Handles batching, masking, pooling, and optional detachment.
-        Strictly validates shapes and context_dim consistency.
+        Handles:
+          - batching and single sequences
+          - masking
+          - optional pooling override
+          - optional gradient detachment
         """
-        if self.encoder is None or sequences.numel() == 0:
-            self._sequence = None
-            self._context = None
-            self._ctx_canonical = None
-            return None, None
+        device = sequences.device
 
-        # Ensure [B,T,F]
+        # Ensure [B, T, F]
         if sequences.ndim == 2:
             sequences = sequences.unsqueeze(0)
         B, T, F = sequences.shape
-        device = sequences.device
+        ctx_dim = self.context_dim or getattr(self.encoder, "out_dim", F)
 
-        # Normalize mask → [B,T]
+        # Standardize mask to [B, T]
         if mask is None:
             mask = torch.ones(B, T, dtype=torch.bool, device=device)
-        elif mask.ndim == 1:
-            mask = mask.unsqueeze(0)
-        elif mask.ndim != 2:
-            raise ValueError(f"mask must be [T] or [B,T], got {mask.shape}")
+        else:
+            mask = mask.bool()
+            if mask.ndim == 1:
+                mask = mask.unsqueeze(0).expand(B, -1)
+            elif mask.ndim == 3 and mask.shape[-1] == 1:
+                mask = mask.squeeze(-1)
+            mask = mask[:, :T]
 
-        # Temporary pool override
-        original_pool = getattr(self.encoder, "pool", None)
-        if pool is not None and hasattr(self.encoder, "pool"):
-            self.encoder.pool = pool
+        # Handle missing encoder
+        if self.encoder is None or sequences.numel() == 0:
+            context_aligned = torch.zeros(B, T, ctx_dim, device=device)
+            ctx_canonical = torch.zeros(B, 1, ctx_dim, device=device)
+            return context_aligned, ctx_canonical
 
-        try:
-            # Forward pass through encoder
-            seq_out, ctx_canonical, _ = self.encoder(
-                sequences,
-                mask=mask,
-                return_context=True,
-                return_sequence=True,
-                detach_context=detach
-            )
+        # Forward pass through encoder
+        kwargs = {"mask": mask, "return_context": True, "return_sequence": True, "detach_context": detach}
+        if pool is not None:
+            kwargs["pool"] = pool
 
-            # ---------------- Canonical context ----------------
-            if ctx_canonical is None:
-                ctx_canonical = seq_out.mean(dim=1, keepdim=True)
-            elif ctx_canonical.ndim == 2:
-                ctx_canonical = ctx_canonical.unsqueeze(1)
-            elif ctx_canonical.ndim == 3 and ctx_canonical.shape[1] != 1:
-                ctx_canonical = ctx_canonical.mean(dim=1, keepdim=True)
+        out, pooled, _ = self.encoder(sequences, **kwargs)
 
-            # ---------------- Per-timestep aligned context ----------------
-            if seq_out.shape[1] == T:
-                context_aligned = seq_out
+        # Ensure dimensions
+        if pooled is None:
+            pooled = out.mean(dim=1, keepdim=True)
+        elif pooled.ndim == 2:
+            pooled = pooled.unsqueeze(1)
+        elif pooled.shape[1] != 1:
+            pooled = pooled.mean(dim=1, keepdim=True)
+
+        context_aligned = out if out.shape[1] == T else pooled.expand(-1, T, -1)
+
+        # Adjust to context dimension
+        if context_aligned.shape[-1] != ctx_dim:
+            if context_aligned.shape[-1] < ctx_dim:
+                pad = ctx_dim - context_aligned.shape[-1]
+                context_aligned = F.pad(context_aligned, (0, pad))
+                pooled = F.pad(pooled, (0, pad))
             else:
-                context_aligned = ctx_canonical.expand(-1, T, -1)
+                context_aligned = context_aligned[:, :, :ctx_dim]
+                pooled = pooled[:, :, :ctx_dim]
 
-            # ---------------- Dimension verification ----------------
-            if context_aligned.shape[-1] != self.context_dim:
-                raise RuntimeError(
-                    f"Encoder output dimension mismatch: expected {self.context_dim}, "
-                    f"got {context_aligned.shape[-1]}"
-                )
-
-            if getattr(self, "debug", False) and logger:
-                logger.debug(
-                    f"[_encode_observations] sequences={sequences.shape}, "
-                    f"seq_out={seq_out.shape}, mask={mask.shape}, "
-                    f"ctx_canonical={ctx_canonical.shape}, context_aligned={context_aligned.shape}"
-                )
-
-        finally:
-            if hasattr(self.encoder, "pool"):
-                self.encoder.pool = original_pool
-
-        # Detach if requested
         if detach:
-            seq_out = seq_out.detach()
             context_aligned = context_aligned.detach()
-            ctx_canonical = ctx_canonical.detach()
+            pooled = pooled.detach()
 
-        # Internal storage for forward pass
-        self._sequence = seq_out
-        self._context = context_aligned
-        self._ctx_canonical = ctx_canonical
+        return context_aligned, pooled
 
-        return context_aligned, ctx_canonical
-
-    def _prepare_observations(
+    def _prepare(
         self,
         X: torch.Tensor,
         theta: Optional[torch.Tensor] = None,
     ) -> utils.SequenceSet:
         """
-        Prepares a SequenceSet with fully batch-aligned tensors:
-            - Computes canonical context (via encoder or provided theta)
-            - Computes log-probs per timestep and state
-            - Builds masks and lengths
+        Prepare a SequenceSet with batch-aligned tensors.
 
         Returns:
             SequenceSet with:
-                - sequences: list of [T,F] tensors
-                - lengths: list of sequence lengths
-                - log_probs: list of [T,K] tensors
-                - contexts: [B,T,H] tensor
-                - masks: [B,T,1] tensor
+                - sequences: [T, F] per sequence
+                - log_probs: [T, K] per sequence
+                - contexts: [B, T, H] or [B, 1, H]
+                - masks: [B, T, 1]
         """
         # Ensure batch dimension
         if X.ndim == 2:
@@ -437,54 +412,59 @@ class HSMM(nn.Module):
         B, T, F = X.shape
         device = X.device
 
-        # Masks
+        # Mask
         mask = torch.ones(B, T, 1, dtype=torch.bool, device=device)
 
         # Context
         if theta is not None:
-            context_aligned = theta
+            context = theta
             if theta.ndim == 2:  # [T,H] -> [1,T,H]
-                context_aligned = theta.unsqueeze(0)
-            elif theta.shape[0] != B:  # expand if batch mismatch
-                context_aligned = theta.expand(B, -1, -1)
-            ctx_canonical = context_aligned[:, :1, :]
+                context = theta.unsqueeze(0)
+            elif theta.shape[0] != B:
+                context = theta.expand(B, -1, -1)
+            ctx_canonical = context[:, :1, :]
         else:
-            context_aligned, ctx_canonical = self._encode_observations(X)
-            if context_aligned is None:
-                context_aligned = torch.zeros(B, T, self.context_dim, device=device)
-                ctx_canonical = torch.zeros(B, 1, self.context_dim, device=device)
+            context, ctx_canonical = self._encode(X)
+            if context is None:
+                ctx_dim = self.context_dim or F
+                context = torch.zeros(B, T, ctx_dim, device=device)
+                ctx_canonical = torch.zeros(B, 1, ctx_dim, device=device)
 
-        # Emission parameters
+        # Log-probabilities per state
         K = self.n_states
-        dist_type = getattr(self.emission_module, "dist_type", None)
+        dist_type = self.emission_module.dist_type
+        log_probs_list = []
 
         if dist_type in (torch.distributions.Categorical, torch.distributions.Bernoulli):
-            # Vectorized categorical log-probs
-            emission_dist = self.emission_module.forward(context=context_aligned, return_dist=True)
-            logits = emission_dist.logits  # [B,K,F]
-            seq_cat = X[..., 0].long()     # [B,T]
-            log_probs_all = F.log_softmax(logits, dim=-1)  # [B,K,F]
+            dist = self.emission_module.forward(context=context, return_dist=True)
+            logits = dist.logits  # [B, K, F]
 
-            idx = seq_cat.unsqueeze(1).expand(-1, K, -1).permute(0, 2, 1)  # [B,T,K]
-            log_probs_list = torch.gather(
-                log_probs_all.unsqueeze(1).expand(-1, T, -1, -1), -1, idx.unsqueeze(-1)
-            ).squeeze(-1)
-            log_probs_list = [log_probs_list[b] for b in range(B)]
+            if isinstance(dist, torch.distributions.Categorical):
+                seq_idx = X[..., 0].long()  # [B, T]
+                logits_exp = logits.unsqueeze(1).expand(B, T, K, F)
+                idx = seq_idx.unsqueeze(2).unsqueeze(-1).expand(B, T, 1, F)
+                log_probs = F.log_softmax(logits_exp, dim=2)
+                log_probs = torch.gather(log_probs, 2, idx).squeeze(2)  # [B, T, F]
+                log_probs = log_probs.sum(-1)  # [B, T]
+            else:  # Bernoulli
+                log_probs = torch.distributions.Bernoulli(logits=logits).log_prob(X)
+                log_probs = log_probs.sum(-1)  # [B, T]
 
-        else:
-            # Gaussian / independent emissions fully vectorized
-            means = self.emission_module._emission_means  # [K,F]
-            covs = self.emission_module._emission_covs
-            stds = covs.diagonal(dim1=-2, dim2=-1).sqrt()  # [K,F]
+            log_probs_list = [log_probs[b] for b in range(B)]
+
+        else:  # Gaussian / independent continuous
+            means = self.emission_module._emission_means  # [K, F]
+            stds = self.emission_module._emission_covs.diagonal(dim1=-2, dim2=-1).sqrt()  # [K, F]
 
             # Expand for batch and time
-            means_exp = means.unsqueeze(0).unsqueeze(0).expand(B, T, K, F)  # [B,T,K,F]
-            stds_exp = stds.unsqueeze(0).unsqueeze(0).expand(B, T, K, F)    # [B,T,K,F]
-            X_exp = X.unsqueeze(2).expand(B, T, K, F)                        # [B,T,K,F]
+            X_exp = X.unsqueeze(2).expand(B, T, K, F)        # [B, T, K, F]
+            means_exp = means.unsqueeze(0).unsqueeze(0).expand(B, T, K, F)
+            stds_exp = stds.unsqueeze(0).unsqueeze(0).expand(B, T, K, F)
 
-            log_probs = -0.5 * torch.log(2 * torch.pi * stds_exp**2)
-            log_probs -= 0.5 * ((X_exp - means_exp)**2 / (stds_exp**2))
-            log_probs = log_probs.sum(-1)  # [B,T,K]
+            # Gaussian log-probabilities
+            log_probs = -0.5 * torch.log(2 * math.pi * stds_exp**2)
+            log_probs -= 0.5 * ((X_exp - means_exp) ** 2 / stds_exp**2)
+            log_probs = log_probs.sum(-1)  # [B, T, K]
             log_probs_list = [log_probs[b] for b in range(B)]
 
         # Build SequenceSet
@@ -492,7 +472,7 @@ class HSMM(nn.Module):
             sequences=[X[b] for b in range(B)],
             lengths=[T] * B,
             log_probs=log_probs_list,
-            contexts=context_aligned,
+            contexts=context,
             masks=mask
         )
 
@@ -765,7 +745,7 @@ class HSMM(nn.Module):
         Compute HSMM model parameters with EM-style estimate, sample-mode collapse, and neural updates.
         Returns a dict of PDFs: emission, initial, duration, transition.
         """
-        eps_collapse = 1e-3
+
         α_min, α_max = 0.03, self.alpha
         α = max(α_min, α_max * (1.0 - iter_idx / max_iter))
 
@@ -793,76 +773,100 @@ class HSMM(nn.Module):
         else:
             _check_context_hidden_dim()
 
-        # Flatten sequences for EM updates
-        if X is not None:
-            all_X = torch.cat([s for s in getattr(X, "sequences", [X]) if s.numel() > 0], dim=0)
-            if all_X.numel() == 0:
-                all_X = torch.zeros(1, self.n_features, dtype=DTYPE, device=self.device)
-        else:
-            all_X = torch.zeros(1, self.n_features, dtype=DTYPE, device=self.device)
-
-        # Align or encode context
+        # --- Align or encode per-sequence context ---
         if theta is not None:
             context_aligned = theta
             if theta.ndim == 2:  # [T,H] -> [1,T,H]
                 context_aligned = theta.unsqueeze(0)
             elif X is not None and theta.shape[0] != len(X.sequences):
                 context_aligned = theta.expand(len(X.sequences), -1, -1)
+        elif X is not None:
+            seqs = X.sequences if X is not None else []
+            B = len(seqs) if seqs else 1
+            lengths = [s.shape[0] for s in seqs] if seqs else [1]
+            T_max = max(lengths)
+            padded = torch.zeros(B, T_max, self.n_features, device=self.device, dtype=DTYPE)
+            mask = torch.zeros(B, T_max, dtype=torch.bool, device=self.device)
+            for b, s in enumerate(seqs):
+                L = s.shape[0]
+                padded[b, :L] = s.to(device=self.device, dtype=DTYPE)
+                mask[b, :L] = 1
+
+            context_aligned, _ = self._encode(padded, mask=mask, detach=True) # [B, T, H]
         else:
-            context_aligned, _ = getattr(self, "_encode_observations", lambda x: (None, None))(all_X)
-            if context_aligned is None:
-                B = len(X.sequences) if X else 1
-                context_aligned = torch.zeros(B, all_X.shape[0], self.context_dim, device=all_X.device)
+            context_aligned = torch.zeros(
+                1, 1, self.context_dim, device=getattr(self, "device", "cpu")
+            )
 
         # -------- Sample mode: collapse logits --------
         def collapse_logits(logits: torch.Tensor, dim: int) -> torch.Tensor:
-            logits = logits.clamp_min(-20.0)
-            probs = logits.exp()
-            probs /= probs.sum(dim=dim, keepdim=True).clamp_min(EPS)
-            dir_alpha = probs * α + EPS
-            shape = dir_alpha.shape
+            # Softer, safer floor — avoids flattening distributions
+            eps_collapse = 1e-9
+
+            # Slight sharpening prevents state-merging after EM updates
+            probs = F.softmax(logits / 0.85, dim=dim)
+
+            # Avoid tail-flooring before Dirichlet — this was flattening distributions
+            dir_alpha = (probs * α).clamp_min(eps_collapse)
+
+            # Move collapsing dimension to last to sample Dirichlet rowwise
             perm = list(range(dir_alpha.ndim))
             perm[dim], perm[-1] = perm[-1], perm[dim]
-            flat = dir_alpha.permute(perm).reshape(-1, shape[dim])
+            alpha_perm = dir_alpha.permute(perm)
+
+            # Flatten all but last dimension for stable vectorized sampling
+            last = alpha_perm.shape[-1]
+            flat = alpha_perm.reshape(-1, last)
+
+            # Sample from Dirichlet — gives "collapsed" probability vectors
             samples = torch.distributions.Dirichlet(flat).rsample()
-            samples = samples.reshape(*[shape[i] for i in perm]).permute(*perm)
+
+            # Reshape back to original shape
+            samples = samples.reshape(alpha_perm.shape).permute(*perm)
+
+            # Renormalize to ensure exact simplex structure
             samples = samples / samples.sum(dim=dim, keepdim=True)
-            samples = torch.where(samples > eps_collapse, samples, torch.full_like(samples, 1.0 / shape[dim]))
-            return torch.log(samples + EPS)
+
+            # Final tiny floor to avoid log(0) but without forcing uniformity
+            samples = samples.clamp_min(EPS)
+            return torch.log(samples)
 
         def safe_sum(lst: list[Optional[torch.Tensor]]) -> Optional[torch.Tensor]:
-            tensors = [x for x in lst if x is not None and x.numel() > 0]
-            return torch.cat(tensors, dim=0).sum(dim=0) if tensors else None
+            tensors = [t for t in lst if t is not None and t.numel() > 0]
+            if not tensors: return None
+            if self.debug: assert all(t.ndim == tensors[0].ndim for t in tensors)
+            return torch.cat(tensors, dim=0).sum(dim=0)
 
         if mode == "sample":
             with torch.no_grad():
-                # Initial
-                initial_pdf = self.initial_module.forward(context=context_aligned, return_dist=True)
+
+                initial_dist = self.initial_module.forward(context=context_aligned, return_dist=True)
                 self.initial_module.update(
-                    new_logits=collapse_logits(initial_pdf.logits, dim=0).exp(),
+                    new_logits=collapse_logits(initial_dist.logits, dim=0).exp(),
                     from_probs=True
                 )
-                # Transition
-                transition_pdf = self.transition_module.forward(context=context_aligned, return_dist=True)
+
+                transition_dist = self.transition_module.forward(context=context_aligned, return_dist=True)
                 self.transition_module.update(
-                    new_logits=collapse_logits(transition_pdf.logits, dim=1).exp(),
+                    new_logits=collapse_logits(transition_dist.logits, dim=1).exp(),
                     from_probs=True
                 )
-                # Duration
-                duration_pdf = self.duration_module.forward(context=context_aligned, return_dist=True)
+
+                duration_dist = self.duration_module.forward(context=context_aligned, return_dist=True)
                 self.duration_module.update(
-                    new_logits=collapse_logits(duration_pdf.logits, dim=1).exp(),
+                    new_logits=collapse_logits(duration_dist.logits, dim=1).exp(),
                     from_probs=True
                 )
-                # Emission
+
                 try:
-                    emission_pdf = self.emission_module.forward(context=context_aligned, return_dist=True)
-                except Exception:
-                    emission_pdf = self.emission_module.initialize(
+                    emission_dist = self.emission_module.forward(context=context_aligned, return_dist=True)
+                except Exception as err:
+                    logger.warning("Emission initialize fallback: %s", err)
+                    all_X = torch.cat([s for s in X.sequences], dim=0) if X else None
+                    emission_dist = self.emission_module.initialize(
                         X=all_X, context=context_aligned, theta=context_aligned, theta_scale=theta_scale
                     )
 
-        # -------- Estimate mode: EM updates --------
         elif mode == "estimate":
             if X is None or not isinstance(X, utils.SequenceSet):
                 raise RuntimeError("SequenceSet X required for estimate mode.")
@@ -877,6 +881,7 @@ class HSMM(nn.Module):
             trans_counts = trans_counts if trans_counts is not None else self.transition_module._mod_logits_buffer.exp()
 
             dur_counts = safe_sum(eta_list)
+            print("dur_counts shape", dur_counts.shape)
             dur_counts = dur_counts if dur_counts is not None else self.duration_module._mod_logits_buffer.exp()
 
             # α-blended log normalization
@@ -890,36 +895,46 @@ class HSMM(nn.Module):
                 torch.log(dur_counts + EPS) * α + (1 - α) * self.duration_module._mod_logits_buffer, dim=1
             )
 
-            # Update modules
+            # if self.debug:
+            print("context_aligned.shape=%s lengths=%s", tuple(context_aligned.shape), X.lengths)
+            print("init_counts min/max: %s/%s", init_counts.min().item(), init_counts.max().item())
+            print("blend_init entropy: %s", - (blend_init.exp() * blend_init.exp().log()).sum().item())
+
             for module, logits in [
                 (self.initial_module, blend_init),
+                (self.duration_module, blend_dur),
                 (self.transition_module, blend_trans),
-                (self.duration_module, blend_dur)
             ]:
                 posterior = logits.exp() if any(p.requires_grad for p in module.parameters()) else None
-                module.update(new_logits=logits.exp(), posterior=posterior, from_probs=True)
-
-            # Emission
+                module.update(
+                    new_logits=logits.exp(),
+                    context=context_aligned,
+                    temperature=self.temperature,
+                    posterior=posterior,
+                    update_rate=1.0,
+                    from_probs=True,
+                    grad_safe=True,
+                )
             try:
-                emission_pdf = self.emission_module.forward(context=context_aligned, return_dist=True)
-            except Exception:
-                emission_pdf = self.emission_module.initialize(
+                emission_dist = self.emission_module.forward(context=context_aligned, return_dist=True)
+            except Exception as err:
+                logger.warning("Emission initialize fallback: %s", err)
+                all_X = torch.cat([s for s in X.sequences], dim=0) if X else None
+                emission_dist = self.emission_module.initialize(
                     X=all_X, context=context_aligned, theta=context_aligned, theta_scale=theta_scale
                 )
-
         else:
             raise ValueError(f"Unsupported mode '{mode}'.")
 
-        # -------- Forward once for all modules to return PDFs --------
-        initial_pdf = self.initial_module.forward(context=context_aligned, return_dist=True)
-        duration_pdf = self.duration_module.forward(context=context_aligned, return_dist=True)
-        transition_pdf = self.transition_module.forward(context=context_aligned, return_dist=True)
+        initial_dist = self.initial_module.forward(context=context_aligned, return_dist=True)
+        duration_dist = self.duration_module.forward(context=context_aligned, return_dist=True)
+        transition_dist = self.transition_module.forward(context=context_aligned, return_dist=True)
 
         return {
-            "initial_pdf": initial_pdf,
-            "duration_pdf": duration_pdf,
-            "transition_pdf": transition_pdf,
-            "emission_pdf": emission_pdf,
+            "initial_dist": initial_dist,
+            "duration_dist": duration_dist,
+            "transition_dist": transition_dist,
+            "emission_dist": emission_dist,
         }
 
     def _viterbi(
@@ -1075,7 +1090,7 @@ class HSMM(nn.Module):
             elif theta.shape[0] != B:
                 context_aligned = theta.expand(B, -1, -1)
         else:
-            context_aligned, _ = getattr(self, "_encode_observations", lambda x: (None, None))(torch.cat(X.sequences, dim=0))
+            context_aligned, _ = getattr(self, "_encode", lambda x: (None, None))(torch.cat(X.sequences, dim=0))
             if context_aligned is None:
                 max_len = max(X.lengths)
                 context_aligned = torch.zeros(B, max_len, self.context_dim, device=self.device)
@@ -1137,11 +1152,11 @@ class HSMM(nn.Module):
 
         # ---------------- Encode context if needed ----------------
         if theta is None and getattr(self, "encoder", None) is not None:
-            context_aligned, _ = self._encode_observations(X)
+            context_aligned, _ = self._encode(X)
             theta = context_aligned
 
         # ---------------- Prepare observations ----------------
-        X_valid = self._prepare_observations(X, theta=theta)
+        X_valid = self._prepare(X, theta=theta)
         B = len(X_valid.sequences)
         max_len = max(X_valid.lengths) if B > 0 else 0
         F_dim = X_valid.sequences[0].shape[-1] if B > 0 else 0
@@ -1172,12 +1187,12 @@ class HSMM(nn.Module):
             mode = "sample" if run_idx > 0 else "estimate"
             params = self._model_params(X_valid, theta=theta, mode=mode)
 
-            init_pdf = params["initial_pdf"]
-            transition_pdf = params["transition_pdf"]
-            duration_pdf = params["duration_pdf"]
-            emission_pdf = params["emission_pdf"]
+            init_pdf = params["initial_dist"]
+            transition_dist = params["transition_dist"]
+            duration_dist = params["duration_dist"]
+            emission_dist = params["emission_dist"]
 
-            X_valid.log_probs = emission_pdf.log_prob(seq_tensor.unsqueeze(2)) * mask_exp
+            X_valid.log_probs = emission_dist.log_prob(seq_tensor.unsqueeze(2)) * mask_exp
             prev_ll = self._compute_emit_log(X_valid).sum().item()
             self._convergence.update(prev_ll, 0, run_idx)
 
@@ -1212,8 +1227,8 @@ class HSMM(nn.Module):
 
                 # -------- EM sufficient statistics --------
                 init_counts = gamma_tensor.sum((0, 1))
-                dur_counts = eta_tensor.sum((0, 1)) if eta_tensor is not None else duration_pdf.expected_probs()
-                trans_counts = xi_tensor.sum((0, 1)) if xi_tensor is not None else transition_pdf.expected_probs()
+                dur_counts = eta_tensor.sum((0, 1)) if eta_tensor is not None else duration_dist.expected_probs()
+                trans_counts = xi_tensor.sum((0, 1)) if xi_tensor is not None else transition_dist.expected_probs()
 
                 # Normalize counts
                 init_counts /= init_counts.sum().clamp_min(EPS)
@@ -1228,10 +1243,10 @@ class HSMM(nn.Module):
                 init_pdf = self.initial_module.dist_type(
                     probs=α * init_counts + (1 - α) * self.initial_module.expected_probs()
                 )
-                duration_pdf = self.duration_module.dist_type(
+                duration_dist = self.duration_module.dist_type(
                     probs=α * dur_counts + (1 - α) * self.duration_module.expected_probs()
                 )
-                transition_pdf = self.transition_module.dist_type(
+                transition_dist = self.transition_module.dist_type(
                     probs=α * trans_counts + (1 - α) * self.transition_module.expected_probs()
                 )
 
@@ -1242,7 +1257,7 @@ class HSMM(nn.Module):
                 flat_theta = theta.reshape(-1, theta.shape[-1])[flat_mask] if theta is not None else None
 
                 # Adaptive learning rate
-                delta_ll = max((emission_pdf.log_prob(seq_tensor.unsqueeze(2)) * mask_exp / F_dim).sum().item() - prev_ll, 0.0)
+                delta_ll = max((emission_dist.log_prob(seq_tensor.unsqueeze(2)) * mask_exp / F_dim).sum().item() - prev_ll, 0.0)
                 adaptive_rate = min(update_rate_max, max(update_rate_min, adapt_factor * delta_ll))
                 update_rate_final = α * adaptive_rate + (1 - α) * update_rate_min
 
@@ -1255,19 +1270,19 @@ class HSMM(nn.Module):
                         for p in self.emission_module.parameters():
                             if p.grad is not None:
                                 p.data.add_(update_rate_final * p.grad)
-                    emission_pdf = self.emission_module.forward(context=flat_theta, return_dist=True)
+                    emission_dist = self.emission_module.forward(context=flat_theta, return_dist=True)
                 else:
-                    emission_pdf = self.emission_module.update(
+                    emission_dist = self.emission_module.update(
                         X=flat_X,
                         posterior=flat_gamma,
                         theta=flat_theta,
                         update_rate=update_rate_final
                     )
 
-                self._params["emission_pdf"] = emission_pdf
+                self._params["emission_dist"] = emission_dist
 
                 # -------- Likelihood & convergence --------
-                X_valid.log_probs = emission_pdf.log_prob(seq_tensor.unsqueeze(2)) * mask_exp / F_dim
+                X_valid.log_probs = emission_dist.log_prob(seq_tensor.unsqueeze(2)) * mask_exp / F_dim
                 curr_ll = self._compute_emit_log(X_valid).sum().item()
                 delta = curr_ll - prev_ll
 
@@ -1285,10 +1300,10 @@ class HSMM(nn.Module):
             if curr_ll > best_score:
                 best_score = curr_ll
                 self._params.update({
-                    "initial_pdf": init_pdf,
-                    "transition_pdf": transition_pdf,
-                    "duration_pdf": duration_pdf,
-                    "emission_pdf": emission_pdf
+                    "initial_dist": init_pdf,
+                    "transition_dist": transition_dist,
+                    "duration_dist": duration_dist,
+                    "emission_dist": emission_dist
                 })
 
         if plot_conv:
@@ -1332,7 +1347,7 @@ class HSMM(nn.Module):
         and optional context modulation.
         """
         # --- Prepare observations ---
-        obs = self._prepare_observations(X, theta=context)
+        obs = self._prepare(X, theta=context)
         B = len(obs.sequences)
         lengths = [seq.shape[0] for seq in obs.sequences]
         max_len = max(lengths) if lengths else 0
