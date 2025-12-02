@@ -64,8 +64,7 @@ def load_ohlcv_tensor(
     feature_cols: list[str] = ["open", "high", "low", "close"],
     state_col: str = "state",
     default_labels: list[str] = DEFAULT_LABELS,
-    rng_seed: int = DEFAULT_RNG_SEED,
-):
+    rng_seed: int = DEFAULT_RNG_SEED,):
     """
     Load OHLCV data from a feather/ipc file. Optional state labels are encoded.
     If missing, synthetic/default label_map is used.
@@ -234,19 +233,6 @@ class CNN_LSTM_Encoder(nn.Module):
                 return out[torch.arange(B), idx]
             return out[:, -1, :]
 
-    # ---------------- Context Utilities ----------------
-    def get_context(self, n_states: Optional[int] = None, detach: bool = True):
-        """
-        Returns ContextEncoder-compatible context:
-          - canonical: [B, 1, F]
-          - per-state: [B, n_states, F] if n_states is given
-        """
-        if self._context is None:
-            return None
-        ctx = self._context.unsqueeze(1)  # [B, 1, F]
-        if n_states is not None:
-            ctx = ctx.expand(-1, n_states, -1)  # [B, n_states, F]
-        return ctx.detach() if detach else ctx
 
 # ============================================================
 # Main execution

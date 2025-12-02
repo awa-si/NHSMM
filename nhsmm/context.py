@@ -5,28 +5,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Literal, Tuple
 
-from nhsmm.constants import DTYPE, EPS, logger
+from nhsmm.constants import DTYPE, logger
 
 
 class ContextEncoder(nn.Module):
     """
     Batch-native context encoder:
+      - Supports masking and optional attention/multihead pooling
       - Returns per-timestep sequence features [B,T,F]
       - Returns pooled canonical context [B,1,F]
-      - Supports masking and optional attention/multihead pooling
     """
 
     def __init__(
         self,
         encoder: nn.Module,
-        pool: Literal["mean", "last", "max", "attn", "mha"] = "mean",
-        context_scale: float = 1.0,
-        layer_norm: bool = True,
-        dropout: float = 0.0,
-        debug: bool = False,
         n_heads: int = 4,
+        dropout: float = 0.0,
+        layer_norm: bool = True,
+        context_scale: float = 1.0,
+        pool: Literal["mean", "last", "max", "attn", "mha"] = "mean",
+        debug: bool = False,
     ):
         super().__init__()
+
         self.encoder = encoder
         self.pool = pool.lower()
         self.context_scale = context_scale
@@ -57,47 +58,48 @@ class ContextEncoder(nn.Module):
             x = x.unsqueeze(0)  # single batch
 
         B, T, F_in = x.shape
-        if mask is not None:
-            mask = mask.bool()
-            if mask.ndim == 1:
-                mask = mask.unsqueeze(0).expand(B, -1)
-            mask = mask[:, :T]
+        mask = self._prepare_mask(mask, B, T)
 
-        # Encode sequence
         out = self.encoder(x, mask=mask)
         if isinstance(out, (tuple, list)):
             out = out[0]
         if out.ndim != 3:
             raise ValueError(f"Encoder returned {out.shape}, expected [B,T,F]")
 
-        theta = out
-        if mask is not None:
-            theta = theta * mask.unsqueeze(-1)
+        theta = out * mask.unsqueeze(-1) if mask is not None else out
+        self._sequence = theta.detach() if detach_context else theta
 
-        # Store per-timestep sequence
-        self._sequence = theta if not detach_context else theta.detach()
-
-        # Pool to context
         pooled, attn = self._pool_context(theta, mask, return_attn_weights)
 
         if self.layer_norm:
             pooled = F.layer_norm(pooled, (pooled.shape[-1],))
         pooled = self.dropout_layer(torch.tanh(pooled) * self.context_scale)
-        ctx = pooled.unsqueeze(1)  # [B,1,F]
-        self._context = ctx if not detach_context else ctx.detach()
+        ctx = pooled.unsqueeze(1)
+        self._context = ctx.detach() if detach_context else ctx
 
-        # Return sequence or last timestep
         if return_sequence:
             seq_out = theta
         else:
-            if mask is not None:
-                lengths = mask.sum(dim=1).clamp_min(1)
-                idx = lengths - 1
-                seq_out = theta[torch.arange(B), idx]
-            else:
-                seq_out = theta[:, -1, :]
+            seq_out = self._last_timestep(theta, mask)
 
         return seq_out, ctx if return_context else None, attn if return_attn_weights else None
+
+    # ---------------- Utilities ----------------
+    def _prepare_mask(self, mask: Optional[torch.BoolTensor], B: int, T: int) -> Optional[torch.BoolTensor]:
+        if mask is None:
+            return None
+        mask = mask.bool()
+        if mask.ndim == 1:
+            mask = mask.unsqueeze(0).expand(B, -1)
+        return mask[:, :T]
+
+    def _last_timestep(self, theta: torch.Tensor, mask: Optional[torch.BoolTensor]) -> torch.Tensor:
+        B, T, F = theta.shape
+        if mask is not None:
+            lengths = mask.sum(dim=1).clamp_min(1)
+            idx = lengths - 1
+            return theta[torch.arange(B), idx]
+        return theta[:, -1, :]
 
     # ---------------- Pooling ----------------
     def _pool_context(
@@ -108,13 +110,7 @@ class ContextEncoder(nn.Module):
             return torch.zeros((B, F), dtype=theta.dtype, device=theta.device), None
 
         if self.pool == "last":
-            if mask is not None:
-                lengths = mask.sum(dim=1).clamp_min(1)
-                idx = lengths - 1
-                ctx = theta[torch.arange(B), idx]
-            else:
-                ctx = theta[:, -1]
-            return ctx, None
+            return self._last_timestep(theta, mask), None
 
         if self.pool == "mean":
             if mask is not None:
@@ -157,7 +153,9 @@ class ContextEncoder(nn.Module):
         scores = torch.einsum("btf,f->bt", theta, self._attn_vector)
         if mask is not None:
             scores = scores.masked_fill(~mask, float("-inf"))
-            scores[mask.sum(dim=1) == 0] = 0
+            empty_rows = mask.sum(dim=1) == 0
+            if empty_rows.any():
+                scores[empty_rows, :] = 0
         attn_w = F.softmax(scores, dim=1).unsqueeze(-1)
         ctx = (attn_w * theta).sum(dim=1)
         return ctx, attn_w if ret_attn else None
@@ -168,13 +166,13 @@ class ContextEncoder(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         B, T, F = theta.shape
         if self._mha is None:
-            self._mha = nn.MultiheadAttention(F, self.n_heads, batch_first=True)
+            self._mha = nn.MultiheadAttention(F, self.n_heads, batch_first=True, device=theta.device)
         key_padding_mask = (~mask.bool()) if mask is not None else None
         out, attn = self._mha(theta, theta, theta, key_padding_mask=key_padding_mask)
         ctx = out.mean(dim=1)
         return ctx, attn if ret_attn else None
 
-    # ---------------- Utilities ----------------
+    # ---------------- Sequence / Context Access ----------------
     def get_sequence(self, detach: bool = True) -> Optional[torch.Tensor]:
         return self._sequence.detach() if detach and self._sequence is not None else self._sequence
 
@@ -188,7 +186,7 @@ class ContextEncoder(nn.Module):
         recompute_context: bool = False,
         mask: Optional[torch.BoolTensor] = None,
     ):
-        self._sequence = sequence if not detach else sequence.detach()
+        self._sequence = sequence.detach() if detach else sequence
         if recompute_context:
             pooled, _ = self._pool_context(sequence, mask, ret_attn=False)
             if self.layer_norm:
@@ -199,7 +197,7 @@ class ContextEncoder(nn.Module):
     def set_context(self, context: torch.Tensor, detach: bool = True):
         if context.ndim == 2:
             context = context.unsqueeze(1)
-        self._context = context if not detach else context.detach()
+        self._context = context.detach() if detach else context
 
     def reset(self):
         self._sequence = None
