@@ -105,7 +105,7 @@ class Categorical(Distribution):
         return self._logits.argmax(dim=self.dim)
 
 
-class DistributionBase(nn.Module):
+class NeuralBase(nn.Module):
     _dist_type: type = None
 
     def __init__(
@@ -409,7 +409,7 @@ class DistributionBase(nn.Module):
             return dist.log_prob(x)
         return F.log_softmax(mod, dim=-1).gather(-1, x.long())
 
-    def log_matrix(self, context: Optional[torch.Tensor] = None, temperature: Optional[float] = None, return_dist: bool = False, **dist_kwargs):
+    def log_matrix(self, context = None, temperature = None, timestep = None, return_dist: bool = False, **dist_kwargs):
         mod = self._modulate(context=context, temperature=temperature)
         if return_dist:
             return self.dist_type(**self._dist_params(mod, **dist_kwargs))
@@ -561,7 +561,7 @@ class DistributionBase(nn.Module):
         self._cache.clear()
 
 
-class Initial(DistributionBase):
+class Initial(NeuralBase):
     _dist_type = Categorical
 
     def __init__(
@@ -618,7 +618,7 @@ class Initial(DistributionBase):
         return self._dist_type(logits=logits)
 
 
-class Duration(DistributionBase):
+class Duration(NeuralBase):
     _dist_type = Categorical
 
     def __init__(
@@ -698,13 +698,6 @@ class Duration(DistributionBase):
         return self._get_dist()
 
     # ---------------- Modulation ----------------
-    def _apply_constraints(self, logits: torch.Tensor) -> torch.Tensor:
-        # Mask duration < 1
-        mask = torch.arange(self.max_duration, dtype=logits.dtype, device=logits.device) < 1
-        if logits.ndim >= 2:
-            mask = mask.view(*([1] * (logits.ndim - 2)), 1, self.max_duration)
-        return logits.masked_fill(mask, -float("inf"))
-
     def _apply_context(
         self,
         base: torch.Tensor,
@@ -735,10 +728,15 @@ class Duration(DistributionBase):
                 mod = mod * grad_scale
         return base
 
-    def _modulate(self, context=None, temperature=None, grad_safe=False, timestep=None):
+    def _modulate(self, context=None, temperature=None, timestep=None, grad_safe=False):
+        # Base logits (K,D)
         base = self._tensor_shape(self.logits + self.log_duration, "duration")
-        tau_val = float(self.temperature if temperature is None else max(temperature, EPS))
-        key = f"duration-{self._context_hash(context)}-T{tau_val:.6g}"
+
+        # Temperature
+        tau = float(self.temperature if temperature is None else max(temperature, EPS))
+
+        # Cache key
+        key = f"duration-{self._context_hash(context)}-T{tau:.6g}"
         if timestep is not None:
             key += f"-step{timestep}"
 
@@ -747,27 +745,57 @@ class Duration(DistributionBase):
             if cached is not None:
                 return cached.clone().detach() if grad_safe else cached
 
-        # Context, temperature, constraints
-        mod = self._apply_context(base, context=context)
-        mod = self._apply_temperature(mod, tau_val)
+        # --- 1) Apply context/temperature/constraints ---
+        mod = self._apply_context(base, context=context)    # shapes: (K,D) or (T,K,D) or (B,T,K,D)
+        mod = self._apply_temperature(mod, tau)
         mod = self._apply_constraints(mod)
 
-        # Select timestep if sequence-level
+        # --- 2) Ensure mod is at least time-shaped if timestep requested ---
         if timestep is not None:
-            if mod.ndim == 4:
-                if timestep >= mod.shape[1]:
-                    raise IndexError(f"Timestep {timestep} out of bounds for shape {mod.shape}")
-                mod = mod[:, timestep, :, :]
-            elif mod.ndim == 2 and timestep != 0:
-                raise IndexError(f"Timestep {timestep} invalid for shape {mod.shape}")
+            t = int(timestep)
 
+            if mod.ndim == 2:
+                # (K,D) -> (T,K,D)
+                mod = mod.unsqueeze(0).expand(t + 1, *mod.shape)
+
+            elif mod.ndim == 3:
+                # (T,K,D) -> verify or broadcast
+                if t >= mod.shape[0]:
+                    # broadcast from 1 to T if needed
+                    if mod.shape[0] == 1:
+                        mod = mod.expand(t + 1, *mod.shape[1:])
+                    else:
+                        raise IndexError(f"Timestep {t} out of bounds for shape {mod.shape}")
+
+            elif mod.ndim == 4:
+                # (B,T,K,D)
+                if t >= mod.shape[1]:
+                    # allow broadcasting from T=1 to larger T
+                    if mod.shape[1] == 1:
+                        mod = mod.expand(mod.shape[0], t + 1, *mod.shape[2:])
+                    else:
+                        raise IndexError(f"Timestep {t} out of bounds for shape {mod.shape}")
+
+                mod = mod[:, t, :, :]  # select time step
+            else:
+                raise RuntimeError(f"Unsupported logits ndim {mod.ndim} for timestep selection")
+
+        # --- 3) Cache ---
         if self.cache_enabled:
             self._cache_set(key, mod.clone())
+
         return mod.detach() if grad_safe else mod
+
+    def _apply_constraints(self, logits: torch.Tensor) -> torch.Tensor:
+        # Mask duration < 1
+        mask = torch.arange(self.max_duration, dtype=logits.dtype, device=logits.device) < 1
+        if logits.ndim >= 2:
+            mask = mask.view(*([1] * (logits.ndim - 2)), 1, self.max_duration)
+        return logits.masked_fill(mask, -float("inf"))
 
     # ---------------- Distribution helpers ----------------
     def _get_dist(self, context=None, temperature=None, timestep=None):
-        mod_logits = self._modulate(context, temperature, timestep=timestep)
+        mod_logits = self._modulate(context=context, temperature=temperature, timestep=timestep)
         mod_logits = self._tensor_shape(mod_logits, "dist_logits")
         return self._dist_type(logits=mod_logits)
 
@@ -789,7 +817,7 @@ class Duration(DistributionBase):
         return dist.probs
 
     def log_matrix(self, context=None, temperature=None, timestep=None):
-        mod_logits = self._modulate(context, temperature)
+        mod_logits = self._modulate(context=context, temperature=temperature, timestep=timestep)
         if timestep is not None:
             if mod_logits.ndim == 4:
                 mod_logits = mod_logits[:, timestep, :, :]
@@ -847,7 +875,7 @@ class Duration(DistributionBase):
             self._invalidate_cache()
             return
 
-        # Fallback to DistributionBase update (posterior updates)
+        # Fallback to NeuralBase update (posterior updates)
         super().update(
             new_logits=None,
             posterior=posterior,
@@ -859,7 +887,7 @@ class Duration(DistributionBase):
         )
 
 
-class Transition(DistributionBase):
+class Transition(NeuralBase):
     _dist_type = Categorical
 
     def __init__(
@@ -938,16 +966,6 @@ class Transition(DistributionBase):
         return self._get_dist()
 
     # ---------------- Context & Constraints ----------------
-    def _apply_context(self, base: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
-        mod = base
-        if context is not None and self.context_net is not None:
-            ctx = self._prepare_context(context)
-            B, T, H = ctx.shape
-            delta = self.context_net(ctx.reshape(B * T, H)).view(B, T, *self._shape)
-            base_exp = base.view(1, 1, *self._shape).expand(B, T, *self._shape)
-            mod = base_exp + delta
-        return base
-
     def _apply_constraints(self, logits: torch.Tensor) -> torch.Tensor:
         out = logits.clone()
         n = self.n_states
@@ -961,8 +979,26 @@ class Transition(DistributionBase):
             out[..., mask] = -float("inf")
         return out
 
-    # ---------------- Modulation ----------------
-    def _modulate(self, context=None, temperature=None, timestep: Optional[int] = None, grad_safe=False):
+    def _apply_context(self, base: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Apply context network to produce (B, T, K, K) or (T, K, K) or leave base as-is.
+        Return the modulated tensor (not base).
+        """
+        mod = base
+        if context is not None and self.context_net is not None:
+            ctx = self._prepare_context(context)   # (B, T, H) canonical
+            B, T, H = ctx.shape
+            delta = self.context_net(ctx.reshape(B * T, H)).view(B, T, *self._shape)
+            base_exp = base.view(1, 1, *self._shape).expand(B, T, *self._shape)
+            mod = base_exp + delta
+        return base
+
+    def _modulate(self, context=None, temperature=None, timestep=None, grad_safe=False):
+        """
+        Robust modulation that tolerates static [K,K], [T,K,K], or [B,T,K,K].
+        If timestep is provided, will broadcast/expand a static tensor to cover that timestep
+        (when safe) instead of raising immediately.
+        """
         base = self._tensor_shape(self.logits, "transition")
         tau_val = float(self.temperature if temperature is None else max(temperature, EPS))
         key = f"transition-{base.mean().item():.6g}-{base.std().item():.6g}-{self._context_hash(context)}-T{tau_val:.6g}"
@@ -974,19 +1010,44 @@ class Transition(DistributionBase):
             if cached is not None:
                 return cached.clone().detach() if grad_safe else cached
 
-        mod = self._apply_context(base, context=context)
+        # Apply context & constraints (mod may be 2D, 3D or 4D)
+        mod = self._apply_context(base, context=context)   # could be (K,K), (T,K,K), or (B,T,K,K)
         mod = self._apply_constraints(mod)
         mod = self._apply_temperature(mod, tau_val)
 
         if timestep is not None:
-            if mod.ndim == 4:  # [B, T, K, K]
-                if timestep >= mod.shape[1]:
-                    raise IndexError(f"Timestep {timestep} out of bounds for shape {mod.shape}")
-                mod = mod[:, timestep, :, :]
-            elif mod.ndim == 3:  # [T, K, K]
-                mod = mod[timestep, :, :]
-            elif mod.ndim == 2 and timestep != 0:
-                raise IndexError(f"Timestep {timestep} invalid for shape {mod.shape}")
+            t = int(timestep)
+
+            # Case: static (K,K) -> expand to time axis and select
+            if mod.ndim == 2:
+                # expand to (t+1, K, K) so indexing timestep is valid
+                mod = mod.unsqueeze(0).expand(t + 1, *mod.shape)
+                mod = mod[t]  # shape -> (K,K)
+
+            # Case: (T, K, K)
+            elif mod.ndim == 3:
+                if t >= mod.shape[0]:
+                    if mod.shape[0] == 1:
+                        # broadcast time dimension
+                        mod = mod.expand(t + 1, *mod.shape[1:])
+                    else:
+                        raise IndexError(f"Timestep {t} out of bounds for shape {mod.shape}")
+                mod = mod[t]  # (K,K)
+
+            # Case: (B, T, K, K)
+            elif mod.ndim == 4:
+                if t >= mod.shape[1]:
+                    if mod.shape[1] == 1:
+                        mod = mod.expand(mod.shape[0], t + 1, *mod.shape[2:])
+                    else:
+                        raise IndexError(f"Timestep {t} out of bounds for shape {mod.shape}")
+                # select time slice -> (B, K, K) or if B==1 expand to (K,K) depending on caller expectation
+                mod = mod[:, t, :, :]
+                if mod.shape[0] == 1:
+                    mod = mod.squeeze(0)
+
+            else:
+                raise RuntimeError(f"Unsupported logits ndim {mod.ndim} for timestep selection")
 
         if self.cache_enabled:
             self._cache_set(key, mod.clone())
@@ -995,7 +1056,7 @@ class Transition(DistributionBase):
 
     # ---------------- Distribution helpers ----------------
     def _get_dist(self, context=None, temperature=None, timestep=None) -> Categorical:
-        mod_logits = self._modulate(context, temperature, timestep)
+        mod_logits = self._modulate(context=context, temperature=temperature, timestep=timestep)
         mod_logits = self._tensor_shape(mod_logits, "dist_logits")
         return self._dist_type(logits=mod_logits)
 
@@ -1014,7 +1075,7 @@ class Transition(DistributionBase):
         return dist if return_dist else dist.probs.argmax(-1)
 
     def log_matrix(self, context=None, temperature=None, timestep=None):
-        mod_logits = self._modulate(context, temperature, timestep)
+        mod_logits = self._modulate(context=context, temperature=temperature, timestep=timestep)
         return F.log_softmax(mod_logits, dim=-1)
 
     @torch.no_grad()
@@ -1066,7 +1127,7 @@ class Transition(DistributionBase):
             self._invalidate_cache()
             return
 
-        # Fallback to DistributionBase update (posterior updates)
+        # Fallback to NeuralBase update (posterior updates)
         super().update(
             new_logits=None,
             posterior=posterior,
@@ -1078,7 +1139,7 @@ class Transition(DistributionBase):
         )
 
 
-class Emission(DistributionBase):
+class Emission(NeuralBase):
 
     _dist_type = MultivariateNormal
 

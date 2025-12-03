@@ -242,7 +242,7 @@ if __name__ == "__main__":
     np.random.seed(0)
 
     MAX_ITER = 9
-    MAX_DURATION = 35
+    MAX_DURATION = 40
     SYMBOL = "BTC/USDT:USDT"
     DATA_DIR = "/opt/trader/user_data/data/bybit/futures_"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

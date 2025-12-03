@@ -519,7 +519,8 @@ class HSMM(nn.Module):
 
         # --- Determine target trailing shape ---
         if hasattr(module, "_shape") and module._shape is not None:
-            target_shape = [int(module._shape)] if isinstance(module._shape, int) else [int(x) for x in module._shape]
+            target_shape = [int(module._shape)] if isinstance(module._shape, int) \
+                           else [int(x) for x in module._shape]
         else:
             if isinstance(module, Initial):
                 target_shape = [self.n_states]
@@ -542,16 +543,27 @@ class HSMM(nn.Module):
                 raise ValueError("Unsupported context ndim")
 
         # --- Call module ---
-        x = module.log_matrix(context=ctx)
+        x = module.log_matrix(context=ctx, timestep=T)
         if not torch.is_tensor(x):
             raise TypeError(f"log_matrix must return tensor, got {type(x)}")
+
+        # --- Minimal fix: collapse accidental time dimension ---
+        # Prevent Duration/Transition from returning [T, ...] blocks when _forward
+        # expects per-step static logits.
+        if T is not None and x.ndim >= 2:
+            if x.shape[0] == T:
+                # Use T-1 slice (consistent with how timestep=T is interpreted in modulate)
+                x = x[T - 1]
 
         # --- Verify trailing dims ---
         if list(x.shape[-tal:]) != target_shape:
             if x.numel() == int(torch.tensor(target_shape).prod().item()):
                 x = x.view(*target_shape)
             else:
-                raise RuntimeError(f"{type(module).__name__}.log_matrix returned trailing dims {tuple(x.shape[-tal:])}, expected {tuple(target_shape)}")
+                raise RuntimeError(
+                    f"{type(module).__name__}.log_matrix returned trailing dims "
+                    f"{tuple(x.shape[-tal:])}, expected {tuple(target_shape)}"
+                )
 
         # --- Ensure leading/time dim ---
         leading_nd = x.ndim - tal
@@ -569,182 +581,19 @@ class HSMM(nn.Module):
             elif x.shape[0] == 1:
                 x = x.expand(T, *x.shape[1:])
             else:
-                raise RuntimeError(f"{type(module).__name__}.log_matrix leading dims {tuple(x.shape[:-tal])} incompatible with T={T}")
+                raise RuntimeError(
+                    f"{type(module).__name__}.log_matrix leading dims "
+                    f"{tuple(x.shape[:-tal])} incompatible with T={T}"
+                )
 
         # --- Final check ---
         if list(x.shape[-tal:]) != target_shape:
-            raise RuntimeError(f"Post-processed {type(module).__name__} shape {tuple(x.shape)} trailing dims != {tuple(target_shape)}")
+            raise RuntimeError(
+                f"Post-processed {type(module).__name__} shape {tuple(x.shape)} "
+                f"trailing dims != {tuple(target_shape)}"
+            )
 
         return x
-
-    def _forward(
-        self,
-        X: utils.SequenceSet,
-        theta: Optional[list[Optional[torch.Tensor]] | torch.Tensor] = None) -> list[torch.Tensor]:
-
-        K, Dmax = self.n_states, self.max_duration
-        neg_inf = torch.finfo(DTYPE).min / 2.0
-        alpha_list = []
-
-        for i, (log_emissions, seq_len) in enumerate(zip(X.log_probs, X.lengths)):
-            device = log_emissions.device
-
-            if seq_len == 0:
-                alpha_list.append(torch.full((0, K, Dmax), neg_inf, dtype=DTYPE, device=device))
-                continue
-
-            T = seq_len
-            # ---------------- Per-sequence context ----------------
-            ctx_seq = None
-            if theta is not None:
-                ctx_seq = theta[i] if isinstance(theta, list) else theta
-
-            # ---------------- Module logits ----------------
-            initial_logits = self._ensure_shape(self.initial_module, ctx_seq, T)
-            duration_logits = self._ensure_shape(self.duration_module, ctx_seq, T)
-            transition_logits = self._ensure_shape(self.transition_module, ctx_seq, T)
-
-            # ---------------- Cumulative emission sums (vectorized) ----------------
-            cumsum_emit = torch.zeros(T + 1, K, dtype=DTYPE, device=device)
-            cumsum_emit[1:] = torch.cumsum(log_emissions, dim=0)
-
-            dur_range = torch.arange(1, Dmax + 1, device=device).view(1, Dmax)   # [1,Dmax]
-            time_idx  = torch.arange(T, device=device).view(T, 1)                 # [T,1]
-            start_idx = (time_idx - dur_range + 1).clamp(min=0)                   # [T,Dmax]
-
-            # gather emission sums for all durations at once
-            start_idx_exp = start_idx.unsqueeze(2).expand(T, Dmax, K)             # [T,Dmax,K]
-            end_idx_exp   = (time_idx + 1).unsqueeze(2).expand(T, 1, K)          # [T,1,K]
-            cumsum_emit_exp = cumsum_emit.unsqueeze(0).expand(T, T + 1, K)        # [T,T+1,K]
-            emit_sums = cumsum_emit_exp.gather(1, end_idx_exp) - cumsum_emit_exp.gather(1, start_idx_exp)
-            emit_sums = emit_sums.permute(0, 2, 1)                                # [T, K, Dmax]
-
-            # ---------------- Forward recursion ----------------
-            alpha_tensor = torch.full((T, K, Dmax), neg_inf, dtype=DTYPE, device=device)
-
-            for t in range(T):
-                max_d = min(Dmax, t + 1)
-
-                if t == 0:
-                    alpha_tensor[t, :, :max_d] = (
-                        initial_logits[t].unsqueeze(1)    # [K,1]
-                        + duration_logits[t, :, :max_d]   # [K,max_d]
-                        + emit_sums[t, :, :max_d]         # [K,max_d]
-                    )
-                    continue
-
-                prev_alpha = torch.full((max_d, K), neg_inf, dtype=DTYPE, device=device)
-
-                valid_mask   = start_idx[t, :max_d] > 0
-                initial_mask = ~valid_mask
-
-                # --- Case 1: valid previous segments ---
-                if valid_mask.any():
-                    idx = valid_mask.nonzero(as_tuple=True)[0]
-                    prev_positions = start_idx[t, idx] - 1
-
-                    # gather previous alpha for all durations
-                    prev_vals = torch.logsumexp(alpha_tensor[prev_positions, :, :], dim=2)
-                    prev_alpha[idx] = prev_vals
-
-                # --- Case 2: segment begins at t=0 ---
-                if initial_mask.any():
-                    idx = initial_mask.nonzero(as_tuple=True)[0]
-                    prev_alpha[idx] = (
-                        initial_logits[t].unsqueeze(0)                    # [1,K]
-                        + duration_logits[t, :, :max_d][:, idx].T         # [len(idx),K]
-                    )
-
-                # --------- Transition step ---------
-                alpha_trans = torch.logsumexp(
-                    prev_alpha.unsqueeze(2) + transition_logits[t].unsqueeze(0),
-                    dim=1
-                )  # [max_d, K]
-
-                alpha_tensor[t, :, :max_d] = (
-                    alpha_trans.T                            # [K, max_d]
-                    + duration_logits[t, :, :max_d]          # [K, max_d]
-                    + emit_sums[t, :, :max_d]                # [K, max_d]
-                )
-
-            alpha_list.append(alpha_tensor)
-
-        return alpha_list
-
-    def _backward(
-        self,
-        X: utils.SequenceSet,
-        theta: Optional[list[Optional[torch.Tensor]] | torch.Tensor] = None) -> list[torch.Tensor]:
-        """
-        Vectorized backward pass for HSMM.
-        Returns list of [T, K, Dmax] tensors per sequence.
-        """
-        K, Dmax = self.n_states, self.max_duration
-        neg_inf = torch.finfo(DTYPE).min / 2.0
-        beta_list = []
-
-        for i, (seq_logp, seq_len) in enumerate(zip(X.log_probs, X.lengths)):
-            device = seq_logp.device
-
-            if seq_len == 0:
-                beta_list.append(torch.full((0, K, Dmax), neg_inf, dtype=DTYPE, device=device))
-                continue
-
-            T = seq_len
-
-            # 1. Per-sequence context
-            ctx_seq = theta[i] if isinstance(theta, list) and theta[i] is not None else theta
-
-            # 2. Module logits
-            init_logits = self._ensure_shape(self.initial_module, ctx_seq, T)     # [T,K]
-            dur_logits = self._ensure_shape(self.duration_module, ctx_seq, T)     # [T,K,Dmax]
-            trans_logits = self._ensure_shape(self.transition_module, ctx_seq, T) # [T,K,K]
-
-            # 3. Cumulative emission sums
-            cumsum_emit = torch.zeros(T + 1, K, dtype=DTYPE, device=device)
-            cumsum_emit[1:] = torch.cumsum(seq_logp, dim=0)
-
-            dur_range = torch.arange(1, Dmax + 1, device=device)                        # [Dmax]
-            ends = torch.arange(T, device=device).unsqueeze(1) + dur_range.unsqueeze(0) # [T,Dmax]
-            ends_clamped = ends.clamp(max=T)  # clip beyond sequence length
-
-            start = (ends_clamped - dur_range).clamp(min=0)  # start indices for emission sums
-
-            # emission sums: [T,K,Dmax]
-            emit_sums = cumsum_emit[ends_clamped] - cumsum_emit[start]
-            emit_sums = emit_sums.permute(0, 2, 1)  # [T,K,Dmax]
-
-            # 4. Initialize β
-            beta_tensor = torch.full((T, K, Dmax), neg_inf, dtype=DTYPE, device=device)
-            beta_tensor[-1, :, 0] = 0.0  # 0-duration at final step
-
-            # 5. Backward recursion
-            for t in reversed(range(T)):
-                max_d = min(Dmax, T - t)
-                dur_scores = dur_logits[t, :, :max_d]  # [K,max_d]
-                trans_t = trans_logits[t]              # [K,K]
-                init_t = init_logits[t]                # [K]
-
-                # β of next steps
-                next_beta = torch.full((max_d, K), neg_inf, dtype=DTYPE, device=device)
-                valid_mask = (t + torch.arange(max_d, device=device) < T)
-                if valid_mask.any():
-                    idx = valid_mask.nonzero(as_tuple=True)[0]
-                    next_beta[idx] = torch.logsumexp(beta_tensor[t + torch.arange(max_d, device=device)[idx], :, :], dim=2)
-
-                if (~valid_mask).any():
-                    idx = (~valid_mask).nonzero(as_tuple=True)[0]
-                    next_beta[idx] = init_t.unsqueeze(0)
-
-                # Combine transitions
-                beta_trans = torch.logsumexp(next_beta.unsqueeze(2) + trans_t.unsqueeze(0), dim=1)  # [max_d,K]
-
-                # Update β
-                beta_tensor[t, :, :max_d] = beta_trans.T + dur_scores + emit_sums[t, :, :max_d]
-
-            beta_list.append(beta_tensor)
-
-        return beta_list
 
     def _compute_posteriors(self, X: utils.SequenceSet, theta: Optional[ContextFeatures] = None):
         """
@@ -1005,6 +854,170 @@ class HSMM(nn.Module):
             "transition_dist": self.transition_module.forward(context=ctx_canonical, return_dist=True),
             "emission_dist": emission_dist,
         }
+
+    def _forward(
+        self,
+        X: utils.SequenceSet,
+        theta: Optional[list[Optional[torch.Tensor]] | torch.Tensor] = None) -> list[torch.Tensor]:
+
+        K, Dmax = self.n_states, self.max_duration
+        neg_inf = torch.finfo(DTYPE).min / 2.0
+        alpha_list = []
+
+        for i, (log_emissions, seq_len) in enumerate(zip(X.log_probs, X.lengths)):
+            device = log_emissions.device
+
+            if seq_len == 0:
+                alpha_list.append(torch.full((0, K, Dmax), neg_inf, dtype=DTYPE, device=device))
+                continue
+
+            T = seq_len
+            # ---------------- Per-sequence context ----------------
+            ctx_seq = None
+            if theta is not None:
+                ctx_seq = theta[i] if isinstance(theta, list) else theta
+
+            # ---------------- Module logits ----------------
+            initial_logits = self._ensure_shape(self.initial_module, ctx_seq, T)  # [T,K] or [K]
+            duration_logits = self._ensure_shape(self.duration_module, ctx_seq, T)  # [T,K,Dmax]
+            transition_logits = self._ensure_shape(self.transition_module, ctx_seq, T)  # [T,K,K]
+
+            # ---------------- Cumulative emission sums ----------------
+            cumsum_emit = torch.zeros(T + 1, K, dtype=DTYPE, device=device)
+            cumsum_emit[1:] = torch.cumsum(log_emissions, dim=0)
+
+            dur_range = torch.arange(1, Dmax + 1, device=device).view(1, Dmax)  # [1,Dmax]
+            time_idx = torch.arange(T, device=device).view(T, 1)  # [T,1]
+            start_idx = (time_idx - dur_range + 1).clamp(min=0)  # [T,Dmax]
+
+            start_idx_exp = start_idx.unsqueeze(2).expand(T, Dmax, K)  # [T,Dmax,K]
+            end_idx_exp = (time_idx + 1).unsqueeze(2).expand(T, 1, K)  # [T,1,K]
+            cumsum_emit_exp = cumsum_emit.unsqueeze(0).expand(T, T + 1, K)  # [T,T+1,K]
+            emit_sums = cumsum_emit_exp.gather(1, end_idx_exp) - cumsum_emit_exp.gather(1, start_idx_exp)
+            emit_sums = emit_sums.permute(0, 2, 1)  # [T,K,Dmax]
+
+            # ---------------- Forward recursion ----------------
+            alpha_tensor = torch.full((T, K, Dmax), neg_inf, dtype=DTYPE, device=device)
+
+            for t in range(T):
+                max_d = min(Dmax, t + 1)
+
+                if t == 0:
+                    alpha_tensor[t, :, :max_d] = (
+                        initial_logits[t].unsqueeze(1)  # [K,1]
+                        + duration_logits[t, :, :max_d]  # [K,max_d]
+                        + emit_sums[t, :, :max_d]        # [K,max_d]
+                    )
+                    continue
+
+                prev_alpha = torch.full((max_d, K), neg_inf, dtype=DTYPE, device=device)
+                valid_mask = start_idx[t, :max_d] > 0
+                initial_mask = ~valid_mask
+
+                # --- Case 1: valid previous segments ---
+                if valid_mask.any():
+                    idx = valid_mask.nonzero(as_tuple=True)[0]
+                    prev_positions = start_idx[t, idx] - 1
+                    prev_vals = torch.logsumexp(alpha_tensor[prev_positions, :, :], dim=2)
+                    prev_alpha[idx] = prev_vals
+
+                # --- Case 2: segment begins at t=0 ---
+                if initial_mask.any():
+                    idx = initial_mask.nonzero(as_tuple=True)[0]
+                    prev_alpha[idx] = (
+                        initial_logits[t].unsqueeze(0)                   # [1,K]
+                        + duration_logits[t, :, :max_d][:, idx].T        # [len(idx),K]
+                    )
+
+                # --- Transition step ---
+                alpha_trans = torch.logsumexp(
+                    prev_alpha.unsqueeze(2) + transition_logits[t].unsqueeze(0), dim=1
+                )  # [max_d,K]
+
+                alpha_tensor[t, :, :max_d] = (
+                    alpha_trans.T
+                    + duration_logits[t, :, :max_d]
+                    + emit_sums[t, :, :max_d]
+                )
+
+            alpha_list.append(alpha_tensor)
+
+        return alpha_list
+
+    def _backward(
+        self,
+        X: utils.SequenceSet,
+        theta: Optional[list[Optional[torch.Tensor]] | torch.Tensor] = None) -> list[torch.Tensor]:
+        """
+        Vectorized backward pass for HSMM.
+        Returns list of [T, K, Dmax] tensors per sequence.
+        """
+        K, Dmax = self.n_states, self.max_duration
+        neg_inf = torch.finfo(DTYPE).min / 2.0
+        beta_list = []
+
+        for i, (seq_logp, seq_len) in enumerate(zip(X.log_probs, X.lengths)):
+            device = seq_logp.device
+
+            if seq_len == 0:
+                beta_list.append(torch.full((0, K, Dmax), neg_inf, dtype=DTYPE, device=device))
+                continue
+
+            T = seq_len
+
+            # 1. Per-sequence context
+            ctx_seq = theta[i] if isinstance(theta, list) and theta[i] is not None else theta
+
+            # 2. Module logits
+            init_logits = self._ensure_shape(self.initial_module, ctx_seq, T)     # [T,K]
+            dur_logits = self._ensure_shape(self.duration_module, ctx_seq, T)     # [T,K,Dmax]
+            trans_logits = self._ensure_shape(self.transition_module, ctx_seq, T) # [T,K,K]
+
+            # 3. Cumulative emission sums
+            cumsum_emit = torch.zeros(T + 1, K, dtype=DTYPE, device=device)
+            cumsum_emit[1:] = torch.cumsum(seq_logp, dim=0)
+
+            dur_range = torch.arange(1, Dmax + 1, device=device)                        # [Dmax]
+            ends = torch.arange(T, device=device).unsqueeze(1) + dur_range.unsqueeze(0) # [T,Dmax]
+            ends_clamped = ends.clamp(max=T)  # clip beyond sequence length
+
+            start = (ends_clamped - dur_range).clamp(min=0)  # start indices for emission sums
+
+            # emission sums: [T,K,Dmax]
+            emit_sums = cumsum_emit[ends_clamped] - cumsum_emit[start]
+            emit_sums = emit_sums.permute(0, 2, 1)  # [T,K,Dmax]
+
+            # 4. Initialize β
+            beta_tensor = torch.full((T, K, Dmax), neg_inf, dtype=DTYPE, device=device)
+            beta_tensor[-1, :, 0] = 0.0  # 0-duration at final step
+
+            # 5. Backward recursion
+            for t in reversed(range(T)):
+                max_d = min(Dmax, T - t)
+                dur_scores = dur_logits[t, :, :max_d]  # [K,max_d]
+                trans_t = trans_logits[t]              # [K,K]
+                init_t = init_logits[t]                # [K]
+
+                # β of next steps
+                next_beta = torch.full((max_d, K), neg_inf, dtype=DTYPE, device=device)
+                valid_mask = (t + torch.arange(max_d, device=device) < T)
+                if valid_mask.any():
+                    idx = valid_mask.nonzero(as_tuple=True)[0]
+                    next_beta[idx] = torch.logsumexp(beta_tensor[t + torch.arange(max_d, device=device)[idx], :, :], dim=2)
+
+                if (~valid_mask).any():
+                    idx = (~valid_mask).nonzero(as_tuple=True)[0]
+                    next_beta[idx] = init_t.unsqueeze(0)
+
+                # Combine transitions
+                beta_trans = torch.logsumexp(next_beta.unsqueeze(2) + trans_t.unsqueeze(0), dim=1)  # [max_d,K]
+
+                # Update β
+                beta_tensor[t, :, :max_d] = beta_trans.T + dur_scores + emit_sums[t, :, :max_d]
+
+            beta_list.append(beta_tensor)
+
+        return beta_list
 
 
     # HSMM EM
