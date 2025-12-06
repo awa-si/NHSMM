@@ -221,9 +221,7 @@ class HSMM(nn.Module):
             transition_type=transition_type,
             context_dim=self.context_dim,
             hidden_dim=self.hidden_dim,
-            temperature=temperature,
-            cache_limit=cache_limit,
-            debug=debug,
+            temperature=temperature
         ).to(device)
 
         # Initialize distributions
@@ -519,8 +517,7 @@ class HSMM(nn.Module):
 
         # --- Determine target trailing shape ---
         if hasattr(module, "_shape") and module._shape is not None:
-            target_shape = [int(module._shape)] if isinstance(module._shape, int) \
-                           else [int(x) for x in module._shape]
+            target_shape = [int(module._shape)] if isinstance(module._shape, int) else [int(x) for x in module._shape]
         else:
             if isinstance(module, Initial):
                 target_shape = [self.n_states]
@@ -543,7 +540,19 @@ class HSMM(nn.Module):
                 raise ValueError("Unsupported context ndim")
 
         # --- Call module ---
-        x = module.log_matrix(context=ctx, timestep=T)
+        if isinstance(module, Duration):
+            # Duration logits are either static [K,D] or batch [B,1,K,D], don't index timestep
+            x = module.log_matrix(context=ctx)
+        elif isinstance(module, Transition):
+            # Only pass timestep if context is [T,H] or [B,T,H], not static/batch
+            timestep_for_modulate = None
+            if ctx is not None and ctx.ndim == 2:
+                timestep_for_modulate = T
+            x = module.log_matrix(context=ctx, timestep=timestep_for_modulate)
+        else:
+            # Initial or other modules: safe to pass T
+            x = module.log_matrix(context=ctx, timestep=T)
+
         if not torch.is_tensor(x):
             raise TypeError(f"log_matrix must return tensor, got {type(x)}")
 
@@ -1292,13 +1301,13 @@ class HSMM(nn.Module):
                 α = max(α_min, α_max * (1.0 - it / max_iter))
 
                 # Update categorical distributions
-                init_pdf = self.initial_module.dist_type(
+                init_pdf = self.initial_module._dist(
                     probs=α * init_counts + (1 - α) * self.initial_module.expected_probs()
                 )
-                duration_dist = self.duration_module.dist_type(
+                duration_dist = self.duration_module._dist(
                     probs=α * dur_counts + (1 - α) * self.duration_module.expected_probs()
                 )
-                transition_dist = self.transition_module.dist_type(
+                transition_dist = self.transition_module._dist(
                     probs=α * trans_counts + (1 - α) * self.transition_module.expected_probs()
                 )
 
