@@ -285,35 +285,29 @@ class Neural(nn.Module, ABC):
 
     def _prepare_context(self, context: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """
-        Standardize context to (B, T, H) shape for internal processing and
-        update self._mode for downstream logic.
-
-        Modes:
-            - "scalar"         : no context or single vector (H,)
-            - "sequence"       : (T, H) per-sequence context
-            - "batch"          : (B, T, H) batched sequence context
+        Standardize context to (B, T, H), but classify modes based on
+        *semantic* meaning, not just ndim.
         """
         if context is None:
             self._mode = "scalar"
             return None
 
-        if context.ndim == 1:  # (H,)
-            ctx = context.view(1, 1, -1)
+        # (H,)  — scalar context
+        if context.ndim == 1:
             self._mode = "scalar"
-        elif context.ndim == 2:  # (T, H)
-            ctx = context.unsqueeze(0)  # (1, T, H)
-            self._mode = "sequence"
-        elif context.ndim == 3:  # (B, T, H)
-            ctx = context
+            return context.view(1, 1, -1)
+
+        # (B, H)  — batch context
+        if context.ndim == 2:
             self._mode = "batch"
-        else:
-            raise ValueError(f"Unsupported context ndim={context.ndim}")
+            return context.unsqueeze(1)    # (B,1,H)
 
-        # Validate context dim if specified
-        if self.context_dim is not None and ctx.shape[-1] != self.context_dim:
-            raise ValueError(f"context_dim mismatch: got {ctx.shape[-1]}, expected {self.context_dim}")
+        # (B, T, H) — batch sequence
+        if context.ndim == 3:
+            self._mode = "batch"
+            return context
 
-        return ctx
+        raise ValueError(f"Unsupported context ndim={context.ndim}")
 
     def _apply_context(
         self,
@@ -745,6 +739,53 @@ class Initial(Neural):
             logits = logits.masked_fill(~mask, -1e9)  # effectively zero probability
         logits = logits - logits.logsumexp(dim=-1, keepdim=True)
         return logits
+
+    def _apply_context(self,
+        base: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+        timestep: Optional[int] = None,
+        grad_scale: Optional[float] = None,
+        skip_adapters: bool = True) -> torch.Tensor:
+        # Delegate almost entirely to Neural
+        delta = super()._apply_context(base, context=context, timestep=timestep, grad_scale=grad_scale, skip_adapters=skip_adapters)
+        return delta
+
+    def expected_probs(
+        self,
+        context: Optional[torch.Tensor] = None,
+        temperature: Optional[float] = None,
+        timestep: Optional[int] = None,
+        return_dist: bool = False,
+        **dist_kwargs) -> torch.Tensor:
+        """
+        Return the expected probabilities for the distribution given context, temperature,
+        and optional timestep. Always returns a tensor of shape:
+            - Scalar context: (n_states,)
+            - Sequence context: (T, n_states)
+            - Batch context: (B, n_states)
+        If `return_dist=True`, returns the distribution object instead.
+        """
+        # Compute modulated logits
+        mod_logits = self._modulate(context=context, temperature=temperature, timestep=timestep)
+        dist = self._dist(**self._dist_params(mod_logits, **dist_kwargs))
+
+        if return_dist: return dist
+
+        probs = F.softmax(mod_logits, dim=-1)
+
+        # Collapse singleton dims to produce clean shapes
+        if self._mode == "scalar":
+            probs = probs.squeeze(0).squeeze(0)           # -> (n_states,)
+        elif self._mode == "sequence":
+            if probs.shape[0] == 1:
+                probs = probs.squeeze(0)                  # -> (T, n_states)
+        elif self._mode == "batch":
+            if probs.shape[0] == 1:
+                probs = probs.squeeze(0)                  # -> (B, n_states)
+            if probs.ndim > 2 and probs.shape[1] == 1:
+                probs = probs.squeeze(1)                  # remove extra timestep dim
+
+        return probs
 
 
 class Duration(Neural):

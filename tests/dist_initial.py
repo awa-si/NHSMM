@@ -136,12 +136,14 @@ def test_update_and_cache():
     out1 = init.expected_probs(context=ctx)
     out2 = init.expected_probs(context=ctx)
     assert torch.allclose(out1, out2), "Cache mismatch"
+    print("Cache check shapes:", out1.shape, out2.shape)
 
     # Update logits via pseudo-posterior
     posterior = torch.ones_like(out1) / out1.shape[-1]
     init.update(posterior=posterior, context=ctx, update_rate=0.5)
     out3 = init.expected_probs(context=ctx)
     assert not torch.allclose(out1, out3), "Logits did not update"
+    print("Updated sample shape:", out3.shape)
 
 if __name__ == "__main__":
     test_basic()

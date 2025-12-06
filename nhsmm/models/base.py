@@ -1037,7 +1037,6 @@ class HSMM(nn.Module):
         """
         gamma_list, _, _ = self._compute_posteriors(X)
         results = []
-
         for gamma in gamma_list:
             if gamma is None or gamma.numel() == 0:
                 results.append(torch.empty(0, dtype=torch.long))
