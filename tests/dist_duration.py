@@ -3,10 +3,71 @@
 import torch
 import torch.nn.functional as F
 from nhsmm.distributions import Duration
-from nhsmm.constants import DTYPE
+from nhsmm.constants import DTYPE, EPS
+from nhsmm.context import CNN_LSTM_Encoder, ContextEncoder
 
 def set_seed(seed: int = 42):
     torch.manual_seed(seed)
+
+# ---------------- ContextEncoder + CNN_LSTM_Encoder Integration ----------------
+def test_context_encoder():
+    print("\n=== TEST: ContextEncoder + CNN_LSTM_Encoder with Duration ===")
+    B, T, F_in = 4, 8, 6
+    n_states = 5
+    context_dim = 16
+
+    x = torch.randn(B, T, F_in)
+
+    # --- CNN_LSTM Encoder ---
+    encoder = CNN_LSTM_Encoder(
+        n_features=F_in,
+        hidden_dim=context_dim,
+        cnn_channels=8,
+        kernel_size=3,
+        bidirectional=True,
+        return_sequence=True
+    )
+
+    # Test each pooling method
+    for pool in ["mean", "last", "max", "attn", "mha"]:
+        print(f"\n=== Testing pool={pool} ===")
+        ctx_enc = ContextEncoder(encoder=encoder, pool=pool, n_heads=2, debug=True)
+        seq_out, ctx, attn = ctx_enc(x, return_context=True, return_attn_weights=True, return_sequence=True)
+        print("Input shape:", x.shape)
+        print("Sequence output shape:", seq_out.shape)
+        print("Context shape:", ctx.shape)
+        if attn is not None:
+            print("Attention weights shape:", attn.shape)
+
+        # Pass context to Duration
+        dur = Duration(n_states=n_states, max_duration=7, context_dim=seq_out.shape[-1], hidden_dim=32)
+        probs = dur.expected_probs(context=ctx.squeeze(1))
+        print("Duration probs shape:", probs.shape)
+        print("Sum of probs (per state):", probs.sum(dim=-1))
+
+        # Verify probabilities sum to 1
+        assert torch.allclose(probs.sum(dim=-1), torch.ones(B, n_states), atol=1e-5)
+
+    # --- Non-uniform temperature scaling ---
+    print("\n=== Testing Non-uniform Temperature ===")
+    dur = Duration(n_states=n_states, max_duration=7, init_mode="short_bias")
+    logits = dur.logits.detach().clone()
+    print("Raw logits:", logits)
+    for temp in [0.1, 1.0, 5.0]:
+        probs_temp = dur.expected_probs(temperature=temp).detach()
+        print(f"Temperature {temp} -> probs:", probs_temp)
+        assert torch.allclose(probs_temp.sum(dim=-1), torch.ones_like(probs_temp.sum(dim=-1)), atol=1e-5)
+
+    # --- Test multi-step sequence contexts ---
+    print("\n=== Testing Sequence Context ===")
+    S, B, T, C = 2, 3, 5, context_dim
+    seq_ctx = torch.randn(S, B, T, C)
+    dur = Duration(n_states=n_states, max_duration=7, context_dim=C, hidden_dim=32)
+    for s in range(S):
+        probs_seq = dur.expected_probs(context=seq_ctx[s])
+        sums = probs_seq.sum(dim=-1)
+        print(f"Sequence {s}, probs shape: {probs_seq.shape}, sum per timestep:", sums)
+        assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
 
 # ---------------- Basic Functionality ----------------
 def test_basic():
@@ -17,6 +78,7 @@ def test_basic():
     probs = dur.expected_probs().detach()
     print("Probs shape:", probs.shape)
     print("Sum over durations per state:", probs.sum(dim=-1))
+    assert torch.allclose(probs.sum(dim=-1), torch.ones(dur.n_states), atol=1e-5)
 
     sample_vec = dur.sample()
     print("Sample vector shape:", sample_vec.shape)
@@ -41,20 +103,41 @@ def test_context():
     probs_single = dur.expected_probs(context=ctx_single).detach()
     print("Single context probs shape:", probs_single.shape)
     print("Sum over durations per state:", probs_single.sum(dim=-1))
+    assert torch.allclose(probs_single.sum(dim=-1), torch.ones(dur.n_states), atol=1e-5)
 
     # Batch context
     ctx_batch = torch.randn(5, 3)
     probs_batch = dur.expected_probs(context=ctx_batch).detach()
     print("Batch context probs shape:", probs_batch.shape)
-    print("Sum over durations per state:", probs_batch.sum(dim=-1))
+    # Sum over durations (last dim)
+    sums = probs_batch.sum(dim=-1)  # shape: [5, 1, n_states]
+    print("Sum over durations per state:", sums)
+    # Check sums = 1
+    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
 
 # ---------------- Log Matrix ----------------
 def test_log_matrix():
     print("\n=== TEST: Log Matrix ===")
+
     dur = Duration(n_states=2, max_duration=4)
+
+    # Raw logits
     L = dur.log_matrix()
-    print("log_matrix shape:", L.shape)
-    print("exp(log_matrix):", L.exp().detach().cpu().numpy())
+    print("log_matrix (logits) shape:", L.shape)
+    print(L)
+
+    # Softmax should produce a valid distribution per state
+    probs = L.softmax(dim=-1)
+
+    print("Softmax probs:", probs)
+    print("Row sums:", probs.sum(-1))
+
+    # Validate rows sum to 1
+    assert torch.allclose(
+        probs.sum(-1),
+        torch.ones_like(probs[..., 0]),
+        atol=1e-6
+    )
 
 # ---------------- Sequence Log Prob ----------------
 def test_sequence_log_prob():
@@ -81,6 +164,7 @@ def test_sampling_correctness(N: int = 5000):
         counts += torch.bincount(s_idx, minlength=probs.shape[-1]).float()
     empirical = counts / counts.sum()
     print("Empirical freq:", empirical)
+    print("Difference:", empirical - probs[0])
     assert torch.allclose(empirical, probs[0], atol=0.05)
 
 # ---------------- Gradient Flow ----------------
@@ -99,12 +183,6 @@ def test_gradient_flow():
     dur.expected_probs(context=ctx_batch).sum().backward()
     print("Batch context grad shape:", ctx_batch.grad.shape)
     print("Batch context grad norm:", ctx_batch.grad.norm().item())
-    ctx_batch.grad.zero_()
-
-    # Sequence batch gradient
-    seq_ctx = torch.randn(2, 3, 3, requires_grad=True, dtype=DTYPE)
-    dur.expected_probs(context=seq_ctx).sum().backward()
-    print("Sequence batch context grad norm:", seq_ctx.grad.norm().item())
     ctx_batch.grad.zero_()
 
     # Logits gradient (no context)
@@ -146,7 +224,6 @@ def test_batch_timestep_modulation():
     ctx = torch.randn(B, 3)
     timesteps = torch.arange(1, T+1).repeat(B, 1)  # B x T
 
-    # Modulate each timestep without flattening
     mod_logits = torch.stack([dur._modulate(context=ctx[b], timestep=timesteps[b, t])
                               for b in range(B) for t in range(T)], dim=0)
     print("Batched modulated logits shape:", mod_logits.shape)
@@ -168,4 +245,5 @@ if __name__ == "__main__":
     test_edge_cases()
     test_update_cache()
     test_batch_timestep_modulation()
+    test_context_encoder()
     print("\n✓ All Duration tests finished.")

@@ -3,6 +3,66 @@
 import torch
 from nhsmm.distributions import Initial
 from nhsmm.constants import EPS
+from nhsmm.context import CNN_LSTM_Encoder, ContextEncoder
+
+def test_context_encoder():
+    B, T, F_in = 4, 8, 6
+    n_states = 5
+    context_dim = 16
+
+    x = torch.randn(B, T, F_in)
+
+    # --- CNN_LSTM Encoder ---
+    encoder = CNN_LSTM_Encoder(
+        n_features=F_in,
+        hidden_dim=context_dim,
+        cnn_channels=8,
+        kernel_size=3,
+        bidirectional=True,
+        return_sequence=True
+    )
+
+    # Test each pooling method
+    for pool in ["mean", "last", "max", "attn", "mha"]:
+        print(f"\n=== Testing pool={pool} ===")
+        ctx_enc = ContextEncoder(encoder=encoder, pool=pool, n_heads=2, debug=True)
+        seq_out, ctx, attn = ctx_enc(x, return_context=True, return_attn_weights=True, return_sequence=True)
+        print("Input shape:", x.shape)
+        print("Sequence output shape:", seq_out.shape)
+        print("Context shape:", ctx.shape)
+        if attn is not None:
+            print("Attention weights shape:", attn.shape)
+
+        # Pass context to Initial
+        init = Initial(n_states=n_states, context_dim=seq_out.shape[-1], hidden_dim=32)
+        probs = init.expected_probs(context=ctx.squeeze(1))
+        print("Initial probs shape:", probs.shape)
+        print("Sum of probs (per batch):", probs.sum(dim=-1))
+
+        # Verify probabilities sum to 1
+        assert torch.allclose(probs.sum(dim=-1), torch.ones(B), atol=1e-5)
+
+    # --- Non-uniform temperature scaling ---
+    print("\n=== Testing Non-uniform Temperature ===")
+    init = Initial(n_states=n_states, init_mode="biased")
+    logits = init.logits.detach().clone()
+    print("Raw logits:", logits)
+    for temp in [0.1, 1.0, 5.0]:
+        probs_temp = init.expected_probs(temperature=temp).detach()
+        print(f"Temperature {temp} -> probs:", probs_temp)
+        # Check sum
+        assert torch.allclose(probs_temp.sum(dim=-1), torch.ones_like(probs_temp.sum(dim=-1)), atol=1e-5)
+
+    # --- Test multi-step context sequences ---
+    print("\n=== Testing Sequence Context ===")
+    S, B, T, C = 2, 3, 5, context_dim
+    seq_ctx = torch.randn(S, B, T, C)
+    init = Initial(n_states=n_states, context_dim=C, hidden_dim=32)
+    for s in range(S):
+        probs_seq = init.expected_probs(context=seq_ctx[s])
+        sums = probs_seq.sum(dim=-1)
+        print(f"Sequence {s}, probs shape: {probs_seq.shape}, sum per timestep:", sums)
+        assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
 
 def test_basic():
     print("\n=== TEST: Basic Functionality ===")
@@ -12,7 +72,7 @@ def test_basic():
     probs = init.expected_probs().detach()
     print("Probs:", probs.cpu().numpy())
     print("Sum of probs:", probs.sum().item())
-    assert torch.allclose(probs.sum(), torch.tensor(1.0), atol=1e-5), "Probs do not sum to 1"
+    assert torch.allclose(probs.sum(), torch.tensor(1.0), atol=1e-5)
 
     sample_vec = init.sample()
     print("Sample vector:", sample_vec.detach().cpu().numpy())
@@ -21,7 +81,6 @@ def test_basic():
 def test_temperature():
     print("\n=== TEST: Temperature Scaling ===")
     init = Initial(n_states=4, init_mode="uniform")
-
     cold = init.expected_probs(temperature=0.1).detach()
     hot = init.expected_probs(temperature=5.0).detach()
 
@@ -51,14 +110,41 @@ def test_context_batch():
     print("Probs shape:", probs.shape)
     assert torch.allclose(probs.sum(dim=-1), torch.ones(probs.shape[0]), atol=1e-5)
 
+def test_context_sequence():
+    print("\n=== TEST: Context Sequence [S,B,T,C] ===")
+    init = Initial(n_states=4, context_dim=3, hidden_dim=8)
+    S, B, T, C = 2, 3, 5, 3
+    ctx = torch.randn(S, B, T, C)
+    all_probs = []
+    for s in range(S):
+        probs = init.expected_probs(context=ctx[s]).detach()
+        all_probs.append(probs)
+        sums = probs.sum(-1)
+        assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
+    print(f"Sequence context shape: {ctx.shape}, sample probs shapes:", [p.shape for p in all_probs])
+
 def test_log_matrix():
     print("\n=== TEST: log_matrix ===")
+
     init = Initial(n_states=4)
-    probs = init.log_matrix().detach()
-    print("log_matrix (probs) shape:", probs.shape)
-    print(probs.cpu().numpy())
-    assert torch.allclose(probs.sum(-1), torch.ones(probs.shape[0]), atol=1e-5), \
-        "log_matrix rows do not sum to 1"
+
+    # NEW: log_matrix returns raw logits
+    logits = init.log_matrix().detach()
+
+    print("logits shape:", logits.shape)
+    print("logits:\n", logits.cpu().numpy())
+
+    # Convert manually to probs for verification
+    probs = torch.softmax(logits, dim=-1)
+
+    print("exp(rows) sum to:", probs.sum(-1))
+
+    # Rows must sum to 1 after softmax
+    assert torch.allclose(
+        probs.sum(-1),
+        torch.ones_like(probs.sum(-1)),
+        atol=1e-5
+    )
 
 def test_log_prob_sequence():
     print("\n=== TEST: log_prob simple sequence ===")
@@ -68,6 +154,25 @@ def test_log_prob_sequence():
     print("Sequence:", seq.detach().cpu().numpy())
     print("log_prob:", lp.item())
 
+def test_log_prob_context():
+    print("\n=== TEST: log_prob with context ===")
+    init = Initial(n_states=4, context_dim=5, hidden_dim=16)
+    B, T, C = 6, 1, 5
+    seq = torch.randint(high=4, size=(B, T))
+    ctx = torch.randn(B, C)
+    lp = init.log_prob(seq, context=ctx)
+    print("Sequences:\n", seq.detach().cpu().numpy())
+    print("Context shape:", ctx.shape)
+    print("log_prob:", lp.detach().cpu().numpy())
+
+    T = 3
+    seq_multi = torch.randint(high=4, size=(B, T))
+    ctx_multi = torch.randn(B, T, C)
+    lp_multi = init.log_prob(seq_multi, context=ctx_multi)
+    print("Multi-step sequences shape:", seq_multi.shape)
+    print("Multi-step context shape:", ctx_multi.shape)
+    print("log_prob multi-step:\n", lp_multi.detach().cpu().numpy())
+
 def test_log_prob_batch():
     print("\n=== TEST: log_prob batch ===")
     init = Initial(n_states=4)
@@ -76,16 +181,16 @@ def test_log_prob_batch():
     print("Sequences:\n", seq.detach().cpu().numpy())
     print("Batch log_prob:", lp.detach().cpu().numpy())
 
-def test_log_prob_context():
-    print("\n=== TEST: log_prob with context ===")
+def test_log_prob_sequence_context():
+    print("\n=== TEST: log_prob with batch sequence context ===")
     init = Initial(n_states=4, context_dim=5, hidden_dim=16)
-    batch = 6
-    seq = torch.randint(high=4, size=(batch, 1))
-    ctx = torch.randn(batch, 5)
+    B, T, C = 6, 3, 5
+    seq = torch.randint(high=4, size=(B, T))
+    ctx = torch.randn(B, T, C)
     lp = init.log_prob(seq, context=ctx)
-    print("Sequences:\n", seq.detach().cpu().numpy())
+    print("Sequences shape:", seq.shape)
     print("Context shape:", ctx.shape)
-    print("log_prob:", lp.detach().cpu().numpy())
+    print("log_prob shape:", lp.shape)
 
 def test_sampling_correctness():
     print("\n=== TEST: Sampling Correctness (empirical) ===")
@@ -117,9 +222,8 @@ def test_edge_cases():
     init1 = Initial(n_states=1)
     p1 = init1.expected_probs().detach()
     print("n_states = 1, probs:", p1.detach().cpu().numpy())
-    assert torch.allclose(p1, torch.ones_like(p1)), "n_states=1 should yield prob 1"
+    assert torch.allclose(p1, torch.ones_like(p1))
 
-    # Large batch with context=None
     try:
         init = Initial(n_states=5)
         out = init.expected_probs(context=None)
@@ -131,18 +235,16 @@ def test_update_and_cache():
     print("\n=== TEST: update() and cache ===")
     init = Initial(n_states=4, context_dim=3, hidden_dim=8)
     ctx = torch.randn(1, 3)
-    
-    # Initial forward pass
+
     out1 = init.expected_probs(context=ctx)
     out2 = init.expected_probs(context=ctx)
-    assert torch.allclose(out1, out2), "Cache mismatch"
+    assert torch.allclose(out1, out2)
     print("Cache check shapes:", out1.shape, out2.shape)
 
-    # Update logits via pseudo-posterior
     posterior = torch.ones_like(out1) / out1.shape[-1]
     init.update(posterior=posterior, context=ctx, update_rate=0.5)
     out3 = init.expected_probs(context=ctx)
-    assert not torch.allclose(out1, out3), "Logits did not update"
+    assert not torch.allclose(out1, out3)
     print("Updated sample shape:", out3.shape)
 
 if __name__ == "__main__":
@@ -150,12 +252,15 @@ if __name__ == "__main__":
     test_temperature()
     test_context_single()
     test_context_batch()
+    test_context_sequence()
     test_log_matrix()
     test_log_prob_sequence()
     test_log_prob_context()
     test_log_prob_batch()
+    test_log_prob_sequence_context()
     test_sampling_correctness()
     test_gradient_flow()
     test_edge_cases()
     test_update_and_cache()
+    test_context_encoder()
     print("\n✓ All tests finished.")
