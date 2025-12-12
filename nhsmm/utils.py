@@ -1,180 +1,276 @@
-# nhsmm/tools/utils.py
+# nhsmm/utils.py
+from __future__ import annotations
 
-import torch
-from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union, Tuple
+from dataclasses import dataclass, field
+import torch
 
 
-@dataclass(frozen=False)
+@dataclass
 class SequenceSet:
     """
-    Modern container for sequences, log-probabilities, contexts, and masks.
+    Batch-major container for sequences, log-probabilities, contexts, canonical contexts, and masks.
+    All fields are Tensors with batch dimension first: [B, T, ...]. Sequences are padded to the same T.
 
-    Supports:
-        - Single sequence: [timesteps, features] or [timesteps]
-        - Batched sequences: [batch, timesteps, features]
-        - Contexts: [timesteps, hidden], [1, hidden], [batch, timesteps, hidden], [batch, hidden]
-        - Masks: [timesteps], [timesteps, 1], [batch, timesteps], [batch, timesteps, 1]
-        - Log-probs: [timesteps, features], [timesteps], or [timesteps, 1, features]
+    Fields
+    ------
+    sequences : torch.Tensor    # [B, T, F]
+    lengths   : torch.Tensor    # [B] (long) valid timesteps per sequence
+    masks     : torch.BoolTensor# [B, T, 1] boolean mask (True = valid)
+    contexts  : torch.Tensor    # [B, T, H]
+    canonical : torch.Tensor    # [B, 1, H] canonical context (first valid timestep)
+    log_probs : Optional[torch.Tensor] = None  # [B, T, K] per-state log-probs (or None)
     """
 
-    sequences: List[torch.Tensor]
-    lengths: Optional[List[int]] = None
-    masks: Optional[List[torch.Tensor]] = None
-    log_probs: Optional[List[torch.Tensor]] = None
-    contexts: Optional[List[Optional[torch.Tensor]]] = None
+    sequences: torch.Tensor
+    lengths: torch.Tensor
+    masks: torch.BoolTensor
+    contexts: torch.Tensor
+    canonical: torch.Tensor
+    log_probs: Optional[torch.Tensor] = None
 
-    def __post_init__(self):
-        # Canonicalize sequences to list of tensors
-        self.sequences = self._ensure_list(self.sequences, "sequences")
-        batch_size = len(self.sequences)
+    # ---------------- Construction helpers ----------------
+    @classmethod
+    def from_unbatched(
+        cls,
+        sequences: Sequence[torch.Tensor],
+        contexts: Optional[Sequence[Optional[torch.Tensor]]] = None,
+        canonical: Optional[Sequence[Optional[torch.Tensor]]] = None,
+        log_probs: Optional[Sequence[Optional[torch.Tensor]]] = None,
+        masks: Optional[Sequence[Optional[torch.Tensor]]] = None,
+        pad_value: float = 0.0,
+    ) -> "SequenceSet":
+        """
+        Build a batch-major SequenceSet from lists of tensors (unbatched).
+        - sequences: list of [T_i, F] or [T_i] tensors
+        - contexts: optional list of [T_i, H] or [1, H] or [T_i] or None
+        - canonical: optional list of [1, H] or [H]
+        - log_probs: optional list of [T_i, K] or [T_i] tensors
+        - masks: optional list of [T_i] or [T_i,1] boolean tensors
 
-        # Infer lengths
-        if self.lengths is None:
-            self.lengths = [s.shape[0] for s in self.sequences]
-        elif len(self.lengths) != batch_size:
-            raise ValueError("`lengths` must match number of sequences.")
-        else:
-            for s, l in zip(self.sequences, self.lengths):
-                if s.shape[0] != l:
-                    raise ValueError(f"Sequence length mismatch: {s.shape[0]} vs {l}")
+        Raises:
+            ValueError on empty input list, mismatched feature-dimensions, or zero-length sequences.
+        """
+        if not isinstance(sequences, (list, tuple)) or len(sequences) == 0:
+            raise ValueError("`sequences` must be a non-empty list of tensors.")
 
-        # Canonicalize log_probs
-        if self.log_probs is not None:
-            self.log_probs = self._ensure_list(self.log_probs, "log_probs", allow_none=False)
-            if len(self.log_probs) != batch_size:
-                raise ValueError("`log_probs` length mismatch")
-            self.log_probs = [self._normalize_log_probs(lp, l) for lp, l in zip(self.log_probs, self.lengths)]
+        device = sequences[0].device
+        dtype = sequences[0].dtype
 
-        # Canonicalize contexts
-        if self.contexts is None:
-            self.contexts = [None] * batch_size
-        else:
-            self.contexts = self._ensure_list(self.contexts, "contexts", allow_none=True)
-            if len(self.contexts) != batch_size:
-                raise ValueError("`contexts` length mismatch")
-            self.contexts = [
-                self._normalize_context(ctx, l) if ctx is not None else None
-                for ctx, l in zip(self.contexts, self.lengths)
-            ]
+        # lengths and check non-empty
+        lengths = torch.tensor([int(s.shape[0]) for s in sequences], dtype=torch.long, device=device)
+        if (lengths <= 0).any():
+            raise ValueError("All sequences must have positive length (no empty sequences allowed).")
 
-        # Canonicalize masks
-        if self.masks is None:
-            self.masks = [torch.ones(l, 1, dtype=torch.bool, device=self.sequences[0].device) for l in self.lengths]
-        else:
-            self.masks = self._ensure_list(self.masks, "masks", allow_none=False)
-            if len(self.masks) != batch_size:
-                raise ValueError("`masks` length mismatch")
-            self.masks = [self._normalize_mask(m, l) for m, l in zip(self.masks, self.lengths)]
+        B = len(sequences)
+        T_max = int(lengths.max().item())
 
-    # ---------------- Internal helpers ----------------
-    def _ensure_list(self, items: Union[torch.Tensor, List[torch.Tensor], None], name: str, allow_none=False):
-        if torch.is_tensor(items):
-            return [items]
-        if isinstance(items, list):
-            if allow_none:
-                return [t if t is None else t for t in items]
-            return list(items)
-        raise TypeError(f"`{name}` must be a tensor or list of tensors.")
+        # feature dimension
+        def _feat_dim(t: torch.Tensor) -> int:
+            return t.shape[1] if t.ndim > 1 else 1
 
-    def _normalize_log_probs(self, lp: torch.Tensor, timesteps: int) -> torch.Tensor:
-        # Remove unnecessary singleton dimensions and ensure [timesteps, features]
-        if lp.ndim == 1 and lp.shape[0] == timesteps:
-            return lp.unsqueeze(-1)
-        if lp.ndim == 2 and lp.shape[0] == timesteps:
-            return lp
-        if lp.ndim == 3:
-            if lp.shape[0] == 1 and lp.shape[1] == timesteps:
-                return lp.squeeze(0)
-            if lp.shape[1] == 1 and lp.shape[0] == timesteps:
-                return lp.squeeze(1)
-        raise ValueError(f"Unsupported log_probs shape {lp.shape} for timesteps={timesteps}")
+        feature_dim = _feat_dim(sequences[0])
+        if any(_feat_dim(s) != feature_dim for s in sequences):
+            raise ValueError("All sequences must have the same per-step feature dimension.")
 
-    def _normalize_context(self, ctx: torch.Tensor, timesteps: int) -> torch.Tensor:
-        # Normalize to [timesteps, hidden]
-        if ctx.ndim == 1:
-            return ctx.unsqueeze(0).expand(timesteps, -1)
-        if ctx.ndim == 2:
-            if ctx.shape[0] in (1, timesteps):
-                return ctx.expand(timesteps, -1)
-        if ctx.ndim == 3:
-            if ctx.shape[0] == 1 and ctx.shape[1] == timesteps:
-                return ctx.squeeze(0)
-            if ctx.shape[1] == 1 and ctx.shape[0] == timesteps:
-                return ctx.squeeze(1)
-        raise ValueError(f"Unsupported context shape {ctx.shape} for timesteps={timesteps}")
+        # context dim if provided
+        ctx_dim = None
+        if contexts is not None:
+            # find first non-None context to infer dim
+            for c in contexts:
+                if c is not None:
+                    ctx_dim = c.shape[-1] if c.ndim > 1 else 1
+                    break
+        if ctx_dim is None:
+            ctx_dim = feature_dim  # fallback
 
-    def _normalize_mask(self, mask: torch.Tensor, timesteps: int) -> torch.Tensor:
-        # Normalize to [timesteps,1] boolean
-        if mask.ndim == 1 and mask.shape[0] == timesteps:
-            return mask.bool().unsqueeze(-1)
-        if mask.ndim == 2 and mask.shape in [(timesteps, 1), (1, timesteps)]:
-            return mask.view(timesteps, 1).bool()
-        if mask.ndim == 3 and mask.shape[0] == 1 and mask.shape[1] == timesteps:
-            return mask.squeeze(0).bool()
-        raise ValueError(f"Unsupported mask shape {mask.shape} for timesteps={timesteps}")
+        # prepare tensors
+        seq_tensor = torch.full((B, T_max, feature_dim), float(pad_value), dtype=dtype, device=device)
+        ctx_tensor = torch.zeros((B, T_max, ctx_dim), dtype=dtype, device=device)
+        mask_tensor = torch.zeros((B, T_max, 1), dtype=torch.bool, device=device)
+        logp_tensor = None
+        if log_probs is not None:
+            # infer K from first non-None
+            K = None
+            for lp in log_probs:
+                if lp is not None:
+                    K = lp.shape[1] if lp.ndim > 1 else 1
+                    break
+            if K is None:
+                raise ValueError("`log_probs` provided but all entries are None")
+            logp_tensor = torch.full((B, T_max, K), float("-inf"), dtype=dtype, device=device)
+
+        for i in range(B):
+            s = sequences[i]
+            L = s.shape[0]
+            if L == 0:
+                raise ValueError("Zero-length sequence encountered; all sequences must be length >= 1.")
+            # fill sequence (handle 1D -> unsqueeze)
+            if s.ndim == 1:
+                seq_tensor[i, :L, 0] = s.to(device=device, dtype=dtype)
+            else:
+                if s.shape[1] != feature_dim:
+                    raise ValueError("Feature dimension mismatch when building batch.")
+                seq_tensor[i, :L] = s.to(device=device, dtype=dtype)
+
+            # mask
+            if masks is None or masks[i] is None:
+                mask_tensor[i, :L, 0] = True
+            else:
+                m = masks[i].to(device=device)
+                if m.ndim == 1:
+                    m = m.unsqueeze(-1)
+                if m.shape[0] != L:
+                    # try to reshape/trim
+                    m = m.reshape(L, -1)[:, 0]
+                mask_tensor[i, :L, 0] = m.view(-1)[:L].bool()
+
+            # contexts
+            if contexts is not None and contexts[i] is not None:
+                c = contexts[i].to(device=device, dtype=dtype)
+                if c.ndim == 1:
+                    # interpret as [H] -> repeat
+                    ctx_tensor[i, :L] = c.unsqueeze(0).expand(L, -1)
+                elif c.ndim == 2:
+                    if c.shape[0] == 1 and c.shape[1] == ctx_dim:
+                        ctx_tensor[i, :L] = c.expand(L, -1)
+                    elif c.shape[0] == L and c.shape[1] == ctx_dim:
+                        ctx_tensor[i, :L] = c
+                    else:
+                        raise ValueError(f"Unsupported context shape {c.shape} for sequence {i}.")
+                else:
+                    raise ValueError(f"Unsupported context ndim {c.ndim} for sequence {i}.")
+
+            # log-probs
+            if logp_tensor is not None and log_probs is not None and log_probs[i] is not None:
+                lp = log_probs[i].to(device=device, dtype=dtype)
+                if lp.ndim == 1:
+                    # interpret as [T] -> [T,1]
+                    lp = lp.unsqueeze(-1)
+                if lp.shape[0] != L:
+                    raise ValueError("log_probs length mismatch for sequence {}".format(i))
+                if lp.shape[1] != logp_tensor.shape[2]:
+                    raise ValueError("log_probs feature (K) mismatch.")
+                logp_tensor[i, :L] = lp
+
+        # canonical: first valid timestep per sequence (require at least one True per row)
+        valid_counts = mask_tensor.squeeze(-1).sum(dim=1)
+        if (valid_counts == 0).any():
+            raise ValueError("All sequences must contain at least one valid timestep (mask).")
+
+        first_idx = mask_tensor.squeeze(-1).float().argmax(dim=1)
+        canonical_tensor = ctx_tensor[torch.arange(B, device=device), first_idx].unsqueeze(1)
+
+        return cls(
+            sequences=seq_tensor,
+            lengths=lengths,
+            masks=mask_tensor,
+            contexts=ctx_tensor,
+            canonical=canonical_tensor,
+            log_probs=logp_tensor,
+        )
 
     # ---------------- Properties ----------------
     @property
-    def n_sequences(self):
-        return len(self.sequences)
+    def n_sequences(self) -> int:
+        return int(self.sequences.shape[0])
 
     @property
-    def total_timesteps(self):
-        return sum(self.lengths)
+    def total_timesteps(self) -> int:
+        return int(self.lengths.sum().item())
 
     @property
-    def feature_dim(self):
-        dims = {s.shape[-1] if s.ndim > 1 else 1 for s in self.sequences}
-        if len(dims) != 1:
-            raise ValueError("Feature dimension mismatch across sequences.")
-        return dims.pop()
+    def feature_dim(self) -> int:
+        return int(self.sequences.shape[2])
 
     @property
-    def device(self):
-        return self.sequences[0].device
+    def context_dim(self) -> int:
+        return int(self.contexts.shape[2])
 
     @property
-    def dtype(self):
-        return self.sequences[0].dtype
+    def device(self) -> torch.device:
+        return self.sequences.device
 
-    # ---------------- Indexing ----------------
-    def __getitem__(self, idx):
-        def pick(lst):
-            if lst is None:
-                return None
-            return lst[idx] if isinstance(idx, slice) else [lst[idx]]
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.sequences.dtype
 
+    # ---------------- Tensor ops ----------------
+    def to(self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> "SequenceSet":
+        kwargs = {}
+        if device is not None:
+            kwargs["device"] = device
+        if dtype is not None:
+            kwargs["dtype"] = dtype
         return SequenceSet(
-            sequences=pick(self.sequences),
-            lengths=pick(self.lengths),
-            log_probs=pick(self.log_probs),
-            contexts=pick(self.contexts),
-            masks=pick(self.masks)
+            sequences=self.sequences.to(**kwargs),
+            lengths=self.lengths.to(**kwargs),
+            masks=self.masks.to(**kwargs),
+            contexts=self.contexts.to(**kwargs),
+            canonical=self.canonical.to(**kwargs),
+            log_probs=self.log_probs.to(**kwargs) if self.log_probs is not None else None,
         )
 
-    # ---------------- Tensor conversion ----------------
-    def to_tensor(self, key="sequences", pad_value=0.0):
-        items = getattr(self, key)
+    def index_select(self, idx: torch.Tensor) -> "SequenceSet":
+        """
+        Select subset of batch by index tensor (1D LongTensor).
+        """
+        return SequenceSet(
+            sequences=self.sequences.index_select(0, idx),
+            lengths=self.lengths.index_select(0, idx),
+            masks=self.masks.index_select(0, idx),
+            contexts=self.contexts.index_select(0, idx),
+            canonical=self.canonical.index_select(0, idx),
+            log_probs=self.log_probs.index_select(0, idx) if self.log_probs is not None else None,
+        )
+
+    def to_padded(self, pad_value: float = 0.0) -> "SequenceSet":
+        """
+        Already batch-major and padded; kept for API compatibility.
+        """
+        return self
+
+    # ---------------- Utility: batchify ----------------
+    @staticmethod
+    def batchify(items: Sequence[torch.Tensor], pad_value: float = 0.0) -> torch.Tensor:
+        """
+        Convert a list of [T_i, F] tensors to a batch-major tensor [B, T_max, F]
+        with padding. Works for sequences, contexts, masks (1D/2D), or log-probs.
+
+        Raises on:
+            - items is None
+            - inconsistent feature dimensions across items
+            - empty list
+        """
         if items is None:
-            raise ValueError(f"{key} is None.")
+            raise ValueError("Cannot batchify None")
+
+        if not isinstance(items, (list, tuple)) or len(items) == 0:
+            raise ValueError("`items` must be a non-empty list or tuple of tensors.")
 
         batch_size = len(items)
-        timesteps_max = max(t.shape[0] for t in items)
-        feature_dim = items[0].shape[-1] if items[0].ndim > 1 else 1
+        max_len = max(int(t.shape[0]) for t in items)
+        feature_dim = items[0].shape[1] if items[0].ndim > 1 else 1
+        device = items[0].device
+        dtype = items[0].dtype
 
-        out = torch.full((batch_size, timesteps_max, feature_dim),
-                         fill_value=pad_value,
-                         dtype=self.dtype,
-                         device=self.device)
+        # check all feature dims match
+        for t in items:
+            fd = t.shape[1] if t.ndim > 1 else 1
+            if fd != feature_dim:
+                raise ValueError("All items must have the same feature dimension for batchify.")
+
+        out = torch.full((batch_size, max_len, feature_dim), float(pad_value), dtype=dtype, device=device)
 
         for i, t in enumerate(items):
             t_ = t if t.ndim > 1 else t.unsqueeze(-1)
-            out[i, :t_.shape[0], :t_.shape[1]] = t_
+            L = t_.shape[0]
+            out[i, :L, : t_.shape[1]] = t_.to(device=device, dtype=dtype)
+
         return out
 
 
-@dataclass(frozen=False)
+@dataclass
 class ContextFeatures:
     """
     Container for batch- and time-aware context tensors.

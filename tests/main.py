@@ -264,7 +264,7 @@ if __name__ == "__main__":
     X_torch = torch.tensor(X_scaled, dtype=DTYPE)
 
     # Build encoder and NHSMM
-    hidden_dim = max(16, min(64, n_features * 2))
+    hidden_dim = max(32, min(64, n_features * 2))
     encoder = CNN_LSTM_Encoder(n_features=n_features, cnn_channels=5, hidden_dim=hidden_dim)
 
     # --- Initialize HSMM ---
