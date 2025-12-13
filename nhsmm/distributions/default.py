@@ -966,6 +966,7 @@ class Duration(Neural):
         temperature: Optional[float] = None,
         timestep: Optional[int] = None,
         grad_safe: bool = False) -> torch.Tensor:
+
         # Base tensor includes log_duration exactly once
         base = self._tensor_shape(self.logits + self.log_duration, "duration_base")
         tau = float(self.temperature if temperature is None else max(temperature, EPS))

@@ -535,119 +535,137 @@ class SequenceSet:
         self.canonical = ctx
 
 
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Union
+import torch
+
 @dataclass
 class ContextRouter:
-    """
-    Wraps canonical ([B,1,H]) and time-varying ([B,T,H]) context for HSMM.
-    Optionally carries feature names, masks, and supplemental log-probabilities.
-    """
-
-    context: torch.Tensor
-    canonical: torch.Tensor
+    context: torch.Tensor               # [B,T,H]
+    canonical: torch.Tensor             # [B,1,H]
     names: Optional[List[str]] = None
-    mask: Optional[torch.Tensor] = None   # [B, T, 1]
+    mask: Optional[torch.Tensor] = None # [B,T,1]
     log_probs: Optional[torch.Tensor] = None
-
     _cache: Dict[str, torch.Tensor] = field(default_factory=dict, init=False)
 
     def __post_init__(self):
-        B, _, H = self.canonical.shape
-
-        if self.canonical.ndim != 3 or self.canonical.shape[1] != 1:
+        B, one, H = self.canonical.shape
+        if self.canonical.ndim != 3 or one != 1:
             raise ValueError(f"canonical must be [B,1,H], got {tuple(self.canonical.shape)}")
-
         if self.context.ndim != 3 or self.context.shape[0] != B or self.context.shape[2] != H:
-            raise ValueError(f"context must be [B,T,H] sharing batch/feature dims, got {tuple(self.context.shape)}")
-
-        if self.names is not None and len(self.names) != H:
+            raise ValueError(f"context must be [B,T,H] with batch/feature dims matching canonical, got {tuple(self.context.shape)}")
+        if self.names is None:
+            self.names = [f"context{i}" for i in range(H)]
+        elif len(self.names) != H:
             raise ValueError(f"names length {len(self.names)} != feature dim {H}")
-
-        if self.log_probs is not None:
-            if self.log_probs.shape[0] != B:
-                raise ValueError(f"log_probs must share batch dim B={B}, got {tuple(self.log_probs.shape)}")
-
-        if self.mask is not None:
-            if self.mask.shape[0] != B or self.mask.shape[1] != self.context.shape[1] or self.mask.shape[2] != 1:
-                raise ValueError(f"mask must be [B,T,1], got {tuple(self.mask.shape)}")
-
-        self.device = self.canonical.device
-        self.dtype = self.canonical.dtype
+        if self.mask is None:
+            self.mask = torch.ones(B, self.context.shape[1], 1, device=self.context.device, dtype=torch.bool)
+        elif self.mask.ndim == 2:
+            self.mask = self.mask.unsqueeze(-1)
+        elif self.mask.shape != (B, self.context.shape[1], 1):
+            raise ValueError(f"mask must be [B,T,1], got {self.mask.shape}")
+        if self.log_probs is not None and self.log_probs.shape[0] != B:
+            raise ValueError(f"log_probs must share batch dim B={B}, got {tuple(self.log_probs.shape)}")
+        self.device = self.context.device
+        self.dtype = self.context.dtype
 
     @classmethod
-    def from_tensor(cls,
-        theta: Optional[torch.Tensor],
-        X: Optional["SequenceSet"] = None,
-        names: Optional[List[str]] = None,
-        log_probs: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None) -> "ContextRouter":
+    def from_tensor(
+        cls,
+        X: "SequenceSet",
+        theta: Optional[Union[torch.Tensor, "ContextRouter"]] = None,
+        mode: str = "additive",
+    ) -> "ContextRouter":
+        """
+        Build ContextRouter from a SequenceSet and optional theta.
 
-        B = X.n_sequences if X else 1
-        T = X.sequences.shape[1] if X else 1
-        H = theta.shape[-1] if theta is not None else getattr(X, "context_dim", 32)
+        Args:
+            X: base SequenceSet
+            theta: tensor [1,H], [B,H], [T,H], [B,T,H] or ContextRouter
+            mode: "additive" or "replace"
+        """
+        if not isinstance(X, SequenceSet):
+            raise TypeError("X must be a SequenceSet")
 
-        device = X.device if X else (theta.device if theta is not None else torch.device("cpu"))
-        dtype = X.dtype if X else (theta.dtype if theta is not None else torch.float32)
+        B, T, H = X.n_sequences, X.sequences.shape[1], X.context_dim
+        canonical = X.canonical.clone()
+        context = X.contexts.clone()
+        mask = X.masks.clone()
+        log_probs = X.log_probs.clone() if X.log_probs is not None else None
+        names = [f"context{i}" for i in range(H)]
 
-        if theta is None:
-            canonical = torch.zeros(B, 1, H, device=device, dtype=dtype)
-            context = canonical.expand(B, T, H)
-        elif theta.ndim == 1:
-            canonical = theta.view(1, 1, H).expand(B, 1, H)
-            context = canonical.expand(B, T, H)
-        elif theta.ndim == 2:
-            if X:
-                if theta.shape[0] == T:
-                    canonical = theta[:1].view(1, 1, H).expand(B, 1, H)
-                    context = theta.unsqueeze(0).expand(B, T, H)
-                elif theta.shape[0] == B:
-                    canonical = theta.view(B, 1, H)
-                    context = canonical.expand(B, T, H)
+        theta_c, theta_ctx, theta_m, theta_lp, theta_names = None, None, None, None, None
+
+        # Extract from ContextRouter if theta is one
+        if isinstance(theta, ContextRouter):
+            theta_c = theta.canonical
+            theta_ctx = theta.context
+            theta_m = theta.mask
+            theta_lp = theta.log_probs
+            theta_names = theta.names
+        elif isinstance(theta, torch.Tensor):
+            theta_ctx = theta
+
+        # Broadcast theta_ctx to [B,T,H]
+        if theta_ctx is not None:
+            if theta_ctx.ndim == 1:
+                theta_ctx = theta_ctx.view(1, 1, -1).expand(B, T, H)
+            elif theta_ctx.ndim == 2:
+                if theta_ctx.shape[0] == B:
+                    theta_ctx = theta_ctx.view(B, 1, H).expand(B, T, H)
+                elif theta_ctx.shape[0] == T:
+                    theta_ctx = theta_ctx.unsqueeze(0).expand(B, T, H)
                 else:
-                    raise ValueError(f"Cannot infer 2D theta shape {theta.shape} for B={B}, T={T}")
+                    raise ValueError(f"Cannot align 2D theta {theta_ctx.shape} with context {context.shape}")
+            elif theta_ctx.ndim == 3:
+                if theta_ctx.shape != (B, T, H):
+                    raise ValueError(f"3D theta {theta_ctx.shape} incompatible with context {context.shape}")
             else:
-                if theta.shape[0] == B:
-                    canonical = theta.view(B, 1, H)
-                    context = canonical.expand(B, T, H)
-                elif theta.shape[0] == T:
-                    canonical = theta[:1].view(1, 1, H).expand(B, 1, H)
-                    context = theta.unsqueeze(0).expand(B, T, H)
-                else:
-                    raise ValueError(f"Cannot infer 2D theta shape {theta.shape}")
-        elif theta.ndim == 3:
-            if X and (theta.shape[0] != B or theta.shape[1] != T):
-                raise ValueError(f"3D theta {theta.shape} incompatible with B={B}, T={T}")
-            canonical = theta[:, :1, :]
-            context = theta
-        else:
-            raise ValueError(f"Unsupported theta ndim {theta.ndim}")
+                raise ValueError(f"Unsupported theta ndim {theta_ctx.ndim}")
 
-        if mask is None:
-            mask = torch.ones(B, T, 1, device=device, dtype=torch.bool)
-        else:
-            if mask.shape != (B, T, 1):
-                raise ValueError(f"mask must be [B,T,1], got {mask.shape}")
+            if mode == "additive":
+                context = context + theta_ctx
+            elif mode == "replace":
+                context = theta_ctx
+                canonical = theta_ctx[:, :1, :]
+            else:
+                raise ValueError(f"Unsupported mode {mode}")
 
-        return cls(context=context, canonical=canonical, names=names, log_probs=log_probs, mask=mask)
+        # Replace attributes if theta is a ContextRouter in "replace" mode
+        if mode == "replace":
+            if theta_c is not None:
+                canonical = theta_c
+            if theta_m is not None:
+                mask = theta_m
+            if theta_lp is not None:
+                log_probs = theta_lp
+            if theta_names is not None:
+                names = theta_names
 
-    def get_context(self) -> torch.Tensor:
-        return self.context
+        # Ensure mask shape
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(-1)
+        elif mask.shape != (B, T, 1):
+            raise ValueError(f"mask must be [B,T,1], got {mask.shape}")
 
-    def get_canonical(self) -> torch.Tensor:
-        return self.canonical
+        return cls(
+            canonical=canonical,
+            context=context,
+            mask=mask,
+            log_probs=log_probs,
+            names=names
+        )
 
-    def get_feature_names(self) -> List[str]:
-        if self.names is None:
-            return [f"context{i}" for i in range(self.context.shape[2])]
-        return self.names
+    # Convenience accessors
+    def get_context(self) -> torch.Tensor: return self.context
+    def get_canonical(self) -> torch.Tensor: return self.canonical
+    def get_feature_names(self) -> List[str]: return self.names
+    def get_log_probs(self) -> Optional[torch.Tensor]: return self.log_probs
+    def get_mask(self) -> torch.Tensor: return self.mask
 
-    def get_log_probs(self) -> Optional[torch.Tensor]:
-        return self.log_probs
-
-    def get_mask(self) -> Optional[torch.Tensor]:
-        return self.mask
-
+    # Utilities
     def select_features(self, keys: List[str]) -> "ContextRouter":
-        idx = [self.get_feature_names().index(k) for k in keys]
+        idx = [self.names.index(k) for k in keys]
         return ContextRouter(
             canonical=self.canonical[:, :, idx],
             context=self.context[:, :, idx],
@@ -662,7 +680,7 @@ class ContextRouter:
             context=self.context.to(device=device, dtype=dtype),
             names=self.names,
             log_probs=(self.log_probs.to(device=device, dtype=dtype) if self.log_probs is not None else None),
-            mask=(self.mask.to(device=device, dtype=dtype) if self.mask is not None else None)
+            mask=self.mask.to(device=device, dtype=dtype)
         )
 
     def detach(self) -> "ContextRouter":
@@ -671,7 +689,7 @@ class ContextRouter:
             context=self.context.detach(),
             names=self.names,
             log_probs=(self.log_probs.detach() if self.log_probs is not None else None),
-            mask=(self.mask.detach() if self.mask is not None else None)
+            mask=self.mask.detach()
         )
 
     def clone(self) -> "ContextRouter":
@@ -680,14 +698,13 @@ class ContextRouter:
             context=self.context.clone(),
             names=self.names,
             log_probs=(self.log_probs.clone() if self.log_probs is not None else None),
-            mask=(self.mask.clone() if self.mask is not None else None)
+            mask=self.mask.clone()
         )
 
     def __repr__(self):
-        names_info = f" names={self.names}" if self.names else ""
-        logp = " log_probs=True" if self.log_probs is not None else ""
-        maskp = " mask=True" if self.mask is not None else ""
         return (f"<ContextRouter canonical={tuple(self.canonical.shape)} "
-                f"context={tuple(self.context.shape)}{names_info}{logp}{maskp} "
+                f"context={tuple(self.context.shape)} names={self.names} "
+                f"log_probs={'Yes' if self.log_probs is not None else 'No'} "
+                f"mask={'Yes' if self.mask is not None else 'No'} "
                 f"device={self.device} dtype={self.dtype}>")
 

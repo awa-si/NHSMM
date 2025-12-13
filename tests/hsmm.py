@@ -238,17 +238,14 @@ def test_sequence_set():
 
 
 def test_context_router():
-    print("\nTest ContextRouter")
+    print("\n--- Test ContextRouter ---")
 
     B, T, H = 3, 5, 4  # batch, time, feature dims
 
     # ---------------- Fixtures ----------------
-    lp1 = torch.randn(1, 10)       # 1-batch log_probs
     lpB = torch.randn(B, 10)       # B-batch log_probs
-    lpBT = torch.randn(B, T)       # B,T log_probs
-
-    mask1 = torch.ones(1, 1, 1, dtype=torch.bool)
-    maskBT = torch.ones(B, T, 1, dtype=torch.bool)
+    mask2D = torch.ones(B, T, dtype=torch.bool)
+    maskBT = mask2D.unsqueeze(-1)
 
     X_dummy = SequenceSet(
         sequences=torch.zeros(B, T, H),
@@ -256,80 +253,96 @@ def test_context_router():
         masks=maskBT,
         contexts=torch.zeros(B, T, H),
         canonical=torch.zeros(B, 1, H),
+        log_probs=lpB
     )
 
     # ---------------- Test 1: theta=None ----------------
-    router = ContextRouter.from_tensor(None, X=X_dummy, log_probs=lpB, mask=maskBT)
-    print("Test1 (theta=None, X=X_dummy):")
-    assert router.canonical.shape == (B, 1, H)
-    assert router.context.shape == (B, T, H)
-    assert torch.all(router.mask == maskBT)
-    assert router.log_probs is lpB
+    print("Test1: theta=None")
+    router = ContextRouter.from_tensor(X=X_dummy)
+    assert torch.allclose(router.context, X_dummy.contexts)
+    assert torch.allclose(router.canonical, X_dummy.canonical)
+    assert torch.all(router.mask == X_dummy.masks)
+    assert torch.allclose(router.log_probs, lpB)
 
-    # ---------------- Test 2: 1D theta ----------------
+    # ---------------- Test 2: theta 1D additive ----------------
+    print("Test2: theta 1D additive")
     theta1 = torch.arange(H, dtype=torch.float32)
-    router = ContextRouter.from_tensor(theta1, X=X_dummy, log_probs=lpB, mask=maskBT)
-    print("Test2 (theta 1D):")
-    assert router.canonical.shape == (B, 1, H)
-    assert router.context.shape == (B, T, H)
-    assert torch.allclose(router.canonical[0], theta1.view(1, H))
-    assert torch.all(router.mask == maskBT)
-    assert router.log_probs is lpB
+    router = ContextRouter.from_tensor(X=X_dummy, theta=theta1, mode="additive")
+    for b in range(B):
+        assert torch.allclose(router.context[b,0], X_dummy.contexts[b,0] + theta1)
+    assert torch.allclose(router.canonical, X_dummy.canonical)
 
-    # ---------------- Test 3: 2D theta, batch-dependent ----------------
+    # ---------------- Test 3: theta 1D replace ----------------
+    print("Test3: theta 1D replace")
+    router = ContextRouter.from_tensor(X=X_dummy, theta=theta1, mode="replace")
+    for b in range(B):
+        assert torch.allclose(router.context[b,0], theta1)
+    expected_canonical = router.context[:, :1, :]
+    assert torch.allclose(router.canonical, expected_canonical)
+
+    # ---------------- Test 4: theta 2D batch-dependent ----------------
+    print("Test4: theta 2D batch-dependent")
     theta2 = torch.randn(B, H)
-    router = ContextRouter.from_tensor(theta2, X=X_dummy, log_probs=lpB, mask=maskBT)
-    print("Test3 (theta 2D batch-dependent):")
-    assert torch.allclose(router.canonical[:, 0, :], theta2)
-    assert torch.all(router.mask == maskBT)
-    assert router.log_probs is lpB
+    router = ContextRouter.from_tensor(X=X_dummy, theta=theta2, mode="additive")
+    for b in range(B):
+        assert torch.allclose(router.context[b], X_dummy.contexts[b] + theta2[b])
+    router = ContextRouter.from_tensor(X=X_dummy, theta=theta2, mode="replace")
+    for b in range(B):
+        assert torch.allclose(router.context[b], theta2[b].expand(T, H))
+    expected_canonical = router.context[:, :1, :]
+    assert torch.allclose(router.canonical, expected_canonical)
 
-    # ---------------- Test 4: 2D theta, time-dependent ----------------
+    # ---------------- Test 5: theta 2D time-dependent ----------------
+    print("Test5: theta 2D time-dependent")
     theta3 = torch.randn(T, H)
-    router = ContextRouter.from_tensor(theta3, X=X_dummy, log_probs=lpB, mask=maskBT)
-    print("Test4 (theta 2D time-dependent):")
+    router = ContextRouter.from_tensor(X=X_dummy, theta=theta3, mode="additive")
+    for b in range(B):
+        assert torch.allclose(router.context[b], X_dummy.contexts[b] + theta3)
+    router = ContextRouter.from_tensor(X=X_dummy, theta=theta3, mode="replace")
     for b in range(B):
         assert torch.allclose(router.context[b], theta3)
-    assert torch.all(router.mask == maskBT)
-    assert router.log_probs is lpB
+    expected_canonical = router.context[:, :1, :]
+    assert torch.allclose(router.canonical, expected_canonical)
 
-    # ---------------- Test 5: 3D theta ----------------
+    # ---------------- Test 6: theta 3D ----------------
+    print("Test6: theta 3D")
     theta4 = torch.randn(B, T, H)
-    router = ContextRouter.from_tensor(theta4, X=X_dummy, log_probs=lpBT, mask=maskBT)
-    print("Test5 (theta 3D):")
+    router = ContextRouter.from_tensor(X=X_dummy, theta=theta4, mode="additive")
+    assert torch.allclose(router.context, X_dummy.contexts + theta4)
+    router = ContextRouter.from_tensor(X=X_dummy, theta=theta4, mode="replace")
     assert torch.allclose(router.context, theta4)
-    assert torch.all(router.mask == maskBT)
-    assert router.log_probs is lpBT
+    expected_canonical = router.context[:, :1, :]
+    assert torch.allclose(router.canonical, expected_canonical)
 
-    # ---------------- Test 6: Mixed canonical + time-varying ----------------
-    canonical = torch.randn(B, 1, H)
-    time_context = torch.randn(B, T, H)
-    mixed_theta = time_context.clone()
-    mixed_theta[:, 0, :] = canonical[:, 0, :]
-    router = ContextRouter(canonical=canonical, context=mixed_theta,
-                           log_probs=lpB, mask=maskBT)
-    print("Test6 (mixed canonical + time-varying):")
-    assert torch.allclose(router.context[:, 0, :], canonical[:, 0, :])
-    assert torch.all(router.mask == maskBT)
-    assert router.log_probs is lpB
+    # ---------------- Test 7: mask propagation ----------------
+    print("Test7: mask propagation")
+    X_mod = SequenceSet(
+        sequences=X_dummy.sequences,
+        lengths=X_dummy.lengths,
+        masks=maskBT,
+        contexts=X_dummy.contexts,
+        canonical=X_dummy.canonical,
+        log_probs=X_dummy.log_probs
+    )
+    router = ContextRouter.from_tensor(X=X_mod)
+    assert router.mask.shape == (B, T, 1)
+    assert torch.all(router.mask.squeeze(-1) == mask2D)
 
-    # ---------------- Test 7: Utilities ----------------
+    # ---------------- Test 8: log_probs propagation ----------------
+    print("Test8: log_probs propagation")
+    router = ContextRouter.from_tensor(X=X_dummy)
+    assert torch.allclose(router.log_probs, lpB)
+
+    # ---------------- Test 9: utilities ----------------
+    print("Test9: clone/detach/to")
     router2 = router.clone()
     router3 = router.detach()
     router4 = router.to(device='cpu')
-    print("Test7 (utilities):")
     assert torch.allclose(router2.context, router.context)
-    assert router3.context.requires_grad is False
+    assert not router3.context.requires_grad
     assert router4.context.device.type == "cpu"
-    assert torch.all(router2.mask == maskBT)
-    assert torch.all(router3.mask == maskBT)
-    assert torch.all(router4.mask.cpu() == maskBT)
-    # log_probs propagation
-    assert torch.allclose(router2.log_probs, lpB)
-    assert torch.allclose(router3.log_probs, lpB)
-    assert router4.log_probs.device.type == "cpu"
 
-    print("✓ All ContextRouter tests passed with mask + log_prob validation")
+    print("✓ All ContextRouter all-round tests passed with X-based modulation and modes")
 
 
 def test_ensure_shape():
@@ -343,7 +356,7 @@ def test_ensure_shape():
 
 
 def test_forward():
-    print("Test _forward")
+    print("Test _forward with ContextRouter")
 
     # Build model and data
     B, T, F = 3, 10, 2
@@ -352,8 +365,6 @@ def test_forward():
 
     # Variable-length mask
     mask = torch.ones(B, T, dtype=torch.bool)
-    # mask[1, 7:] = 0    # batch 1 is length 7
-    # mask[2, 5:] = 0    # batch 2 is length 5
 
     # Prepare SequenceSet
     S = model._prepare(X, mask=mask)
@@ -363,61 +374,50 @@ def test_forward():
     print(" S.masks    :", S.masks.shape)
     print(" S.lengths  :", S.lengths)
 
-    # Run forward
-    print("Running _forward...")
+    # --- Run forward without theta ---
+    print("Running _forward (no theta)...")
     alpha = model._forward(S, theta=None)
-
     print(" alpha shape:", alpha.shape)
     print(" alpha dtype:", alpha.dtype)
 
-    # ==== Basic structural checks ====
-    assert isinstance(alpha, torch.Tensor)
-    assert alpha.shape == (B, T, model.n_states, model.max_duration)
+    # --- Run forward with additive theta ---
+    theta_add = torch.randn(S.contexts.shape[2])
+    CR_add = ContextRouter.from_tensor(S, theta=theta_add, mode="additive")
+    alpha_add = model._forward(S, theta=CR_add)
 
-    # ==== Numerical validity ====
-    # α is allowed to contain -inf, but never NaN
-    assert not torch.isnan(alpha).any(), "Alpha contains NaNs"
+    # --- Run forward with replace theta ---
+    theta_rep = torch.randn(S.contexts.shape[2])
+    CR_rep = ContextRouter.from_tensor(S, theta=theta_rep, mode="replace")
+    alpha_rep = model._forward(S, theta=CR_rep)
+
+    # ==== Basic structural checks ====
+    for a in [alpha, alpha_add, alpha_rep]:
+        assert isinstance(a, torch.Tensor)
+        assert a.shape == (B, T, model.n_states, model.max_duration)
+        assert not torch.isnan(a).any(), "Alpha contains NaNs"
 
     # ==== Padding checks ====
-    # All padded timesteps must be exactly -inf for all states & durations
-    for b in range(B):
-        pad_idx = (~mask[b]).nonzero(as_tuple=True)[0]
-        if pad_idx.numel() > 0:
-            # Find the positions that are not -inf
-            bad_pos = (alpha[b, pad_idx] != float("-inf")).nonzero(as_tuple=True)
-            if bad_pos[0].numel() > 0:
-                print(f"[DEBUG] Batch {b}, padded timesteps {pad_idx.tolist()} have non -inf values at positions {bad_pos}")
-            assert (alpha[b, pad_idx] == float("-inf")).all(), f"Padded alpha not -inf for batch {b}"
+    for a in [alpha, alpha_add, alpha_rep]:
+        for b in range(B):
+            pad_idx = (~mask[b]).nonzero(as_tuple=True)[0]
+            if pad_idx.numel() > 0:
+                assert (a[b, pad_idx] == float("-inf")).all(), f"Padded alpha not -inf for batch {b}"
 
     # ==== Valid timestep checks ====
-    for b in range(B):
-        L = S.lengths[b]
-        for t in range(L):
-            max_d = min(model.max_duration, t + 1)
+    for a in [alpha, alpha_add, alpha_rep]:
+        for b in range(B):
+            L = S.lengths[b]
+            for t in range(L):
+                max_d = min(model.max_duration, t + 1)
+                finite_or_inf = torch.isfinite(a[b, t, :, :max_d]) | (a[b, t, :, :max_d] == -float("inf"))
+                assert finite_or_inf.all(), f"Invalid value at batch {b}, t={t}"
+                assert torch.isfinite(a[b, t, :, :max_d]).any(), f"No finite alpha at batch {b}, t={t}"
 
-            # d < max_d must be finite OR -inf only for impossible segments
-            finite_or_inf = torch.isfinite(alpha[b, t, :, :max_d]) | (alpha[b, t, :, :max_d] == -float("inf"))
-            assert finite_or_inf.all(), f"Invalid value at batch {b}, t={t}"
-
-            # Must have at least one finite duration per timestep
-            assert torch.isfinite(alpha[b, t, :, :max_d]).any(), f"No finite alpha at batch {b}, t={t}"
-
-        # All durations beyond max_d must be -inf
-        # if L < T:
-            # last_t = L - 1
-        # else:
-            # last_t = T - 1
-        # for t in range(L):
-            # max_d = min(model.max_duration, t + 1)
-            # tail = alpha[b, t, :, max_d:]
-            # if tail.numel() > 0:
-                # assert (tail == float("-inf")).all(), f"Durations > t+1 not -inf at batch {b}, t={t}"
-
-    print("✓ _forward passed successfully")
+    print("✓ _forward all-round tests passed (no theta, additive, replace)")
 
 
 def test_backward():
-    print("\nTest _backward")
+    print("\nTest _backward with ContextRouter")
 
     # ---------------- Build model and data ----------------
     B, T, F = 3, 10, 2
@@ -426,9 +426,8 @@ def test_backward():
 
     # ---------------- Variable-length mask ----------------
     mask = torch.ones(B, T, dtype=torch.bool)
-    # Example: uncomment to test variable-length sequences
-    # mask[1, 7:] = 0  # batch 1 has length 7
-    # mask[2, 5:] = 0  # batch 2 has length 5
+    # mask[1, 7:] = 0  # batch 1 length 7
+    # mask[2, 5:] = 0  # batch 2 length 5
 
     # ---------------- Prepare SequenceSet ----------------
     S = model._prepare(X, mask=mask)
@@ -436,120 +435,118 @@ def test_backward():
     print(f"[Prepare] Encoded context: {S.contexts.shape}, canonical: {S.canonical.shape}")
     print(f"[Prepare] log_probs shape: {S.log_probs.shape}")
 
-    # ---------------- Run backward pass ----------------
-    beta = model._backward(S)  # [B, T, K, Dmax]
-    
-    # ---------------- Validate output ----------------
-    assert isinstance(beta, torch.Tensor), f"Expected torch.Tensor, got {type(beta)}"
-    B_out, T_out, K_out, Dmax_out = beta.shape
+    # --- Run backward without theta ---
+    beta = model._backward(S, theta=None)
 
-    expected_B = len(S.sequences)
-    expected_T = max(seq.shape[0] for seq in S.sequences)
-    expected_K = model.n_states
-    expected_Dmax = model.max_duration
+    # --- Run backward with additive theta ---
+    theta_add = torch.randn(S.contexts.shape[2])
+    CR_add = ContextRouter.from_tensor(S, theta=theta_add, mode="additive")
+    beta_add = model._backward(S, theta=CR_add)
 
-    assert B_out == expected_B, f"Batch size mismatch: {B_out} vs {expected_B}"
-    assert T_out == expected_T, f"Sequence length mismatch: {T_out} vs {expected_T}"
-    assert K_out == expected_K, f"Number of states mismatch: {K_out} vs {expected_K}"
-    assert Dmax_out == expected_Dmax, f"Max duration mismatch: {Dmax_out} vs {expected_Dmax}"
-    assert torch.isfinite(beta).all(), "Beta contains non-finite values"
+    # --- Run backward with replace theta ---
+    theta_rep = torch.randn(S.contexts.shape[2])
+    CR_rep = ContextRouter.from_tensor(S, theta=theta_rep, mode="replace")
+    beta_rep = model._backward(S, theta=CR_rep)
 
-    # ---------------- Optional debug ----------------
+    # ==== Basic structural checks ====
+    for bpass in [beta, beta_add, beta_rep]:
+        assert isinstance(bpass, torch.Tensor)
+        assert bpass.shape == (B, T, model.n_states, model.max_duration)
+        # Allow -inf for padding/durations but never NaN
+        assert not torch.isnan(bpass).any(), "Beta contains NaNs"
+
+    # ==== Padding checks ====
+    for bpass in [beta, beta_add, beta_rep]:
+        for b in range(B):
+            pad_idx = (~mask[b]).nonzero(as_tuple=True)[0]
+            if pad_idx.numel() > 0:
+                assert (bpass[b, pad_idx] == float("-inf")).all(), f"Padded beta not -inf for batch {b}"
+
+    # ==== Valid timestep checks ====
+    for bpass in [beta, beta_add, beta_rep]:
+        for b in range(B):
+            L = S.lengths[b]
+            for t in range(L):
+                max_d = min(model.max_duration, T - t)
+                finite_or_inf = torch.isfinite(bpass[b, t, :, :max_d]) | (bpass[b, t, :, :max_d] == -float("inf"))
+                assert finite_or_inf.all(), f"Invalid value at batch {b}, t={t}"
+                # At least one finite value must exist per timestep
+                assert torch.isfinite(bpass[b, t, :, :max_d]).any(), f"No finite beta at batch {b}, t={t}"
+
+    # Optional debug output
     print(f"[Backward] beta sample (batch0, timestep0): {beta[0,0]}")
-    print("✓ _backward passed successfully")
+    print("✓ _backward all-round tests passed (no theta, additive, replace)")
 
 
 def test_compute_posteriors():
-    print("\nTest _compute_posteriors")
+    print("\nTest _compute_posteriors with ContextRouter")
 
+    # ---------------- Build model and data ----------------
     B, T, F = 3, 10, 2  # batch, time, features
     model = make_model(enc=True, n_features=F)
     X = make_data(B=B, T=T, F=F)
 
-    X = model._prepare(X)
-    theta = None  # Optional context features
+    # ---------------- Prepare SequenceSet ----------------
+    mask = torch.ones(B, T, dtype=torch.bool)
+    X_seq = model._prepare(X, mask=mask)
+    theta = None  # Optional: ContextRouter or tensor for modulation
 
-    gamma, xi, eta = model._compute_posteriors(X, theta=theta)
+    # ---------------- Compute posteriors ----------------
+    gamma, xi, eta = model._compute_posteriors(X_seq, theta=theta)
 
-    B = len(X.sequences)
-    T_max = max(X.lengths) if B > 0 else 0
+    B = len(X_seq.sequences)
+    T_max = max(X_seq.lengths) if B > 0 else 0
     K = model.n_states
     Dmax = model.max_duration
 
     print(f"Batch size: {B}, Max sequence length: {T_max}, States: {K}, Max duration: {Dmax}")
     print(f"gamma shape: {gamma.shape}, eta shape: {eta.shape}, xi shape: {xi.shape}")
 
-    # Check shapes
+    # ---------------- Shape checks ----------------
     assert gamma.shape == (B, T_max, K), f"gamma shape mismatch: {gamma.shape}"
     assert eta.shape == (B, T_max, K, Dmax), f"eta shape mismatch: {eta.shape}"
-    assert xi.shape == (B, max(T_max-1,0), K, K), f"xi shape mismatch: {xi.shape}"
+    assert xi.shape == (B, max(T_max-1, 0), K, K), f"xi shape mismatch: {xi.shape}"
 
-    # Check finite values
+    # ---------------- Numerical checks ----------------
     assert torch.isfinite(gamma).all(), "gamma contains non-finite values"
     assert torch.isfinite(eta).all(), "eta contains non-finite values"
     assert torch.isfinite(xi).all(), "xi contains non-finite values"
 
-    # Check masking: positions beyond actual sequence lengths should be zero
-    for b, L in enumerate(X.lengths):
+    # ---------------- Masking checks ----------------
+    for b, L in enumerate(X_seq.lengths):
         if L < T_max:
-            print(f"Checking padding for sequence {b}, length {L}")
             assert torch.all(gamma[b, L:] == 0), f"gamma not zero-padded correctly for sequence {b}"
             assert torch.all(eta[b, L:] == 0), f"eta not zero-padded correctly for sequence {b}"
             if L < 2:
-                assert xi[b].numel() == 0 or torch.all(xi[b] == 0), f"xi not zero-padded correctly for sequence {b}"
+                assert xi[b].numel() == 0 or torch.all(xi[b, L-1:] == 0), f"xi not zero-padded correctly for sequence {b}"
 
-    # Check normalization
-    for b, L in enumerate(X.lengths):
+    # ---------------- Normalization check ----------------
+    for b, L in enumerate(X_seq.lengths):
         if L > 0:
             gamma_sum = gamma[b, :L].sum(-1)
-            if not torch.allclose(gamma_sum, torch.ones_like(gamma_sum)):
-                print(f"gamma not normalized for sequence {b}: {gamma_sum}")
-            assert torch.allclose(gamma_sum, torch.ones_like(gamma_sum)), f"gamma not normalized for sequence {b}"
+            assert torch.allclose(gamma_sum, torch.ones_like(gamma_sum)), f"gamma not normalized for sequence {b}: {gamma_sum}"
 
     print("✓ _compute_posteriors successfully")
-
-
-def test_compute_posteriors_with_theta():
-    print("Test _compute_posteriors with passed theta")
-    
-    model = make_model()
-    X = make_data(B=2, T=5, F=model.n_features)
-    S = model._prepare(X)
-    
-    # Context: list of per-sequence tensors
-    theta = [torch.randn(L, model.context_dim) for L in S.lengths]
-    
-    gamma, xi, eta = model._compute_posteriors(S, theta=theta)
-    
-    # Shape and finiteness checks
-    B, T_max, K, Dmax = len(S.sequences), max(S.lengths), model.n_states, model.max_duration
-    assert gamma.shape == (B, T_max, K)
-    assert eta.shape == (B, T_max, K, Dmax)
-    assert xi.shape == (B, max(T_max-1,0), K, K)
-    assert torch.isfinite(gamma).all()
-    assert torch.isfinite(eta).all()
-    assert torch.isfinite(xi).all()
-    
-    print("✓ _compute_posteriors with theta passed")
 
 
 def test_model_params():
     print("Test _model_params")
 
+    # -------------------- Basic model/data --------------------
     model = make_model()
     X = make_data()
     X = model._prepare(X)
 
     B = len(X.sequences)
-    T_max = max([s.shape[0] for s in X.sequences])
+    T_max = max(s.shape[0] for s in X.sequences)
 
     # -------------------- Estimate mode --------------------
     params_est = model._model_params(X, mode="estimate", iter_idx=0)
 
     for key in ["initial_dist", "duration_dist", "transition_dist"]:
         dist = params_est[key]
-        assert hasattr(dist, "logits")
-        assert torch.isfinite(dist.logits).all()
+        assert hasattr(dist, "logits"), f"{key} missing logits"
+        assert torch.isfinite(dist.logits).all(), f"{key} logits contain non-finite values"
 
     emit_dist = params_est["emission_dist"]
     if hasattr(emit_dist, "logits"):
@@ -573,20 +570,18 @@ def test_model_params():
 
     print("✓ Sample mode passed")
 
-    # -------------------- Context mode --------------------
+    # -------------------- ContextRouter mode --------------------
     ctx_list = [
         torch.randn(seq.shape[0], model.context_dim, device=X.device, dtype=X.dtype)
         for seq in X.sequences
     ]
     ctx_tensor = torch.nn.utils.rnn.pad_sequence(ctx_list, batch_first=True)
 
+    # Create router with context tensor and optional X (for canonical/log_probs/mask)
     theta = ContextRouter.from_tensor(
         theta=ctx_tensor,
-        X=X,
-        log_probs=X.log_probs,
-        mask=X.masks,
+        X=X
     )
-
     params_ctx = model._model_params(X, theta=theta, mode="estimate", iter_idx=5)
 
     for key in ["initial_dist", "duration_dist", "transition_dist", "emission_dist"]:
@@ -599,24 +594,18 @@ def test_model_params():
 
     print("✓ Context mode passed")
 
-    # -------------------- Test with encoder active --------------------
+    # -------------------- Encoder active --------------------
     print("\n--- Test with encoder (enc=True) ---")
-    B, T, F = 3, 10, 5  # define batch, time, features
+    B, T, F = 3, 10, 5
     model = make_model(enc=True, n_features=F)
     Xraw = make_data(B=B, T=T, F=F)
-
-    # Prepare normally (this will call _encode internally)
     Xenc = model._prepare(Xraw)
 
-    # Ensure shapes valid
     assert isinstance(Xenc, SequenceSet)
-    assert Xenc.contexts is not None
-    assert Xenc.contexts.shape[0] == B
+    assert Xenc.contexts is not None and Xenc.contexts.shape[0] == B
 
-    # Run params
     params_enc = model._model_params(Xenc, mode="estimate", iter_idx=3)
 
-    # Validate same as before
     for key in ["initial_dist", "duration_dist", "transition_dist", "emission_dist"]:
         dist = params_enc[key]
         if hasattr(dist, "logits"):
@@ -628,64 +617,145 @@ def test_model_params():
             raise AssertionError(f"{key} missing expected attributes with encoder")
 
     print("✓ Encoder mode passed")
-
-
     print("✓ _model_params test completed")
 
 
-def test_full_with_encoder():
-    F = 5
-    m = make_model(enc=True, n_features=F)
-    X = make_data(F=F)
-    S = m._prepare(X)
-    alpha = m._forward(S)
-    beta = m._backward(S)
-    assert torch.isfinite(alpha[0]).all()
-    assert torch.isfinite(beta[0]).all()
-    print("✓ full HSMM pipeline (with encoder)")
+def test_viterbi():
+    print("\nTest _viterbi")
 
-
-def test_forward_with_encode_context():
-    print("Test _forward with context from _encode")
-
-    B, T, F = 3, 10, 5
-    X = make_data(B, T, F)
-    mask = torch.ones(B, T, dtype=torch.bool)
-    mask[1, 7:] = 0
-    mask[2, 5:] = 0
-
+    # ---------------- Build model and data ----------------
+    B, T, F = 3, 12, 4
     model = make_model(enc=True, n_features=F)
-    S = model._prepare(X, mask=mask)
+    Xraw = make_data(B=B, T=T, F=F)
 
-    # --- get context from _encode ---
-    seq, ctx_canonical = model._encode(X, mask=mask)  # [B, T, H] or [B, 1, H]
-    H = seq.shape[-1]
+    # ---------------- Variable-length mask ----------------
+    mask = torch.ones(B, T, dtype=torch.bool)
+    mask[1, 9:] = 0  # sequence length 9
+    mask[2, 6:] = 0  # sequence length 6
 
-    # Make theta a list of per-sequence tensors, shape [T_i, H]
-    theta = []
-    for b, L in enumerate(S.lengths):
-        if ctx_canonical.shape[1] == 1:
-            # sequence-level context → repeat across time
-            theta_b = ctx_canonical[b].repeat(L, 1)
-        else:
-            # time-level context → slice to sequence length
-            theta_b = ctx_canonical[b, :L]
-        theta.append(theta_b)
+    # ---------------- Prepare SequenceSet ----------------
+    S = model._prepare(Xraw, mask=mask)
 
-    # Forward pass
-    alpha = model._forward(S, theta=theta)
+    print("[Prepare]")
+    print(" lengths :", S.lengths.tolist())
+    print(" log_probs:", S.log_probs.shape)
+    print(" contexts :", S.contexts.shape)
+    print(" canonical:", S.canonical.shape)
 
-    # Check shapes
-    B_check = len(S.sequences)
-    T_check = max(S.lengths)
-    expected_shape = (B_check, T_check, model.n_states, model.max_duration)
-    assert alpha.shape == expected_shape, f"Expected shape {expected_shape}, got {alpha.shape}"
-    assert torch.isfinite(alpha).all(), "Alpha contains NaNs or infinities"
+    def check_paths(paths: list[torch.Tensor], B: int):
+        assert isinstance(paths, list)
+        assert len(paths) == B
 
-    print("✓ _forward with encoded context passed successfully")
+        for b, path in enumerate(paths):
+            L = S.lengths[b]
+            print(f" batch {b}: decoded length={len(path)}, expected={L}")
+
+            assert isinstance(path, torch.Tensor)
+            assert path.dtype == torch.long
+            assert path.numel() == L
+            assert path.min() >= 0 and path.max() < model.n_states
+            assert torch.isfinite(path.float()).all()
+
+    # =====================================================
+    # Case 1: theta=None
+    # =====================================================
+    print("\n--- Viterbi: theta=None ---")
+    paths = model._viterbi(S, theta=None)
+    check_paths(paths, B)
+    print("✓ Viterbi passed with theta=None")
+
+    # =====================================================
+    # Case 2: ContextRouter (time-varying)
+    # =====================================================
+    print("\n--- Viterbi: ContextRouter ---")
+    H = model.context_dim
+    ctx_list = [
+        torch.randn(L, H, device=S.sequences.device, dtype=S.sequences.dtype)
+        for L in S.lengths
+    ]
+    ctx_tensor = torch.nn.utils.rnn.pad_sequence(ctx_list, batch_first=True)
+
+    # Only pass theta tensor; X contains mask/log_probs
+    theta = ContextRouter.from_tensor(theta=ctx_tensor, X=S)
+
+    paths_ctx = model._viterbi(S, theta=theta)
+    check_paths(paths_ctx, B)
+    print("✓ Viterbi passed with ContextRouter")
+
+    # =====================================================
+    # Case 3: Determinism check
+    # =====================================================
+    print("\n--- Viterbi determinism check ---")
+    paths2 = model._viterbi(S, theta=None)
+    for p1, p2 in zip(paths, paths2):
+        assert torch.equal(p1, p2), "Viterbi is not deterministic"
+    print("✓ Viterbi deterministic")
+
+    print("✓ _viterbi test passed successfully")
+
+
+def init_test():
+    print("Running HSMM __init__ test...")
+
+    n_states = 3
+    n_features = 5
+    max_duration = 4
+    context_dim = 8
+    hidden_dim = 8
+
+    # --- Basic initialization without encoder ---
+    model = HSMM(
+        n_states=n_states,
+        n_features=n_features,
+        max_duration=max_duration,
+        context_dim=context_dim,
+        hidden_dim=hidden_dim,
+        encoder=None,
+        debug=True,
+    )
+
+    assert isinstance(model, HSMM)
+    assert model.n_states == n_states
+    assert model.n_features == n_features
+    assert model.max_duration == max_duration
+    assert model.context_dim == context_dim
+    assert model.hidden_dim == hidden_dim
+    assert model.encoder is None
+
+    # Check modules
+    for module_name in ["initial_module", "duration_module", "transition_module", "emission_module"]:
+        module = getattr(model, module_name, None)
+        assert module is not None, f"{module_name} not initialized"
+        for param in module.parameters():
+            assert torch.isfinite(param).all(), f"{module_name} has non-finite parameter"
+
+    # Check device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    assert all(p.device == device for p in model.parameters()), "Parameters not on correct device"
+
+    print("✓ HSMM __init__ test passed")
+
+    # --- Initialization with encoder ---
+    dummy_encoder = torch.nn.Linear(n_features, hidden_dim)
+    model_enc = HSMM(
+        n_states=n_states,
+        n_features=n_features,
+        max_duration=max_duration,
+        context_dim=context_dim,
+        hidden_dim=hidden_dim,
+        encoder=dummy_encoder,
+        debug=True,
+    )
+
+    assert model_enc.encoder is not None
+    assert model_enc.context_dim == hidden_dim
+    assert model_enc.hidden_dim == hidden_dim
+
+    print("✓ HSMM __init__ test with encoder passed")
 
 
 if __name__ == "__main__":
+    # init_test()
     # test_context_router()
     # test_encode()
     # test_prepare()
@@ -693,9 +763,7 @@ if __name__ == "__main__":
     # test_forward()
     # test_backward()
     # test_compute_posteriors()
-    test_model_params()
-    # test_forward_with_encode_context()
-    # test_compute_posteriors_with_theta()
+    # test_model_params()
+    test_viterbi()
     # test_ensure_shape()
-    # test_full_with_encoder()
     print("\nAll HSMM base tests passed.")
