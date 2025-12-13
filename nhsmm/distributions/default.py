@@ -1105,6 +1105,7 @@ class Duration(Neural):
 
 
 class Transition(Neural):
+
     _dist_type = Categorical
 
     def __init__(

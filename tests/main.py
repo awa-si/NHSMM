@@ -1,3 +1,4 @@
+
 import os
 import time
 import torch
@@ -19,14 +20,12 @@ from scipy.optimize import linear_sum_assignment
 import matplotlib.pyplot as plt
 
 from nhsmm.constants import DEBUG, DTYPE, EPS, logger
+from nhsmm.context import CNN_LSTM_Encoder
 from nhsmm.models import HSMM
 
 DEFAULT_RNG_SEED = 0
 DEFAULT_LABELS = ["range", "bull", "bear"]
 
-# ============================================================
-# Synthetic OHLCV generator (robust 2D output)
-# ============================================================
 def generate_ohlcv(n_segments=12, seg_len_low=15, seg_len_high=40, rng_seed=None):
     rng_seed = DEFAULT_RNG_SEED if rng_seed is None else rng_seed
     rng = np.random.default_rng(rng_seed)
@@ -53,9 +52,7 @@ def generate_ohlcv(n_segments=12, seg_len_low=15, seg_len_high=40, rng_seed=None
     label_map = {i: lbl for i, lbl in enumerate(DEFAULT_LABELS)}
     return states_arr, X_np, label_map
 
-# ============================================================
-# Data Loading
-# ============================================================
+
 def load_ohlcv_tensor(
     data_dir: str,
     symbol: str,
@@ -95,12 +92,11 @@ def load_ohlcv_tensor(
 
     return X, true_states, label_map
 
-# ============================================================
-# Hungarian permutation alignment
-# ============================================================
+
 def best_permutation_accuracy(true, pred, n_classes, label_map=None):
     true = np.array(true)
-    pred = np.array(pred)
+    pred = pred.detach().cpu().numpy()
+
     C = confusion_matrix(true, pred, labels=list(range(n_classes)))
     row_ind, col_ind = linear_sum_assignment(-C)
     mapping = {col: row for row, col in zip(row_ind, col_ind)}
@@ -116,9 +112,7 @@ def best_permutation_accuracy(true, pred, n_classes, label_map=None):
     )
     return acc, mapped_pred, mapping, readable
 
-# ============================================================
-# Duration and variance summary
-# ============================================================
+
 def print_duration_summary(model):
     with torch.no_grad():
         D = torch.exp(model.duration_module.log_matrix()).cpu().numpy()
@@ -138,111 +132,13 @@ def print_duration_summary(model):
         else:
             logger.info(f" state {i}: mode={mode}, mean={mean_dur:.2f}")
 
-# -------------------------
-# CNN+LSTM Encoder
-# -------------------------
-class CNN_LSTM_Encoder(nn.Module):
-    """
-    CNN + LSTM sequence encoder with ContextEncoder-compatible context.
 
-    Input:
-        x: [B, T, F]
-        mask: optional [B, T] (1 for valid, 0 for padding)
-
-    Output:
-        - sequence: [B, T, out_dim] if return_sequence=True
-        - last valid timestep: [B, out_dim] if return_sequence=False
-        - _context: always pooled sequence-level [B, 1, out_dim]
-    """
-
-    def __init__(
-        self,
-        n_features: int,
-        hidden_dim: int = 32,
-        cnn_channels: int = 16,
-        kernel_size: int = 3,
-        dropout: float = 0.1,
-        bidirectional: bool = True,
-        return_sequence: bool = True,
-        use_packed: bool = True,
-    ):
-        super().__init__()
-        self.use_packed = use_packed
-        self.return_sequence = return_sequence
-        self._context: Optional[torch.Tensor] = None
-
-        # CNN
-        padding = kernel_size // 2
-        self.conv = nn.Conv1d(n_features, cnn_channels, kernel_size, padding=padding)
-        self.norm = nn.LayerNorm(cnn_channels)
-
-        # LSTM
-        self.lstm = nn.LSTM(
-            input_size=cnn_channels,
-            hidden_size=hidden_dim,
-            batch_first=True,
-            bidirectional=bidirectional,
-        )
-
-        self.dropout = nn.Dropout(dropout)
-        self.out_dim = hidden_dim * (2 if bidirectional else 1)
-
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
-        if x.ndim == 2:
-            x = x.unsqueeze(0)  # handle single sequence
-        B, T, F_in = x.shape
-        if T == 0:
-            raise ValueError("Input sequence has zero length")
-
-        # --- CNN ---
-        x_c = x.transpose(1, 2)        # [B, F, T]
-        x_c = F.relu(self.conv(x_c))   # [B, C, T]
-        x_c = x_c.transpose(1, 2)      # [B, T, C]
-        x_c = self.norm(x_c)
-        x_c = self.dropout(x_c)
-
-        # --- LSTM ---
-        if mask is not None and self.use_packed:
-            mask = mask.bool()
-            lengths = mask.sum(dim=1).clamp_min(1)
-            packed = nn.utils.rnn.pack_padded_sequence(
-                x_c, lengths.cpu(), batch_first=True, enforce_sorted=False
-            )
-            out_packed, _ = self.lstm(packed)
-            out, _ = nn.utils.rnn.pad_packed_sequence(out_packed, batch_first=True, total_length=T)
-        else:
-            out, _ = self.lstm(x_c)
-        out = self.dropout(out)  # [B, T, D]
-
-        # --- Pooled context (mean over valid timesteps) ---
-        if mask is not None:
-            mask_f = mask.unsqueeze(-1)
-            denom = mask_f.sum(dim=1).clamp_min(1)
-            pooled = (out * mask_f).sum(dim=1) / denom
-        else:
-            pooled = out.mean(dim=1)
-
-        self._context = pooled  # [B, D]
-
-        # --- Return ---
-        if self.return_sequence:
-            return out
-        else:
-            if mask is not None:
-                idx = mask.sum(dim=1).clamp_min(1) - 1
-                return out[torch.arange(B), idx]
-            return out[:, -1, :]
-
-
-# ============================================================
-# Main execution
-# ============================================================
 if __name__ == "__main__":
     torch.manual_seed(0)
     np.random.seed(0)
 
-    MAX_ITER = 9
-    MAX_DURATION = 40
+    MAX_ITER = 3
+    MAX_DURATION = 30
     SYMBOL = "BTC/USDT:USDT"
     DATA_DIR = "/opt/trader/user_data/data/bybit/futures_"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -263,6 +159,9 @@ if __name__ == "__main__":
     X_scaled = scaler.fit_transform(X_torch)
     X_torch = torch.tensor(X_scaled, dtype=DTYPE)
 
+    # --- Add batch dimension for encoder [B, T, F] ---
+    X_torch_batched = X_torch.unsqueeze(0)  # [1, T, F]
+
     # Build encoder and NHSMM
     hidden_dim = max(32, min(64, n_features * 2))
     encoder = CNN_LSTM_Encoder(n_features=n_features, cnn_channels=5, hidden_dim=hidden_dim)
@@ -272,20 +171,18 @@ if __name__ == "__main__":
         encoder=encoder,
         n_states=n_states,
         n_features=n_features,
+        emission_type="gaussian",
         max_duration=MAX_DURATION,
         seed=DEFAULT_RNG_SEED,
         min_covar=1e-3,
         alpha=1.0,
     )
-
     print("[Init] Duration logits differentiated per state.")
 
-    # --- EM Training ---
-    print("\n=== EM Training ===")
-
     t0 = time.time()
+    print("\n=== EM Training ===")
     model.fit(
-        X_torch,
+        X_torch_batched,
         n_init=3,
         tol=1e-4,
         max_iter=MAX_ITER,
@@ -295,7 +192,7 @@ if __name__ == "__main__":
 
     # --- Decode ---
     print("\n=== Decoding ===")
-    v_path = model.decode(X_torch, algorithm="viterbi")
+    v_path = model.decode(X_torch_batched, algorithm="viterbi")
 
     # --- Accuracy metrics ---
     if true_states is not None:
@@ -321,18 +218,37 @@ if __name__ == "__main__":
         print("⚠ No true state labels found — skipping accuracy evaluation.")
 
     # --- Duration summary ---
+    print("\n ===== Duration summary =====")
     print_duration_summary(model)
 
     # --- State occupancy & transition diagnostics ---
     with torch.no_grad():
-        trans = torch.exp(model.transition_module.log_matrix()).cpu().numpy()
-        init = torch.exp(model.initial_module.log_matrix()).cpu().numpy()
+        # ---- Initial distribution ----
+        log_init = model.initial_module.log_matrix()    # [B,T,K]
+        log_init = log_init.mean(dim=(0, 1))             # [K]
+
+        init = torch.softmax(log_init, dim=-1).cpu().numpy()
+
         print("\nInitial state distribution:")
         for i, p in enumerate(init):
-            print(f"  {label_map[i]}: {p:.3f}")
-        print("\nTransition matrix (row=from, col=to):")
+            print(f"  {i:02d} ({label_map[i]}): {p:.4f}")
+
+        # ---- Transition matrix ----
+        log_trans = model.transition_module.log_matrix()  # [B,T,K,K]
+        log_trans = log_trans.mean(dim=(0, 1))             # [K,K]
+
+        trans = torch.softmax(log_trans, dim=-1).cpu().numpy()
+
+        print("\nTransition matrix (row = from, col = to):")
         for i, row in enumerate(trans):
-            print(f"  {label_map[i]}: {' '.join(f'{v:.3f}' for v in row)}")
+            row_fmt = " ".join(f"{v:8.4f}" for v in row)
+            print(f"  {i:02d} ({label_map[i]:>6})  {row_fmt}")
+
+        row_sums = trans.sum(axis=1)
+        if not np.allclose(row_sums, 1.0, atol=1e-6):
+            print("\n[WARN] Transition rows not normalized:")
+            for i, s in enumerate(row_sums):
+                print(f"  {i:02d} ({label_map[i]}): sum={s:.6f}")
 
 
         # print("\n----- Duration -----")

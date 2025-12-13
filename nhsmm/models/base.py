@@ -907,12 +907,13 @@ class HSMM(nn.Module):
 
         return path
 
-    def fit(self,
+    def fit(
+        self,
         X: torch.Tensor,
         n_init: int = 1,
-        max_iter: int = 20,
-        tol: float = 1e-4,
         patience: int = 1,
+        tol: float = 1e-4,
+        max_iter: int = 20,
         theta: Optional[torch.Tensor] = None,
         update_rate_min: float = 0.1,
         update_rate_max: float = 0.9,
@@ -921,15 +922,16 @@ class HSMM(nn.Module):
         """
         Fit the HSMM using EM with optional neural emission updates.
         """
+
         X_valid = self._prepare(X, theta=theta)
         B = len(X_valid.sequences)
-        if B == 0:
-            return self
+        if B == 0: return self
 
         device = X_valid.sequences[0].device
         F_dim = X_valid.sequences[0].shape[-1]
         max_len = max(X_valid.lengths)
 
+        # Create sequence tensor and mask
         seq_tensor = torch.zeros((B, max_len, F_dim), dtype=DTYPE, device=device)
         mask = torch.zeros(B, max_len, dtype=torch.bool, device=device)
         for b, seq in enumerate(X_valid.sequences):
@@ -959,6 +961,7 @@ class HSMM(nn.Module):
             emission_dist = params["emission_dist"]
             transition_dist = params["transition_dist"]
 
+            # Initial likelihood
             log_probs_tensor = emission_dist.log_prob(seq_tensor.unsqueeze(2)) * mask_exp
             prev_ll = log_probs_tensor.sum().item()
             self._convergence.update(prev_ll, 0, run_idx)
@@ -966,7 +969,7 @@ class HSMM(nn.Module):
             for it in range(1, max_iter + 1):
                 gamma, xi, eta = self._compute_posteriors(X_valid, theta=theta)
 
-                # Sufficient statistics
+                # ---------------- Update EM statistics ----------------
                 init_counts = gamma.sum((0, 1))
                 dur_counts = eta.sum((0, 1))
                 trans_counts = xi.sum((0, 1)) if xi is not None else transition_dist.expected_probs()
@@ -976,24 +979,23 @@ class HSMM(nn.Module):
                 if xi is not None:
                     trans_counts /= trans_counts.sum(dim=1, keepdim=True).clamp_min(EPS)
 
-                # Update distributions (alpha blending handled internally)
                 init_pdf = self.initial_module._dist(probs=init_counts)
                 duration_dist = self.duration_module._dist(probs=dur_counts)
                 if xi is not None:
                     transition_dist = self.transition_module._dist(probs=trans_counts)
 
-                # Flatten for emission updates
+                # ---------------- Flatten sequences for emission update ----------------
                 flat_mask = mask.view(-1)
                 flat_X = seq_tensor.reshape(-1, F_dim)[flat_mask]
                 flat_gamma = gamma.reshape(-1, self.n_states)[flat_mask]
                 flat_theta = theta.reshape(-1, theta.shape[-1])[flat_mask] if theta is not None else None
 
-                if self.emission_module.emission_type in {"gaussian", "laplace", "studentt"}:
-                    flat_gamma = flat_gamma.unsqueeze(-1).expand(-1, -1, F_dim)
-
+                # ---------------- Adaptive rate ----------------
                 delta_ll = max(log_probs_tensor.sum().item() - prev_ll, 0.0)
                 adaptive_rate = min(update_rate_max, max(update_rate_min, adapt_factor * delta_ll))
 
+                # ---------------- Neural emission update ----------------
+                neural_update=False
                 if neural_update:
                     for p in self.emission_module.parameters():
                         p.requires_grad_(True)
@@ -1004,18 +1006,27 @@ class HSMM(nn.Module):
                             pg['lr'] = adaptive_rate
 
                     self._emission_optimizer.zero_grad()
-                    flat_gamma_safe = flat_gamma.detach()
-                    loss = -(flat_gamma_safe * self.emission_module.log_prob(flat_X)).sum() / flat_gamma_safe.sum()
+
+                    # Ensure gamma is float and detached safely
+                    flat_gamma_safe = flat_gamma.detach().float()
+
+                    # Compute log_prob without in-place ops
+                    log_probs = self.emission_module.log_prob(flat_X)
+                    loss = -(flat_gamma_safe * log_probs).sum() / flat_gamma_safe.sum().clamp_min(EPS)
+
                     loss.backward()
                     self._emission_optimizer.step()
+
                     emission_dist = self.emission_module.forward(context=flat_theta, return_dist=True)
+
+                # ---------------- Standard EM emission update ----------------
                 else:
                     self.emission_module.update(posterior=flat_gamma, context=flat_theta, update_rate=adaptive_rate)
                     emission_dist = self.emission_module.forward(context=flat_theta, return_dist=True)
 
                 self._params["emission_dist"] = emission_dist
 
-                # Likelihood & convergence
+                # ---------------- Likelihood & convergence ----------------
                 log_probs_tensor = emission_dist.log_prob(seq_tensor.unsqueeze(2)) * mask_exp / F_dim
                 curr_ll = log_probs_tensor.sum().item()
 
@@ -1175,6 +1186,7 @@ class HSMM(nn.Module):
         preds = self.predict(X_list, algorithm=algorithm, context=context_list, verbose=verbose)
 
         return preds[0] if first_only and preds else preds
+
 
     @torch.no_grad()
     def score(self,
