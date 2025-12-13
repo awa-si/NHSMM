@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import contextlib
 from dataclasses import dataclass, field
 from typing import Optional, Literal, Tuple, Callable, Dict
 
@@ -356,11 +357,14 @@ class SequenceSet:
     log_probs: Optional[torch.Tensor] = None  # [B, T, K]
 
     @classmethod
-    def from_unbatched(cls,
+    def from_unbatched(
+        cls,
         sequences: Sequence[torch.Tensor],
         contexts: Optional[Sequence[Optional[torch.Tensor]]] = None,
         log_probs: Optional[Sequence[Optional[torch.Tensor]]] = None,
-        pad_value: float = 0.0) -> "SequenceSet":
+        pad_value: float = 0.0,
+        context_pad_value: Optional[float] = None,
+        canonical_idx: Optional[int] = None) -> "SequenceSet":
         if not sequences:
             raise ValueError("`sequences` must be a non-empty list of tensors.")
 
@@ -383,31 +387,31 @@ class SequenceSet:
 
         # Allocate tensors
         seq_tensor = torch.full((B, T_max, F), pad_value, dtype=dtype, device=device)
-        ctx_tensor = torch.zeros((B, T_max, ctx_dim), dtype=dtype, device=device)
+        ctx_tensor = torch.full((B, T_max, ctx_dim),
+                                context_pad_value if context_pad_value is not None else 0.0,
+                                dtype=dtype, device=device)
         mask_tensor = torch.zeros((B, T_max, 1), dtype=torch.bool, device=device)
         logp_tensor = None
 
         if log_probs is not None:
-            K = next((lp.shape[1] if lp.ndim > 1 else 1 for lp in log_probs if lp is not None), None)
+            K = next((lp.shape[1] if lp is not None and lp.ndim > 1 else 1 for lp in log_probs), None)
             if K is None:
                 raise ValueError("log_probs provided but all entries are None")
             logp_tensor = torch.full((B, T_max, K), float("-inf"), dtype=dtype, device=device)
 
+        # Precompute max lengths for slicing
         for i, s in enumerate(sequences):
             L = s.shape[0]
-            seq_tensor[i, :L] = s.unsqueeze(-1) if s.ndim == 1 else s
+            seq_tensor[i, :L] = s if s.ndim > 1 else s.unsqueeze(-1)
 
-            # Valid mask
-            valid_mask = torch.ones(L, dtype=torch.bool, device=device)
-            if s.ndim == 1:
-                valid_mask &= ~torch.isnan(s)
+            # Mask: NaN-aware
+            mask_tensor[i, :L, 0] = ~torch.isnan(s).all(dim=1) if s.ndim > 1 else ~torch.isnan(s)
+
+            # Context
+            c = contexts[i] if contexts and contexts[i] is not None else None
+            if c is None:
+                ctx_tensor[i, :L, :F] = seq_tensor[i, :L]
             else:
-                valid_mask &= ~torch.isnan(s).all(dim=1)
-            mask_tensor[i, :L, 0] = valid_mask
-
-            # Fill contexts
-            if contexts and contexts[i] is not None:
-                c = contexts[i]
                 if c.ndim == 1:
                     ctx_tensor[i, :L] = c.unsqueeze(0).expand(L, -1)
                 elif c.ndim == 2:
@@ -419,18 +423,20 @@ class SequenceSet:
                         raise ValueError(f"Invalid context shape {c.shape} for sequence {i}")
                 else:
                     raise ValueError(f"Unsupported context ndim {c.ndim}")
-            else:
-                # fallback: use sequences as context
-                ctx_tensor[i, :L, :F] = seq_tensor[i, :L]
 
-            # Fill log_probs
+            # Log-probs
             if logp_tensor is not None and log_probs[i] is not None:
-                lp = log_probs[i].unsqueeze(-1) if log_probs[i].ndim == 1 else log_probs[i]
+                lp = log_probs[i] if log_probs[i].ndim > 1 else log_probs[i].unsqueeze(-1)
                 logp_tensor[i, :L] = lp
 
-        # Canonical context: first valid timestep per sequence
-        first_idx = mask_tensor.squeeze(-1).float().argmax(dim=1)
-        canonical_tensor = ctx_tensor[torch.arange(B, device=device), first_idx].unsqueeze(1)
+        # Canonical context
+        if canonical_idx is not None:
+            canonical_idx = torch.full((B,), canonical_idx, device=device, dtype=torch.long)
+        else:
+            # first valid timestep
+            canonical_idx = mask_tensor.squeeze(-1).float().argmax(dim=1)
+
+        canonical_tensor = ctx_tensor[torch.arange(B, device=device), canonical_idx].unsqueeze(1)
 
         return cls(
             sequences=seq_tensor,
@@ -488,6 +494,30 @@ class SequenceSet:
             log_probs=self.log_probs[idx] if self.log_probs is not None else None
         )
 
+    def select(self, indices: torch.Tensor | list[int]) -> "SequenceSet":
+        """
+        Return a new SequenceSet containing only the sequences at the given indices.
+
+        Args:
+            indices: list of int or 1D torch.Tensor of indices to select.
+
+        Returns:
+            SequenceSet: subset of sequences
+        """
+        if isinstance(indices, list):
+            indices = torch.tensor(indices, dtype=torch.long, device=self.sequences.device)
+        elif not isinstance(indices, torch.Tensor):
+            raise TypeError(f"indices must be list[int] or torch.Tensor, got {type(indices)}")
+
+        return SequenceSet(
+            sequences=self.sequences[indices],
+            lengths=self.lengths[indices],
+            masks=self.masks[indices],
+            contexts=self.contexts[indices],
+            canonical=self.canonical[indices],
+            log_probs=self.log_probs[indices] if self.log_probs is not None else None
+        )
+
     @staticmethod
     def batchify(items: Sequence[torch.Tensor], pad_value: float = 0.0) -> torch.Tensor:
         if not items:
@@ -503,10 +533,7 @@ class SequenceSet:
             out[i, :t2.shape[0], :t2.shape[1]] = t2
         return out
 
-    def update(self,
-        encoder: ContextEncoder,
-        pool: Optional[str] = None,
-        detach: bool = False):
+    def update(self, encoder: ContextEncoder, pool: Optional[str] = None, detach: bool = False):
         """
         Update SequenceSet contexts and canonical context from a ContextEncoder.
 
@@ -534,10 +561,6 @@ class SequenceSet:
         self.contexts = ctx.expand(-1, x.shape[1], -1)
         self.canonical = ctx
 
-
-from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Union
-import torch
 
 @dataclass
 class ContextRouter:
@@ -574,8 +597,7 @@ class ContextRouter:
         cls,
         X: "SequenceSet",
         theta: Optional[Union[torch.Tensor, "ContextRouter"]] = None,
-        mode: str = "additive",
-    ) -> "ContextRouter":
+        mode: str = "additive") -> "ContextRouter":
         """
         Build ContextRouter from a SequenceSet and optional theta.
 
@@ -672,6 +694,29 @@ class ContextRouter:
             names=keys,
             log_probs=self.log_probs,
             mask=self.mask
+        )
+
+    def select(self, indices: torch.Tensor | list[int]) -> "ContextRouter":
+        """
+        Return a new ContextRouter containing only the selected batch indices.
+
+        Args:
+            indices: list of int or 1D torch.Tensor of batch indices.
+
+        Returns:
+            ContextRouter: subset of the batch.
+        """
+        if isinstance(indices, list):
+            indices = torch.tensor(indices, dtype=torch.long, device=self.context.device)
+        elif not isinstance(indices, torch.Tensor):
+            raise TypeError(f"indices must be list[int] or torch.Tensor, got {type(indices)}")
+
+        return ContextRouter(
+            canonical=self.canonical[indices],
+            context=self.context[indices],
+            names=self.names.copy() if self.names is not None else None,
+            mask=self.mask[indices] if self.mask is not None else None,
+            log_probs=self.log_probs[indices] if self.log_probs is not None else None
         )
 
     def to(self, device=None, dtype=None) -> "ContextRouter":

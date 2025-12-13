@@ -125,7 +125,7 @@ class Categorical(Distribution):
 
 class Neural(nn.Module, ABC):
 
-    _dist_type: type = None
+    _dist_type: Distribution = None
 
     def __init__(
         self,
@@ -334,6 +334,7 @@ class Neural(nn.Module, ABC):
 
         # Optional projection
         if self._proj is not None and self.allow_projection:
+            if ctx.numel() == 0: return ctx  # skip projection
             ctx = self._proj(ctx.reshape(-1, ctx.shape[-1])).view(*ctx.shape[:-1], -1)
         elif self.context_dim is not None and ctx.shape[-1] != self.context_dim:
             raise ValueError(
@@ -1499,13 +1500,9 @@ class Emission(Neural):
         timestep: Optional[int] = None,
         grad_safe: bool = False) -> torch.Tensor:
 
-        # Base emission parameters from module if not supplied
         if base is None:
             base = getattr(self, self._params[self.emission_type])
 
-        # -------------------------------------------------------
-        # CONTEXT MODULATION  (let Neural._apply_context do all shapes)
-        # -------------------------------------------------------
         if context is not None:
             # _apply_context returns Δ with the SAME SHAPE as base
             delta = super()._apply_context(
@@ -1513,25 +1510,17 @@ class Emission(Neural):
                 context=context,      # CAN BE (B,H) or (B,T,H) or (S,B,T,H)
                 timestep=timestep
             )
+            if context.numel() == 0: return base  # skip projection
             mod = base + delta
         else:
             mod = base
 
-        # -------------------------------------------------------
-        # TEMPERATURE SCALING (discrete emission types)
-        # -------------------------------------------------------
         if self.emission_type in {"categorical", "bernoulli", "poisson"}:
             tau = temperature if temperature is not None else self.temperature
             mod = mod / max(tau, EPS)
 
-        # -------------------------------------------------------
-        # CONSTRAINTS
-        # -------------------------------------------------------
         mod = self._apply_constraints(mod)
 
-        # -------------------------------------------------------
-        # CACHE (optional)
-        # -------------------------------------------------------
         if self.cache_enabled:
             key = f"{self._context_hash(context)}-T{timestep}-Temp{temperature}"
             self._cache[key] = mod.clone().detach() if grad_safe else mod.clone()
@@ -1731,7 +1720,8 @@ class Emission(Neural):
         optimizer_kwargs: Optional[dict] = None,
         update_temperature: bool = False,
         from_probs: bool = False,
-        grad_safe: bool = False):
+        grad_safe: bool = False
+    ):
         """
         Update emission parameters (direct or posterior-based) for all emission types.
         - Continuous: EM-style updates for mean/location and variance/scale.
@@ -1744,16 +1734,12 @@ class Emission(Neural):
         # ---------------- Direct update ----------------
         if new_logits is not None:
             new_logits = self._tensor_shape(new_logits, "new_logits")
-
             if from_probs:
                 new_logits = torch.log(new_logits.clamp_min(EPS))
-
             if self.emission_type in {"categorical", "bernoulli", "poisson"} and temperature is not None:
                 new_logits = new_logits / max(temperature, EPS)
-
             with torch.no_grad():
                 param.data.mul_(1 - lr).add_(lr * new_logits)
-
                 # Update covariance/scale for continuous
                 if self.emission_type == "gaussian":
                     var = F.softplus(self.log_var).clamp_min(self.min_covar)
@@ -1761,7 +1747,6 @@ class Emission(Neural):
                 elif self.emission_type in {"laplace", "studentt"}:
                     scale = F.softplus(self.scale_param).clamp_min(self.min_covar)
                     self._emission_covs.copy_(torch.diag_embed(scale**2))
-
             self._invalidate_cache()
             return
 
@@ -1769,18 +1754,23 @@ class Emission(Neural):
         if posterior is None:
             return
 
-        posterior = self._tensor_shape(posterior, "posterior").expand_as(param)
+        # ---------------- Debug ----------------
+        print("DEBUG update(): param.shape =", param.shape)
+        print("DEBUG update(): posterior.shape (before reshape) =", posterior.shape)
 
         # Continuous emissions: EM-style
         if self.emission_type in {"gaussian", "laplace", "studentt"}:
-            # Weighted mean (location)
-            delta = (posterior * param).sum(dim=tuple(range(len(param.shape) - len(self._shape)))) / \
-                    posterior.sum(dim=tuple(range(len(param.shape) - len(self._shape)))).clamp_min(EPS)
+            # Ensure posterior shape: (N, n_states, n_features)
+            if posterior.ndim == 2:  # (N, n_states)
+                posterior = posterior.unsqueeze(-1).expand(-1, -1, param.shape[-1])
+            assert posterior.shape[-2:] == param.shape, \
+                f"Posterior shape {posterior.shape} incompatible with param {param.shape}"
 
+            # Weighted mean (location)
+            delta = (posterior * param).sum(dim=0) / posterior.sum(dim=0).clamp_min(EPS)
             with torch.no_grad():
                 # Update location
                 param.data.mul_(1 - lr).add_(lr * delta)
-
                 # Update variance/scale EM-style
                 if self.emission_type == "gaussian":
                     diff = (param - delta).pow(2).clamp_min(self.min_covar)
@@ -1793,6 +1783,8 @@ class Emission(Neural):
                     scale = F.softplus(self.scale_param).clamp_min(self.min_covar)
                     self._emission_covs.copy_(torch.diag_embed(scale**2))
 
+            print("DEBUG update(): Continuous posterior applied. param updated.")
+
         # Discrete / Poisson: gradient-based optimizer update
         else:
             if not param.requires_grad:
@@ -1801,11 +1793,9 @@ class Emission(Neural):
             modulated = self._modulate(base=param, context=context, temperature=temperature, grad_safe=False)
             posterior_norm = posterior / posterior.sum(dim=-1, keepdim=True).clamp_min(EPS)
 
-            # Cross-entropy / logit loss
             log_probs = F.log_softmax(modulated, dim=-1)
             loss = -(posterior_norm * log_probs).sum() / posterior_norm.sum().clamp_min(EPS)
 
-            # Persistent optimizer
             if not hasattr(self, "_optimizer") or self._optimizer is None:
                 params = [param]
                 if update_temperature and hasattr(self, "log_temperature"):
@@ -1819,6 +1809,6 @@ class Emission(Neural):
             self._optimizer.zero_grad(set_to_none=True)
             loss.backward()
             self._optimizer.step()
+            print("DEBUG update(): Discrete/Poisson posterior applied. param updated via optimizer.")
 
         self._invalidate_cache()
-
