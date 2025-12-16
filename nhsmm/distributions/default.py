@@ -125,7 +125,7 @@ class Categorical(Distribution):
 
 class Neural(nn.Module, ABC):
 
-    _dist_type: Distribution = None
+    _dist_factory: Distribution = None
 
     def __init__(
         self,
@@ -156,7 +156,7 @@ class Neural(nn.Module, ABC):
         self.max_delta = max_delta
         self.temperature = 1.0
 
-        self._mode: str = "scalar"
+        self._process_mode: str = "scalar"
         self.activation_fn = self._get_activation(activation)
         self.final_activation_fn = self._get_activation(final_activation)
 
@@ -252,7 +252,7 @@ class Neural(nn.Module, ABC):
                 tau = tau.view(*([1] * (logits.ndim - tau.ndim)), *tau.shape)
         return logits / tau
 
-    def _tensor_shape(self, tensor: torch.Tensor, name: str = "tensor") -> torch.Tensor:
+    def _tensor_shape(self, tensor: torch.Tensor) -> torch.Tensor:
         """
         Ensure `tensor` has trailing dimensions compatible with self._shape.
         Leading dimensions are preserved; trailing dims are broadcasted if needed.
@@ -283,19 +283,19 @@ class Neural(nn.Module, ABC):
 
     def _prepare_context(self, context: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if context is None:
-            self._mode = "scalar"
+            self._process_mode = "scalar"
             return None
         if context.ndim == 1:  # (H,)
-            self._mode = "scalar"
+            self._process_mode = "scalar"
             return context.view(1, 1, -1)
         elif context.ndim == 2:  # (B,H)
-            self._mode = "batch"
+            self._process_mode = "batch"
             return context.unsqueeze(1)  # (B,1,H)
         elif context.ndim == 3:  # (B,T,H)
-            self._mode = "batch"
+            self._process_mode = "batch"
             return context
         elif context.ndim == 4:  # (S,B,T,H)
-            self._mode = "sample_batch"
+            self._process_mode = "sample_batch"
             return context
         else:
             raise ValueError(f"Unsupported context ndim={context.ndim}")
@@ -311,10 +311,10 @@ class Neural(nn.Module, ABC):
         Compute delta logits to add to base logits from context.
         Supports scalar, batch, and sequence contexts with optional timestep selection.
         """
-        base = self._tensor_shape(base, "base")
+        base = self._tensor_shape(base)
 
         # No context or context_net -> zero delta
-        if context is None or self.context_net is None:
+        if context is None or context.numel() == 0 or self.context_net is None:
             return torch.zeros_like(base, requires_grad=base.requires_grad)
 
         # Canonicalize context to (S,B,T,H)
@@ -403,11 +403,11 @@ class Neural(nn.Module, ABC):
         mod = self._apply_temperature(mod, temperature)
 
         # Ensure trailing dims match logits shape
-        mod = self._tensor_shape(mod, "modulated_logits")
+        mod = self._tensor_shape(mod)
 
         # Expand leading dims based on mode
         leading_dims_map = {"scalar": 1, "batch": 2, "sequence": 2, "sample_batch": 3}
-        leading_dims = leading_dims_map.get(self._mode, 1)
+        leading_dims = leading_dims_map.get(self._process_mode, 1)
         while mod.ndim < leading_dims + len(self._shape):
             mod = mod.unsqueeze(0)
 
@@ -418,7 +418,7 @@ class Neural(nn.Module, ABC):
         return mod.detach() if grad_safe else mod
 
     @abstractmethod
-    def _init_logits(self, *args, **kwargs) -> torch.Tensor:
+    def _init_params(self, *args, **kwargs) -> torch.Tensor:
         pass
 
     @abstractmethod
@@ -617,15 +617,15 @@ class Neural(nn.Module, ABC):
 
     @property
     def _dist(self) -> type:
-        if self._dist_type is None:
-            raise TypeError(f"{self.__class__.__name__} must define `_dist_type`.")
-        return self._dist_type
+        if self._dist_factory is None:
+            raise TypeError(f"{self.__class__.__name__} must define `_dist_factory`.")
+        return self._dist_factory
 
     @_dist.setter
     def _dist(self, value: type) -> None:
         if not isinstance(value, type):
             raise TypeError("_dist must be a distribution *class*, not an instance.")
-        self._dist_type = value
+        self._dist_factory = value
 
     def _context_hash(self, context: Optional[torch.Tensor]) -> str:
         """Generate a stable hash for context and current parameter version."""
@@ -681,7 +681,7 @@ class Neural(nn.Module, ABC):
             if temperature is not None:
                 new_logits = new_logits / max(temperature, EPS)
 
-            new_logits = self._tensor_shape(new_logits, "new_logits")
+            new_logits = self._tensor_shape(new_logits)
             if new_logits.shape != self.logits.shape:
                 lead_dims = new_logits.ndim - len(self._shape)
                 if lead_dims > 0:
@@ -711,7 +711,7 @@ class Neural(nn.Module, ABC):
         posterior = posterior / psum.clamp_min(EPS)
 
         # Ensure trailing dims match logits
-        posterior = self._tensor_shape(posterior, "posterior").expand_as(mod_logits)
+        posterior = self._tensor_shape(posterior).expand_as(mod_logits)
 
         # Compute cross-entropy loss
         log_probs = F.log_softmax(mod_logits, dim=-1)
@@ -738,7 +738,7 @@ class Neural(nn.Module, ABC):
 
 class Initial(Neural):
 
-    _dist_type = Categorical
+    _dist_factory = Categorical
 
     def __init__(
         self,
@@ -760,9 +760,9 @@ class Initial(Neural):
         )
 
         # Initialize logits
-        self._init_logits(mode=init_mode)
+        self._init_params(mode=init_mode)
 
-    def _init_logits(self, mode: str) -> torch.Tensor:
+    def _init_params(self, mode: str, jitter: float = 1e-3) -> torch.Tensor:
         if mode == "uniform":
             logits = torch.full((self.n_states,), -math.log(self.n_states), dtype=DTYPE)
         elif mode == "biased":
@@ -773,6 +773,10 @@ class Initial(Neural):
         else:
             raise ValueError(f"Unknown init_mode '{mode}'")
 
+        # Add small jitter to break exact ties
+        if jitter > 0.0:
+            logits = logits + torch.randn_like(logits) * jitter
+
         logits = self._validate_logits(logits)
         self.logits.data.copy_(logits)
         self._reset_buffers()
@@ -781,7 +785,7 @@ class Initial(Neural):
 
     @torch.no_grad()
     def initialize(self, mode: str = "uniform", context: Optional[torch.Tensor] = None, **dist_kwargs) -> Distribution:
-        logits = self._init_logits(mode)
+        logits = self._init_params(mode)
         return self._dist(**self._dist_params(logits, **dist_kwargs))
 
     def _dist_params(self, logits: torch.Tensor, **dist_kwargs) -> Dict[str, torch.Tensor]:
@@ -792,7 +796,7 @@ class Initial(Neural):
         mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         logits = torch.clamp(logits, min=-1e6, max=1e6)
         if mask is not None:
-            logits = logits.masked_fill(~mask, -1e9)  # effectively zero probability
+            logits = logits.masked_fill(~mask, -1e9)
         return logits - logits.logsumexp(dim=-1, keepdim=True)
 
     def _apply_context(self,
@@ -807,6 +811,12 @@ class Initial(Neural):
             grad_scale=grad_scale,
             skip_adapters=True
         )
+
+    def _modulate(self, context=None, temperature=None, timestep=None, grad_safe=False):
+        tau = float(self.temperature if temperature is None else max(temperature, EPS))
+        logits = super()._modulate(context=context, temperature=temperature, timestep=timestep, grad_safe=grad_safe)
+        logits = logits / tau  # scale logits by temperature
+        return logits
 
     def log_matrix(self, context=None, temperature=None, timestep=None, return_dist=False, T=None, **dist_kwargs):
         logits = self._modulate(context=context, temperature=temperature, timestep=timestep)
@@ -866,9 +876,9 @@ class Initial(Neural):
         """
         # Ensure trailing dims match _shape before delegating
         if new_logits is not None:
-            new_logits = self._tensor_shape(new_logits, "new_logits")
+            new_logits = self._tensor_shape(new_logits)
         if posterior is not None:
-            posterior = self._tensor_shape(posterior, "posterior")
+            posterior = self._tensor_shape(posterior)
 
         super().update(
             new_logits=new_logits,
@@ -886,7 +896,7 @@ class Initial(Neural):
 
 class Duration(Neural):
 
-    _dist_type = Categorical
+    _dist_factory = Categorical
 
     def __init__(
         self,
@@ -914,10 +924,10 @@ class Duration(Neural):
         )
 
         self.log_duration = nn.Parameter(torch.zeros(self._shape, dtype=DTYPE))
-        self._init_logits(mode=init_mode)
+        self._init_params(mode=init_mode)
 
     @torch.no_grad()
-    def _init_logits(self, mode: str) -> torch.Tensor:
+    def _init_params(self, mode: str) -> torch.Tensor:
         if mode == "uniform":
             logits = torch.full(self._shape, -math.log(self.max_duration), dtype=DTYPE)
         elif mode == "short_bias":
@@ -939,7 +949,7 @@ class Duration(Neural):
 
     @torch.no_grad()
     def initialize(self, mode: str = "uniform", context: Optional[torch.Tensor] = None, **dist_kwargs) -> Distribution:
-        logits = self._init_logits(mode)
+        logits = self._init_params(mode)
         self._invalidate_cache()
         return self._dist(**self._dist_params(logits, **dist_kwargs))
 
@@ -969,7 +979,7 @@ class Duration(Neural):
         grad_safe: bool = False) -> torch.Tensor:
 
         # Base tensor includes log_duration exactly once
-        base = self._tensor_shape(self.logits + self.log_duration, "duration_base")
+        base = self._tensor_shape(self.logits + self.log_duration)
         tau = float(self.temperature if temperature is None else max(temperature, EPS))
 
         # Cache key
@@ -1042,12 +1052,12 @@ class Duration(Neural):
         probs = F.softmax(mod, dim=-1)
 
         # Squeeze leading singleton dims intelligently
-        if self._mode == "scalar":
+        if self._process_mode == "scalar":
             probs = probs.squeeze(0).squeeze(0)        # -> (K,D)
-        elif self._mode in ("batch", "sequence"):
+        elif self._process_mode in ("batch", "sequence"):
             while probs.ndim > 3 and probs.shape[1] == 1:
                 probs = probs.squeeze(1)               # remove extra timestep dim
-        elif self._mode == "sample_batch":
+        elif self._process_mode == "sample_batch":
             while probs.ndim > 4 and probs.shape[2] == 1:
                 probs = probs.squeeze(2)               # remove timestep dim
 
@@ -1086,9 +1096,9 @@ class Duration(Neural):
         """
         # Ensure trailing dims match _shape before delegating
         if new_logits is not None:
-            new_logits = self._tensor_shape(new_logits, "new_logits")
+            new_logits = self._tensor_shape(new_logits)
         if posterior is not None:
-            posterior = self._tensor_shape(posterior, "posterior")
+            posterior = self._tensor_shape(posterior)
 
         super().update(
             new_logits=new_logits,
@@ -1106,7 +1116,7 @@ class Duration(Neural):
 
 class Transition(Neural):
 
-    _dist_type = Categorical
+    _dist_factory = Categorical
 
     def __init__(
         self,
@@ -1130,10 +1140,10 @@ class Transition(Neural):
             activation="tanh",
             final_activation="tanh",
         )
-        self._init_logits(mode=init_mode)
+        self._init_params(mode=init_mode)
 
     @torch.no_grad()
-    def _init_logits(self, mode: str) -> torch.Tensor:
+    def _init_params(self, mode: str) -> torch.Tensor:
         if mode == "uniform":
             logits = torch.full(self._shape, -math.log(self.n_states), dtype=DTYPE)
         elif mode == "diag_bias":
@@ -1153,7 +1163,7 @@ class Transition(Neural):
 
     @torch.no_grad()
     def initialize(self, mode: str = "diag_bias", context: Optional[torch.Tensor] = None, **dist_kwargs):
-        logits = self._init_logits(mode)
+        logits = self._init_params(mode)
         self._invalidate_cache()
         return self._dist(**self._dist_params(logits, **dist_kwargs))
 
@@ -1245,12 +1255,12 @@ class Transition(Neural):
         probs = F.softmax(mod, dim=-1)
 
         # Squeeze leading singleton dims intelligently
-        if self._mode == "scalar":
+        if self._process_mode == "scalar":
             probs = probs.squeeze(0).squeeze(0)        # -> (K,D)
-        elif self._mode in ("batch", "sequence"):
+        elif self._process_mode in ("batch", "sequence"):
             while probs.ndim > 3 and probs.shape[1] == 1:
                 probs = probs.squeeze(1)               # remove extra timestep dim
-        elif self._mode == "sample_batch":
+        elif self._process_mode == "sample_batch":
             while probs.ndim > 4 and probs.shape[2] == 1:
                 probs = probs.squeeze(2)               # remove timestep dim
 
@@ -1278,9 +1288,9 @@ class Transition(Neural):
         from_probs: bool = False,
         grad_safe: bool = False):
         if new_logits is not None:
-            new_logits = self._tensor_shape(new_logits, "new_logits")
+            new_logits = self._tensor_shape(new_logits)
         if posterior is not None:
-            posterior = self._tensor_shape(posterior, "posterior")
+            posterior = self._tensor_shape(posterior)
 
         super().update(
             new_logits=new_logits,
@@ -1298,22 +1308,14 @@ class Transition(Neural):
 
 class Emission(Neural):
 
-    _dist_type = MultivariateNormal
-
-    _params = {
-        "gaussian": "mu",
-        "laplace": "loc",
-        "studentt": "loc",
-        "categorical": "logits",
-        "bernoulli": "logits",
-        "poisson": "log_rate"
-    }
+    _dist_factory = None
 
     def __init__(
         self,
         n_states: int,
         n_features: int,
         min_covar: float = 1e-6,
+        init_mode: str = "spread",
         modulate_var: bool = False,
         emission_type: str = "gaussian",
         context_dim: Optional[int] = None,
@@ -1321,13 +1323,23 @@ class Emission(Neural):
         allow_projection: bool = True,
         temperature: float = 1.0,
     ):
-        self.n_states, self.n_features = n_states, n_features
+
+        self.n_states = n_states
+        self.n_features = n_features
         self._shape = (n_states, n_features)
         self.emission_type = emission_type
         self.modulate_var = modulate_var
         self.temperature = temperature
         self.min_covar = min_covar
+        self.init_mode = init_mode
         self.dof = 5.0
+
+        if self.emission_type == "gaussian":
+            self._dist_factory = MultivariateNormal
+        elif self.emission_type == "studentt":
+            self._dist_factory = lambda **kwargs: Independent(StudentT(df=self.dof, **kwargs), 1)
+        else:
+            raise ValueError(f"Unsupported emission_type: {self.emission_type}")
 
         super().__init__(
             hidden_dim=hidden_dim,
@@ -1336,480 +1348,248 @@ class Emission(Neural):
             allow_projection=allow_projection,
         )
 
-        self._init_logits(mode=self.emission_type)
+        self._init_params(mode=self.emission_type)
         self._invalidate_cache()
+
+    def _init_params(self, mode: Optional[str] = None):
+        """
+        Legacy initializer retained for API compatibility.
+        Delegates to _init_params and ignores mode except for validation.
+        """
+        if mode is not None and mode != self.emission_type:
+            raise ValueError(f"Emission initialized with emission_type={self.emission_type}, got mode={mode}")
+
+        K, F = self.n_states, self.n_features
+
+        self.register_buffer("_emission_covs", torch.zeros(K, F, F, dtype=DTYPE))
+        self.register_buffer("_emission_means", torch.zeros(K, F, dtype=DTYPE))
+
+        if self.emission_type == "gaussian":
+            self.log_var = nn.Parameter(torch.full((K, F), -1.0, dtype=DTYPE))
+            self.mu = nn.Parameter(torch.randn(K, F, dtype=DTYPE) * 0.1)
+
+        else:
+            self.scale_param = nn.Parameter(torch.full((K, F), 0.1, dtype=DTYPE))
+            self.loc = nn.Parameter(torch.randn(K, F, dtype=DTYPE) * 0.1)
+
+        self._reset_buffers()
 
     def _reset_buffers(self) -> None:
-        """
-        Refresh internal buffers from current parameters.
-        Continuous emissions update covariance buffer.
-        Discrete/Poisson emissions update parameter buffer.
-        """
-        if self.emission_type in {"categorical", "bernoulli", "poisson"}:
-            # Store a snapshot of logits or rates
-            param = getattr(self, self._params[self.emission_type], None)
-            if param is not None and hasattr(self, "_emission_params"):
-                self._emission_params.data.copy_(param.data)
-
-        elif self.emission_type == "gaussian":
-            if hasattr(self, "_emission_covs"):
-                var = F.softplus(self.log_var).clamp_min(self.min_covar)
-                self._emission_covs.data.copy_(torch.diag_embed(var))
-
-        elif self.emission_type in {"laplace", "studentt"}:
-            if hasattr(self, "_emission_covs") and hasattr(self, "scale_param"):
-                scale = F.softplus(self.scale_param).clamp_min(self.min_covar)
-                self._emission_covs.data.copy_(torch.diag_embed(scale**2))
-            if hasattr(self, "_emission_means") and hasattr(self, "loc"):
-                self._emission_means.data.copy_(self.loc.data)
-
-        if hasattr(self, "logits"): super()._reset_buffers()
-
-    @torch.no_grad()
-    def _init_logits(self, mode: str):
-        K, F = self.n_states, self.n_features
-
-        if not hasattr(self, "_emission_means"):
-            self.register_buffer("_emission_means", torch.zeros(K, F, dtype=DTYPE))
-
-        if not hasattr(self, "_emission_params"):
-            self.register_buffer("_emission_params", torch.zeros(K, F, dtype=DTYPE))
-
-        for name in self._params.values():
-            if hasattr(self, name): delattr(self, name)
-
-        if mode == "gaussian":
-            self.mu = nn.Parameter(torch.randn(K, F, dtype=DTYPE) * 0.1)
-            self.log_var = nn.Parameter(torch.full((K, F), -1.0, dtype=DTYPE))
-            cov = torch.diag_embed(torch.nn.functional.softplus(self.log_var).clamp_min(self.min_covar))
-
-        elif mode in {"laplace", "studentt"}:
-            self.loc = nn.Parameter(torch.randn(K, F, dtype=DTYPE) * 0.1)
-            self.scale_param = nn.Parameter(torch.full((K, F), 0.1, dtype=DTYPE))
-            cov = torch.diag_embed(self.scale_param**2)
-
-        elif mode in {"categorical", "bernoulli"}:
-            self.logits = nn.Parameter(torch.zeros(K, F, dtype=DTYPE))
-            cov = None   # not used for discrete
-
-        elif mode == "poisson":
-            self.log_rate = nn.Parameter(torch.zeros(K, F, dtype=DTYPE))
-            cov = None
-
-        else:
-            raise ValueError(f"Unsupported emission_type: {mode}")
-
-        if cov is not None:
-            self.register_buffer("_emission_covs", cov)
-
-        self._reset_buffers()
-        self._invalidate_cache()
-
-    @torch.no_grad()
-    def initialize(
-        self,
-        X: Optional[torch.Tensor] = None,
-        context: Optional[torch.Tensor] = None,
-        posterior: Optional[torch.Tensor] = None):
-        """
-        Initialize emission parameters from data or posterior, optionally modulated by context.
-        """
-        K, F = self.n_states, self.n_features
-        device = self._emission_means.device
-
-        # Select base tensor
         if self.emission_type == "gaussian":
-            base = self.mu
-        elif self.emission_type in {"laplace", "studentt"}:
-            base = self.loc
-        else:
-            base = self.logits if self.emission_type != "poisson" else self.log_rate
+            var = F.softplus(self.log_var).clamp_min(self.min_covar)
+            self._emission_covs.copy_(torch.diag_embed(var))
+            self._emission_means.copy_(self.mu)
+        else:  # studentt
+            # Use softplus for positive scale and squared for covariance
+            scale = F.softplus(self.scale_param).clamp_min(self.min_covar)
+            self._emission_covs.copy_(torch.diag_embed(scale ** 2))
+            self._emission_means.copy_(self.loc)
+        super()._reset_buffers()
 
-        # Posterior-based initialization for continuous emissions
-        if X is not None and posterior is not None and self.emission_type in {"gaussian", "laplace", "studentt"}:
-            Xf = X.reshape(-1, F).to(device=device)
-            w = posterior.clamp_min(EPS)
-            base = (w.T @ Xf) / (w.sum(dim=0, keepdim=True).T + EPS)
+    def _tensor_shape(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Wrap super()._tensor_shape to ensure broadcasting for HSMM EM.
 
-        # Apply context modulation if provided
-        if context is not None:
-            base = self._modulate(base=base, context=context, grad_safe=True)
+        Ensures tensor has shape [1, 1, K, F] if currently [K, F],
+        so it can be safely expanded to [B, T, K, F].
+        """
+        tensor = super()._tensor_shape(tensor)
 
-        # Assign to parameters and update buffers
-        if self.emission_type == "gaussian":
-            self.mu.copy_(base)
-            var = torch.nn.functional.softplus(self.log_var).clamp_min(self.min_covar)
-            cov = torch.diag_embed(var)
-            I = torch.eye(F, device=device)
-            for k in range(K):
-                jitter = self.min_covar
-                for _ in range(5):
-                    _, info = torch.linalg.cholesky_ex(cov[k])
-                    if torch.all(info == 0):
-                        break
-                    cov[k] += jitter * I
-                    jitter *= 2
-            self._emission_covs.copy_(cov)
-            self.log_var.copy_(torch.log(torch.diagonal(cov, dim1=-2, dim2=-1).clamp_min(EPS)))
+        if tensor.ndim == 2:  # [K, F] -> [1, 1, K, F]
+            K, F = tensor.shape
+            tensor = tensor.view(1, 1, K, F)
+        elif tensor.ndim == 3:  # [K, F, something] unexpected but handled
+            tensor = tensor.unsqueeze(0)  # prepend batch dim
 
-        elif self.emission_type in {"laplace", "studentt"}:
-            self.loc.copy_(base)
-            scale = torch.full_like(base, 0.1) if getattr(self, "scale_param", None) is None else self.scale_param
-            self.scale_param.copy_(scale)
-            self._emission_covs.copy_(torch.diag_embed(scale**2))
-            self._emission_means.copy_(base)
-
-        else:  # Discrete emissions
-            if self.emission_type in {"categorical", "bernoulli"}:
-                self.logits.copy_(base)
-            elif self.emission_type == "poisson":
-                self.log_rate.copy_(base)
-            self._emission_params.copy_(base)
-
-        # Sync buffers with current parameters
-        self._reset_buffers()
-        self._invalidate_cache()
-
-        return self._get_dist(context=context, temperature=None)
-
-    @property
-    def _dist(self):
-        if self.emission_type in {"gaussian"}:
-            self._dist_type = MultivariateNormal
-        elif self.emission_type in {"laplace", "studentt"}:
-            self._dist_type = lambda **kwargs: Independent(StudentT(**kwargs), 1)
-        elif self.emission_type == "categorical":
-            self._dist_type = Categorical
-        elif self.emission_type == "bernoulli":
-            self._dist_type = lambda **kwargs: Independent(Bernoulli(**kwargs), 1)
-        elif self.emission_type == "poisson":
-            self._dist_type = lambda **kwargs: Independent(Poisson(**kwargs), 1)
-        return self._dist_type
-
-    def _apply_constraints(self, tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        if tensor is None: return None
-        if self.emission_type in {"categorical", "bernoulli", "poisson"}:
-            tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1e6, neginf=-1e6)
-            return tensor.clamp(-MAX_LOGITS, MAX_LOGITS)
         return tensor
 
-    def _modulate(
-        self,
-        base: Optional[torch.Tensor] = None,
-        context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        timestep: Optional[int] = None,
-        grad_safe: bool = False) -> torch.Tensor:
+    @torch.no_grad()
+    def initialize(self, context: Optional[torch.Tensor] = None, mode: Optional[str] = None):
+        K, F = self.n_states, self.n_features
+        mode = mode or getattr(self, "init_mode", "spread")
 
-        if base is None:
-            base = getattr(self, self._params[self.emission_type])
+        if mode == "random":
+            init_mean = torch.randn(K, F, dtype=DTYPE) * 0.1
+        elif mode == "spread":
+            init_mean = torch.zeros(K, F, dtype=DTYPE)
+            for f in range(F):
+                linspace = torch.linspace(-1.0, 1.0, steps=K, dtype=DTYPE)
+                init_mean[:, f] = linspace[torch.randperm(K)]
+            init_mean += torch.randn_like(init_mean) * 0.05
+        else:
+            raise ValueError(f"Unsupported mode: {mode}")
 
         if context is not None:
-            # _apply_context returns Δ with the SAME SHAPE as base
-            delta = super()._apply_context(
-                base=base,
-                context=context,      # CAN BE (B,H) or (B,T,H) or (S,B,T,H)
-                timestep=timestep
-            )
-            if context.numel() == 0: return base  # skip projection
-            mod = base + delta
-        else:
-            mod = base
+            init_mean = self._modulate(base=init_mean, context=context, grad_safe=True)
 
-        if self.emission_type in {"categorical", "bernoulli", "poisson"}:
-            tau = temperature if temperature is not None else self.temperature
-            mod = mod / max(tau, EPS)
+        mean_spread = init_mean.std(dim=0, keepdim=True).clamp_min(1e-2)
+        init_var = mean_spread ** 2 + torch.rand(K, F, dtype=DTYPE) * 0.01
 
-        mod = self._apply_constraints(mod)
+        if self.emission_type == "gaussian":
+            self.mu.copy_(init_mean)
+            self.log_var.copy_(torch.log(init_var))
+        else:  # student-t
+            self.loc.copy_(init_mean)
+            self.scale_param.copy_(init_var.sqrt())
 
-        if self.cache_enabled:
-            key = f"{self._context_hash(context)}-T{timestep}-Temp{temperature}"
-            self._cache[key] = mod.clone().detach() if grad_safe else mod.clone()
+        self._reset_buffers(), self._invalidate_cache()
+        base = self.mu if self.emission_type == "gaussian" else self.loc
+        return self._get_dist(base)
+
+    def _apply_context(self,
+        base: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+        timestep: Optional[int] = None,
+        grad_scale: Optional[float] = None) -> torch.Tensor:
+
+        delta = super()._apply_context(
+            base,
+            context=context,
+            timestep=timestep,
+            grad_scale=grad_scale,
+            skip_adapters=True
+        )
+        if delta.ndim < base.ndim:
+            delta = delta.unsqueeze(1)  # [B,1,...] -> [B,n_states,...] via broadcasting later
+        return delta
+
+    def _modulate(self,
+        base: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+        temperature: Optional[float] = None,
+        timestep: Optional[int] = None, grad_safe: bool = False) -> torch.Tensor:
+
+        if context is None or not self.modulate_var:
+            return base
+
+        if context.ndim == 3 and context.shape[1] == 1:
+            context = context.squeeze(1)
+
+        delta = self._apply_context(base=base, context=context, timestep=timestep)
+        while delta.ndim < base.ndim:
+            delta = delta.unsqueeze(1)
+
+        tau = float(self.temperature if temperature is None else max(temperature, EPS))
+        mod = self._apply_constraints(base + delta)
+        mod = self._apply_temperature(mod, tau)
 
         return mod.detach() if grad_safe else mod
 
-    def _dist_params(self, logits: torch.Tensor, **dist_kwargs) -> Dict[str, torch.Tensor]:
+    def _apply_constraints(self, tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """No-op constraint hook kept for API compatibility."""
+        return tensor
+
+    def _dist_params(self, loc: torch.Tensor, **dist_kwargs) -> dict:
+        """Return distribution parameters compatible with _dist factory."""
         if self.emission_type == "gaussian":
             var = F.softplus(self.log_var).clamp_min(self.min_covar)
-            return {"loc": logits, "cov": torch.diag_embed(var), **dist_kwargs}
+            cov = torch.diag_embed(var)
+            return {"loc": loc, "covariance_matrix": cov, **dist_kwargs}
 
-        if self.emission_type in {"laplace", "studentt"}:
-            scale = self.scale_param.clamp_min(self.min_covar)
-            return {"loc": logits, "scale": scale, **dist_kwargs}
+        # Student-t
+        scale = F.softplus(self.scale_param).clamp_min(self.min_covar)
+        return {"loc": loc, "scale": scale, **dist_kwargs}
 
-        return {"logits": logits, **dist_kwargs}
-
-    def _get_dist(
-        self,
+    def _get_dist(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
-        timestep: Optional[float] = None,
-        **dist_kwargs):
-        """
-        Return a PyTorch distribution object for the current emission parameters.
-        Safe across continuous/discrete emission types and any context shapes.
-        """
-        # --- Modulate base parameters by context / temperature ---
-        mod_logits = self._modulate(context=context, temperature=temperature, timestep=timestep)
-
-        # --- Get distribution parameters ---
-        params = self._dist_params(mod_logits, **dist_kwargs)
-
-        # Ensure all dict values are tensors
-        for k, v in params.items():
-            if not isinstance(v, torch.Tensor):
-                params[k] = torch.tensor(v, dtype=DTYPE, device=mod_logits.device)
-
-        # Apply tensor shaping for 2D parameters only
-        shaped = {k: self._tensor_shape(v) if isinstance(v, torch.Tensor) and v.ndim == 2 else v
-                  for k, v in params.items()}
-
-        # --- Continuous emissions ---
-        if self.emission_type == "gaussian":
-            return MultivariateNormal(loc=shaped["loc"], covariance_matrix=shaped["cov"])
-        if self.emission_type == "laplace":
-            return Independent(Laplace(loc=shaped["loc"], scale=shaped["scale"]), 1)
-        if self.emission_type == "studentt":
-            return Independent(StudentT(loc=shaped["loc"], scale=shaped["scale"], df=self.dof), 1)
-
-        # --- Discrete emissions ---
-        if self.emission_type == "categorical":
-            return Categorical(logits=shaped["logits"])
-        if self.emission_type == "bernoulli":
-            return Independent(Bernoulli(logits=shaped["logits"]), 1)
-        if self.emission_type == "poisson":
-            rate = shaped["logits"].exp().clamp_min(EPS)
-            return Independent(Poisson(rate=rate), 1)
-
-        # --- Fallback ---
-        return self._dist(**self._dist_params(mod_logits, **dist_kwargs))
+        timestep: Optional[int] = None, **dist_kwargs):
+        base = self.mu if self.emission_type == "gaussian" else self.loc
+        base = self._modulate(base=base, context=context, timestep=timestep)
+        base = self._tensor_shape(base)
+        return self._dist(**self._dist_params(base, **dist_kwargs))
 
     def forward(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
-        return_dist: bool = False):
-        dist = self._get_dist(context=context, temperature=temperature)
-        
+        return_dist: bool = False, **dist_kwargs):
+
+        dist = self._get_dist(context=context, temperature=temperature, **dist_kwargs)
         if return_dist: return dist
 
         if self.emission_type == "gaussian":
-            return dist.mean, dist.covariance_matrix
-        elif self.emission_type in {"laplace", "studentt"}:
-            return dist.loc, dist.scale
-        elif self.emission_type in {"bernoulli", "categorical", "poisson"}:
-            # For discrete distributions, loc=probs/logits, scale=None
-            if hasattr(dist, "probs"):
-                loc = dist.probs
-            elif hasattr(dist, "logits"):
-                loc = torch.nn.functional.softmax(dist.logits, dim=-1)
-            else:
-                loc = None
-            return loc, None
-        else:
-            # fallback to modulation for any custom emission type
-            return self._modulate(), None
+            return self._tensor_shape(dist.mean), self._tensor_shape(dist.covariance_matrix)
+
+        return self._tensor_shape(dist.loc), self._tensor_shape(dist.scale)
 
     def log_prob(self,
         x: torch.Tensor,
         context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        **dist_kwargs) -> torch.Tensor:
-
-        dist = self._get_dist(context=context, temperature=temperature, **dist_kwargs)
+        temperature: Optional[float] = None, **dist_kwargs) -> torch.Tensor:
         K, F = self.n_states, self.n_features
 
-        # Ensure batch & time dimensions
+        dist = self._get_dist(context=context, temperature=temperature, **dist_kwargs)
+
         if x.ndim == 1:
             x = x.view(1, 1, F)
         elif x.ndim == 2:
-            x = x.view(x.shape[0], 1, F)
-        B, T, _ = x.shape
+            x = x.unsqueeze(0)
 
-        # Continuous emissions
-        if self.emission_type in {"gaussian", "laplace", "studentt", "bernoulli", "poisson"}:
-            if self.emission_type == "bernoulli":
-                x = (x > 0).float()
-            elif self.emission_type == "poisson":
-                x = x.clamp_min(0).round()
-            # Expand to (B, T, K, F) for distribution
-            x_exp = x.unsqueeze(2).expand(B, T, K, F)
-            return dist.log_prob(x_exp)
-
-        # Categorical emission
-        elif self.emission_type == "categorical":
-            if F != 1:
-                raise ValueError(f"Categorical emission expects n_features=1, got {F}")
-            x_int = x.long().squeeze(-1)
-            logits = dist.logits.squeeze(-1).view(1, 1, K).expand(B, T, K)
-            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-            return log_probs.gather(-1, x_int.unsqueeze(-1)).squeeze(-1)
-
-        else:
-            raise ValueError(f"Unsupported emission_type: {self.emission_type}")
+        x = x.unsqueeze(2).expand(-1, -1, K, -1)
+        logp = dist.log_prob(x)
+        if logp.ndim == 4:
+            logp = logp.sum(-1)
+        return logp
 
     def expect_probs(self,
         context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        **dist_kwargs) -> torch.Tensor:
-        """
-        Returns expected probabilities for each state:
-        - Categorical/Bernoulli: exact probabilities
-        - Gaussian/Laplace/StudentT: approximated via normalization
-        - Poisson: normalized mean as probability approximation
-        """
+        temperature: Optional[float] = None, **dist_kwargs) -> torch.Tensor:
+
         dist = self._get_dist(context=context, temperature=temperature, **dist_kwargs)
+        loc = dist.mean if self.emission_type == "gaussian" else dist.base_dist.loc
+        loc = self._tensor_shape(loc)
+        if loc.ndim == 4:
+            loc = loc.mean(-1)
+        return torch.softmax(loc, dim=-1)
+
+    @torch.no_grad()
+    def update(self,
+        X: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None,
+        posterior: Optional[torch.Tensor] = None,
+        update_rate: Optional[float] = None):
+
+        if X is None or posterior is None: return
+
+        lr = 1.0 if update_rate is None else update_rate
         K, F = self.n_states, self.n_features
 
-        if self.emission_type in {"categorical"}:
-            # Exact categorical probabilities (B, T, K)
-            probs = torch.nn.functional.softmax(dist.logits.squeeze(-1), dim=-1)
-            return probs
+        Xf = X.reshape(-1, F)
+        w = posterior.reshape(-1, K).clamp_min(EPS)
+        Nk = w.sum(dim=0)
 
-        elif self.emission_type == "bernoulli":
-            # Probability of 1 (B, T, K, F)
-            return dist.probs
+        mask = Nk > self.min_covar
+        print("Nk per state:", Nk)
+        print("Update mask:", mask)
 
-        elif self.emission_type in {"gaussian", "laplace", "studentt"}:
-            # Use softmax over means as a proxy for expected state probabilities
-            loc = dist.mean if self.emission_type == "gaussian" else dist.loc
-            # Ensure (B, T, K, F)
-            if loc.ndim == 2:  # (B, K)
-                loc = loc.unsqueeze(1)  # (B, 1, K)
-            elif loc.ndim == 3:  # (B, T, K)
-                pass
-            # Average over features if multidimensional
-            if F > 1:
-                loc = loc.mean(-1)
-            return torch.nn.functional.softmax(loc, dim=-1)
+        if not mask.any(): return
+        mean = (w.T @ Xf) / Nk.unsqueeze(-1)
+        print("Computed weighted means:\n", mean)
 
-        elif self.emission_type == "poisson":
-            # Normalize expected counts as proxy probabilities
-            lam = dist.rate
-            if lam.ndim == 4:
-                lam = lam.mean(-1)  # average over features
-            return torch.nn.functional.softmax(lam, dim=-1)
+        if self.emission_type == "gaussian":
+            print("Before update mu:\n", self.mu)
+            self.mu[mask] = self.mu[mask].mul(1 - lr).add_(lr * mean[mask])
+            print("After update mu:\n", self.mu)
 
-        else:
-            raise ValueError(f"Unsupported emission_type: {self.emission_type}")
+            Xc = Xf.unsqueeze(1) - mean.unsqueeze(0)
+            var = (w.unsqueeze(-1) * Xc.pow(2)).sum(dim=0) / Nk.unsqueeze(-1)
+            var = var.clamp_min(self.min_covar)
+            print("Computed weighted variances:\n", var)
+            self.log_var[mask] = self.log_var[mask].mul(1 - lr).add_(lr * torch.log(var[mask]))
+            print("After update log_var:\n", self.log_var)
 
-    def sample(self,
-        n_samples: int = 1,
-        context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        timestep: Optional[float] = None,
-        **dist_kwargs) -> torch.Tensor:
-        dist = self._get_dist(context=context, temperature=temperature, **dist_kwargs)
+        else:  # student-t
+            print("Before update loc:\n", self.loc)
+            self.loc[mask] = self.loc[mask].mul(1 - lr).add_(lr * mean[mask])
+            print("After update loc:\n", self.loc)
 
-        # Continuous emissions use reparameterized sampling
-        if self.emission_type in {"gaussian", "laplace", "studentt"}:
-            return dist.rsample((n_samples,)).to(DTYPE)
+            Xc = Xf.unsqueeze(1) - mean.unsqueeze(0)
+            scale = (w.unsqueeze(-1) * Xc.abs()).sum(dim=0) / Nk.unsqueeze(-1)
+            scale = scale.clamp_min(self.min_covar)
+            print("Computed weighted scales:\n", scale)
+            self.scale_param[mask] = self.scale_param[mask].mul(1 - lr).add_(lr * scale[mask])
+            print("After update scale_param:\n", self.scale_param)
 
-        # Discrete or other emissions
-        s = dist.sample((n_samples,))
-        if self.emission_type == "categorical":
-            s = s.squeeze(-1)  # remove feature dimension
-        return s.to(DTYPE)
-
-    def update(
-        self,
-        new_logits: Optional[torch.Tensor] = None,
-        posterior: Optional[torch.Tensor] = None,
-        context: Optional[torch.Tensor] = None,
-        update_rate: Optional[float] = None,
-        temperature: Optional[float] = None,
-        optimizer_cls: type = torch.optim.SGD,
-        optimizer_kwargs: Optional[dict] = None,
-        update_temperature: bool = False,
-        from_probs: bool = False,
-        grad_safe: bool = False
-    ):
-        """
-        Update emission parameters (direct or posterior-based) for all emission types.
-        - Continuous: EM-style updates for mean/location and variance/scale.
-        - Discrete/Poisson: optional gradient-based soft updates using optimizer.
-        """
-        lr = update_rate or 1.0
-        optimizer_kwargs = optimizer_kwargs or {}
-        param = getattr(self, self._params[self.emission_type])
-
-        # ---------------- Direct update ----------------
-        if new_logits is not None:
-            new_logits = self._tensor_shape(new_logits, "new_logits")
-            if from_probs:
-                new_logits = torch.log(new_logits.clamp_min(EPS))
-            if self.emission_type in {"categorical", "bernoulli", "poisson"} and temperature is not None:
-                new_logits = new_logits / max(temperature, EPS)
-            with torch.no_grad():
-                param.data.mul_(1 - lr).add_(lr * new_logits)
-                # Update covariance/scale for continuous
-                if self.emission_type == "gaussian":
-                    var = F.softplus(self.log_var).clamp_min(self.min_covar)
-                    self._emission_covs.copy_(torch.diag_embed(var))
-                elif self.emission_type in {"laplace", "studentt"}:
-                    scale = F.softplus(self.scale_param).clamp_min(self.min_covar)
-                    self._emission_covs.copy_(torch.diag_embed(scale**2))
-            self._invalidate_cache()
-            return
-
-        # ---------------- Posterior-based update ----------------
-        if posterior is None:
-            return
-
-        # ---------------- Debug ----------------
-        print("DEBUG update(): param.shape =", param.shape)
-        print("DEBUG update(): posterior.shape (before reshape) =", posterior.shape)
-
-        # Continuous emissions: EM-style
-        if self.emission_type in {"gaussian", "laplace", "studentt"}:
-            # Ensure posterior shape: (N, n_states, n_features)
-            if posterior.ndim == 2:  # (N, n_states)
-                posterior = posterior.unsqueeze(-1).expand(-1, -1, param.shape[-1])
-            assert posterior.shape[-2:] == param.shape, \
-                f"Posterior shape {posterior.shape} incompatible with param {param.shape}"
-
-            # Weighted mean (location)
-            delta = (posterior * param).sum(dim=0) / posterior.sum(dim=0).clamp_min(EPS)
-            with torch.no_grad():
-                # Update location
-                param.data.mul_(1 - lr).add_(lr * delta)
-                # Update variance/scale EM-style
-                if self.emission_type == "gaussian":
-                    diff = (param - delta).pow(2).clamp_min(self.min_covar)
-                    self.log_var.data.copy_(torch.log(diff))
-                    var = F.softplus(self.log_var).clamp_min(self.min_covar)
-                    self._emission_covs.copy_(torch.diag_embed(var))
-                else:  # laplace / studentt
-                    diff = (param - delta).abs().clamp_min(self.min_covar)
-                    self.scale_param.data.copy_(diff)
-                    scale = F.softplus(self.scale_param).clamp_min(self.min_covar)
-                    self._emission_covs.copy_(torch.diag_embed(scale**2))
-
-            print("DEBUG update(): Continuous posterior applied. param updated.")
-
-        # Discrete / Poisson: gradient-based optimizer update
-        else:
-            if not param.requires_grad:
-                param.requires_grad_(True)
-
-            modulated = self._modulate(base=param, context=context, temperature=temperature, grad_safe=False)
-            posterior_norm = posterior / posterior.sum(dim=-1, keepdim=True).clamp_min(EPS)
-
-            log_probs = F.log_softmax(modulated, dim=-1)
-            loss = -(posterior_norm * log_probs).sum() / posterior_norm.sum().clamp_min(EPS)
-
-            if not hasattr(self, "_optimizer") or self._optimizer is None:
-                params = [param]
-                if update_temperature and hasattr(self, "log_temperature"):
-                    self.log_temperature.requires_grad_(True)
-                    params.append(self.log_temperature)
-                self._optimizer = optimizer_cls(params, lr=lr, **optimizer_kwargs)
-            else:
-                for pg in self._optimizer.param_groups:
-                    pg['lr'] = lr
-
-            self._optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            self._optimizer.step()
-            print("DEBUG update(): Discrete/Poisson posterior applied. param updated via optimizer.")
-
+        self._reset_buffers()
         self._invalidate_cache()
+
