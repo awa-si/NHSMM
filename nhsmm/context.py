@@ -342,6 +342,72 @@ class ContextEncoder(nn.Module):
         self._attn_vector = None
         self._mha = None
 
+    def _emcode(self,
+        sequences: torch.Tensor,
+        mask: Optional[torch.BoolTensor] = None,
+        pool: Optional[str] = None,
+        detach: bool = False):
+        """
+        HSMM / EM-facing encoding helper.
+
+        Guarantees:
+            - seq_features: [B,T,H]
+            - ctx_features: [B,1,H]
+
+        Args:
+            sequences: [B,T,F]
+            mask: optional [B,T] or [B,T,1]
+            pool: optional pooling override
+            detach: detach outputs from graph
+        """
+        if sequences.numel() == 0:
+            B, T = sequences.shape[:2]
+            H = self.context_dim
+            device, dtype = sequences.device, sequences.dtype
+            return (
+                torch.zeros(B, T, H, device=device, dtype=dtype),
+                torch.zeros(B, 1, H, device=device, dtype=dtype),
+            )
+
+        # normalize mask
+        if mask is not None:
+            if mask.ndim == 3:
+                mask = mask.squeeze(-1)
+            mask = mask.bool()
+
+        # temporary pooling override
+        old_pool = self.pool
+        if pool is not None:
+            self.pool = pool
+
+        try:
+            with torch.no_grad() if detach else contextlib.nullcontext():
+                seq_out, ctx_out, _ = self.forward(
+                    sequences,
+                    mask=mask,
+                    return_sequence=True,
+                    return_context=True,
+                    detach_context=detach,
+                )
+        finally:
+            self.pool = old_pool
+
+        if seq_out is None or ctx_out is None:
+            raise RuntimeError("ContextEncoder._emcode(): encoder returned None outputs")
+
+        # enforce canonical shapes
+        if ctx_out.ndim == 2:
+            ctx_out = ctx_out.unsqueeze(1)
+        elif ctx_out.ndim != 3 or ctx_out.shape[1] != 1:
+            ctx_out = ctx_out.mean(dim=1, keepdim=True)
+
+        if self.debug:
+            print(f"[ContextEncoder._emcode] seq={seq_out.shape}, ctx={ctx_out.shape}")
+            if mask is not None:
+                print(f"[ContextEncoder._emcode] mask sum={mask.sum(dim=1)}")
+
+        return seq_out, ctx_out
+
 
 @dataclass
 class SequenceSet:

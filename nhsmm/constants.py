@@ -5,6 +5,7 @@ import logging
 EPS = 1e-12
 MAX_LOGITS = 1e4
 DTYPE = torch.float32
+NEG_INF = torch.finfo(DTYPE).min
 DEBUG = False
 
 # -------------------------
@@ -18,7 +19,3 @@ if not logger.hasHandlers():
     formatter = logging.Formatter('[%(levelname)s] %(name)s - %(message)s')
     ch.setFormatter(formatter)
     logger.addHandler(ch)
-
-class HSMMError(ValueError):
-    """Custom error class for HSMM module."""
-    pass

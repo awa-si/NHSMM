@@ -12,24 +12,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import (
-    Distribution, Bernoulli, Laplace, MultivariateNormal,
-    Normal, Independent, Poisson, StudentT
+    Distribution, Bernoulli, Laplace, MultivariateNormal, Normal, Independent, Poisson, StudentT
 )
 
-from nhsmm.constants import DEBUG, DTYPE, EPS, MAX_LOGITS, logger
+from nhsmm.constants import DEBUG, DTYPE, EPS, logger, MAX_LOGITS, NEG_INF
 from nhsmm import constraints
 
 
 class Categorical(Distribution):
     """
-    HSMM-friendly, differentiable, broadcast-safe Categorical.
-
-    Features:
-      - Stores probs and log_probs at init to avoid repeated softmax.
-      - Integer sampling via torch.multinomial (broadcast-safe).
-      - Differentiable rsample via Gumbel-Softmax (soft / hard).
-      - log_prob supports arbitrary leading dims and negative `dim`.
-      - Fully compatible with batch/time leading dimensions.
+    A numerically stable categorical distribution supporting logits or probabilities,
+    with optional differentiable Gumbel-Softmax sampling.
     """
 
     has_rsample = True
@@ -38,15 +31,17 @@ class Categorical(Distribution):
         "probs": torch.distributions.constraints.simplex,
     }
 
-    def __init__(self,
+    def __init__(
+        self,
         logits: Optional[torch.Tensor] = None,
         probs: Optional[torch.Tensor] = None,
         validate_args: bool = False,
-        dim: int = -1):
+        dim: int = -1,
+    ):
         super().__init__(validate_args=validate_args)
-
         if (logits is None) == (probs is None):
             raise ValueError("Specify exactly one of logits or probs.")
+
         self.dim = dim
 
         if logits is not None:
@@ -85,37 +80,45 @@ class Categorical(Distribution):
         return torch.Size()
 
     def sample(self, sample_shape=torch.Size()):
+        """
+        Draw samples [sample_shape, batch_shape].
+        """
         sample_shape = torch.Size(sample_shape)
-        flattened = self._probs.reshape(-1, self._probs.shape[-1])  # [L, C]
-        idx = torch.multinomial(flattened, 1, replacement=True)  # [L,1]
-        idx = idx.reshape(*self.batch_shape)
-        if len(sample_shape) > 0:
-            idx = idx.unsqueeze(0).expand(*sample_shape, *idx.shape)
+        batch_flat = self._probs.reshape(-1, self._probs.shape[-1])
+        n_samples = int(torch.prod(torch.tensor(sample_shape, dtype=torch.int64)))
+        idx = torch.multinomial(batch_flat, n_samples, replacement=True)
+        # Reshape to [sample_shape, batch_shape]
+        idx = idx.view(*sample_shape, *self.batch_shape)
         return idx.long()
 
     def rsample(self, sample_shape=torch.Size(), temperature: float = 1.0, hard: bool = False):
+        """
+        Differentiable Gumbel-Softmax sampling.
+        """
         sample_shape = torch.Size(sample_shape)
         temperature = max(float(temperature), EPS)
 
         logits = self._logits
-        n_unsqueeze = len(sample_shape)
-        for _ in range(n_unsqueeze):
-            logits = logits.unsqueeze(0)
+        expand_shape = tuple(sample_shape) + logits.shape
+        logits_exp = logits.expand(*expand_shape)
+        return F.gumbel_softmax(logits_exp, tau=temperature, hard=hard, dim=-1)
 
-        out_shape = tuple(sample_shape) + tuple(self._logits.shape)
-        logits = logits.expand(*out_shape)
-        return F.gumbel_softmax(logits, tau=temperature, hard=hard, dim=self.dim)
-
-    def log_prob(self, value):
+    def log_prob(self, value: torch.Tensor):
+        """
+        Compute log-probabilities of indices (integers).
+        """
         value = torch.as_tensor(value, device=self._logits.device)
-        if value.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64):
-            value = value.long()
-        lp = self._log_probs
-        gather_dim = self.dim if self.dim >= 0 else lp.ndim + self.dim
-        expanded_value = value.unsqueeze(gather_dim)
-        return lp.gather(gather_dim, expanded_value).squeeze(gather_dim)
+        if not torch.is_integral(value):
+            raise ValueError("Categorical indices must be integers.")
+
+        gather_dim = self.dim if self.dim >= 0 else self._log_probs.ndim + self.dim
+        value_exp = value.unsqueeze(gather_dim)
+        return self._log_probs.gather(gather_dim, value_exp).squeeze(gather_dim)
 
     def entropy(self):
+        """
+        Shannon entropy of the categorical distribution.
+        """
         p = self._probs.clamp_min(EPS)
         return -(p * p.log()).sum(dim=self.dim)
 
@@ -219,6 +222,22 @@ class Neural(nn.Module, ABC):
         self._logits_buffer.data.copy_(self.logits.data)
         self._mod_logits_buffer.data.copy_(self.logits.data)
 
+    @torch.no_grad()
+    def reset_parameters(self, mode: Optional[str] = None):
+        mode = mode or getattr(self, "init_mode", None)
+        if not hasattr(self, "_init_params") or not mode:
+            raise RuntimeError(f"{self.__class__.__name__} does not support parameter reset")
+
+        self._init_params(mode)
+        self._reset_buffers()
+        self._invalidate_cache()
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        state = super().load_state_dict(state_dict, strict=strict)
+        self._reset_buffers()
+        self._invalidate_cache()
+        return state
+
     def _get_activation(self, name: str) -> nn.Module:
         return {
             "tanh": nn.Tanh(),
@@ -253,19 +272,7 @@ class Neural(nn.Module, ABC):
         return logits / tau
 
     def _tensor_shape(self, tensor: torch.Tensor) -> torch.Tensor:
-        """
-        Ensure `tensor` has trailing dimensions compatible with self._shape.
-        Leading dimensions are preserved; trailing dims are broadcasted if needed.
-
-        Args:
-            tensor: input tensor to reshape/expand
-            name: for error messages
-
-        Returns:
-            tensor expanded to (..., *self._shape)
-        """
-        if tensor is None:
-            return None
+        if tensor is None: return None
 
         k = len(self._shape)
         if tensor.ndim < k:
@@ -307,13 +314,8 @@ class Neural(nn.Module, ABC):
         grad_scale: Optional[float] = None,
         skip_adapters: bool = False,
         l2_normalize: bool = False) -> torch.Tensor:
-        """
-        Compute delta logits to add to base logits from context.
-        Supports scalar, batch, and sequence contexts with optional timestep selection.
-        """
-        base = self._tensor_shape(base)
 
-        # No context or context_net -> zero delta
+        base = self._tensor_shape(base)
         if context is None or context.numel() == 0 or self.context_net is None:
             return torch.zeros_like(base, requires_grad=base.requires_grad)
 
@@ -381,17 +383,12 @@ class Neural(nn.Module, ABC):
         temperature: Optional[float] = None,
         timestep: Optional[int] = None,
         grad_safe: bool = False) -> torch.Tensor:
-        """
-        Return modulated logits: base + delta, after constraints and temperature scaling.
-        Supports caching and [S,B,T,...] contexts.
-        """
-        # Cache key
+
         context_key = self._context_hash(context)
         timestep_key = f"T{timestep}" if timestep is not None else "TNone"
         temp_key = f"{float(temperature):.6g}" if temperature is not None else "None"
         key = f"{context_key}-{timestep_key}-Temp{temp_key}"
 
-        # Check cache
         if self.cache_enabled:
             cached = self._cache_get(key)
             if cached is not None:
@@ -401,8 +398,6 @@ class Neural(nn.Module, ABC):
         delta = self._apply_context(self.logits, context=context, timestep=timestep, grad_scale=None)
         mod = self._validate_logits(self.logits + delta)
         mod = self._apply_temperature(mod, temperature)
-
-        # Ensure trailing dims match logits shape
         mod = self._tensor_shape(mod)
 
         # Expand leading dims based on mode
@@ -429,32 +424,18 @@ class Neural(nn.Module, ABC):
     def _apply_constraints(self, *args, **kwargs) -> torch.Tensor:
         pass
 
-    @abstractmethod
-    def _dist_params(self, *args, **kwargs) -> Dict[str, torch.Tensor]:
-        pass
+    def _dist_params(self, logits: torch.Tensor, **dist_kwargs) -> Dict[str, torch.Tensor]:
+        return {"logits": logits, **dist_kwargs}
 
     def _get_dist(self, context=None, temperature=None, timestep=None, **dist_kwargs):
-        """Return the distribution object for the given context/temperature/timestep."""
         mod_logits = self._modulate(context=context, temperature=temperature, timestep=timestep)
         return self._dist(**self._dist_params(mod_logits, **dist_kwargs))
 
     def forward(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
-        return_dist: bool = False,
-        **dist_kwargs) -> torch.Tensor:
-        """
-        Forward pass through the distribution.
+        return_dist: bool = False, **dist_kwargs) -> torch.Tensor:
 
-        Args:
-            context: Optional context tensor for modulation.
-            temperature: Optional temperature for scaling logits.
-            return_dist: If True, return the distribution object instead of logits.
-            **dist_kwargs: Extra keyword arguments for the distribution.
-
-        Returns:
-            Modulated logits tensor, or distribution object if `return_dist=True`.
-        """
         mod_logits = self._modulate(context=context, temperature=temperature, timestep=None)
         dist = self._dist(**self._dist_params(mod_logits, **dist_kwargs))
         if return_dist: return dist
@@ -464,143 +445,76 @@ class Neural(nn.Module, ABC):
         x: torch.Tensor,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
-        timestep: Optional[int] = None,
-        **dist_kwargs) -> torch.Tensor:
-        """
-        Compute log-probabilities for scalar, batch, or sequence inputs.
-        Supports extra leading sample dimension [S,B,T,C] while preserving backward compatibility.
-        """
+        timestep: Optional[int] = None, **dist_kwargs) -> torch.Tensor:
         x_tensor = x.long()
         n_states = self._shape[-1]
 
-        # Modulate logits
         mod = self._modulate(context=context, temperature=temperature, timestep=timestep)
-
-        # Ensure last dim is states
         if mod.shape[-1] != n_states:
             raise ValueError(f"Last dim of modulated logits ({mod.shape[-1]}) != n_states ({n_states})")
 
-        # Unsqueeze mod to match x leading dims
         while mod.ndim < x_tensor.ndim:
             mod = mod.unsqueeze(0)
 
-        # Broadcast leading singleton dims
         expand_shape = []
         for xd, md in zip(x_tensor.shape, mod.shape):
             expand_shape.append(xd if md == 1 else md)
         expand_shape.append(n_states)  # last dim is states
         mod = mod.expand(*expand_shape)
 
-        # Flatten for gather
         mod_flat = mod.reshape(-1, n_states)
         x_flat = x_tensor.reshape(-1, 1)
 
-        # Compute log-probabilities
         log_probs_flat = F.log_softmax(mod_flat, dim=-1).gather(-1, x_flat).squeeze(-1)
-
-        # Reshape back to original x shape
         return log_probs_flat.view(*x_tensor.shape)
 
     def log_matrix(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
-        timestep: Optional[int] = None,
-        return_dist: bool = False,
-        **dist_kwargs):
-        """
-        Produce initial-state logits.
+        timestep: Optional[int] = None, **dist_kwargs):
 
-        Shape rules:
-            logits: [B, S]
-            dist: categorical-style distribution over S
-
-        If return_dist=True:
-            returns the constructed distribution.
-        """
         logits = self._modulate(context=context, temperature=temperature, timestep=timestep)
-
-        # Validate shape early (helps debugging)
         if logits.dim() != 2:
             raise ValueError(f"Initial.log_matrix expected logits shape [B, S], got {tuple(logits.shape)}")
-
-        if return_dist:
-            dist = self._dist(**self._dist_params(logits, **dist_kwargs))
-            return dist
-
         return logits
 
     def sample(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
-        timestep: Optional[int] = None,
-        return_dist: bool = False,
-        **dist_kwargs):
-        """
-        Draw a sample from the distribution.
+        timestep: Optional[int] = None, **dist_kwargs):
 
-        - Supports scalar, batch, and sequence inputs.
-        - Converts integer indices to one-hot vectors with last dim = n_states.
-        - Maintains leading dimensions for multiple samples [S,B,T,...].
-        """
         n_states = self._shape[-1]
         dist = self._get_dist(context=context, temperature=temperature, timestep=timestep, **dist_kwargs)
-        s = dist.sample()  # may be integer indices or already one-hot
+        s = dist.sample()
 
-        # Convert integer indices to one-hot
         if s.dtype in [torch.int64, torch.long] or s.ndim == 0:
             s = F.one_hot(s, num_classes=n_states)
-
-        # Ensure trailing dim = n_states
         if s.shape[-1] != n_states:
             s = s.view(*s.shape[:-1], n_states)
-
-        if return_dist: return dist
         return s
 
     def rsample(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
-        timestep: Optional[int] = None,
-        return_dist: bool = False,
-        **dist_kwargs) -> torch.Tensor:
-        """
-        Draw a reparameterized sample if supported, otherwise fallback to regular sample.
+        timestep: Optional[int] = None, **dist_kwargs) -> torch.Tensor:
 
-        Supports:
-            - Scalar, batch, and sequence inputs ([B], [B,T], [S,B,T,...])
-            - Automatic one-hot conversion if distribution returns integer indices
-            - Preserves leading dimensions for multiple samples
-        """
-        dist = self._get_dist(context, temperature, timestep, **dist_kwargs)
-
-        # Draw sample using rsample if supported, else fallback
-        s = dist.rsample() if getattr(dist, "has_rsample", False) else dist.sample()
         n_states = self._shape[-1]
+        dist = self._get_dist(context, temperature, timestep, **dist_kwargs)
+        s = dist.rsample() if getattr(dist, "has_rsample", False) else dist.sample()
 
-        # Convert integer indices to one-hot
         if s.dtype in [torch.int64, torch.long] or s.ndim == 0:
             s = F.one_hot(s, num_classes=n_states)
-
-        # Ensure trailing dim matches number of states
         if s.shape[-1] != n_states:
             s = s.view(*s.shape[:-1], n_states)
-
-        if return_dist:
-            return dist
-
         return s
 
-    def expected_probs(self, context: Optional[torch.Tensor] = None, temperature: Optional[float] = None, timestep: Optional[int] = None, return_dist: bool = False, **dist_kwargs):
-        """Return expected probabilities or the distribution itself."""
+    def expected_probs(self, context: Optional[torch.Tensor] = None, temperature: Optional[float] = None, timestep: Optional[int] = None, **dist_kwargs):
         mod_logits = self._modulate(context=context, temperature=temperature, timestep=timestep)
-        dist = self._dist(**self._dist_params(mod_logits, **dist_kwargs))
-        return dist if return_dist else F.softmax(mod_logits, dim=-1)
+        return F.softmax(mod_logits, dim=-1)
 
-    def mode(self, context: Optional[torch.Tensor] = None, temperature: Optional[float] = None, timestep: Optional[int] = None, return_dist: bool = False, **dist_kwargs):
-        """Return the mode of the distribution."""
+    def mode(self, context: Optional[torch.Tensor] = None, temperature: Optional[float] = None, timestep: Optional[int] = None, **dist_kwargs):
+
         dist = self._get_dist(context, temperature, timestep=timestep, **dist_kwargs)
-        if return_dist:
-            return dist
         if hasattr(dist, "mode"):
             return dist.mode
         if hasattr(dist, "probs"):
@@ -628,7 +542,6 @@ class Neural(nn.Module, ABC):
         self._dist_factory = value
 
     def _context_hash(self, context: Optional[torch.Tensor]) -> str:
-        """Generate a stable hash for context and current parameter version."""
         if context is None:
             return f"none-v{int(self._param_version.item())}"
 
@@ -655,6 +568,7 @@ class Neural(nn.Module, ABC):
         self._param_version += 1
         self._cache.clear()
 
+    @torch.no_grad()
     def update(
         self,
         new_logits: Optional[torch.Tensor] = None,
@@ -662,76 +576,48 @@ class Neural(nn.Module, ABC):
         context: Optional[torch.Tensor] = None,
         update_rate: Optional[float] = None,
         temperature: Optional[float] = None,
-        optimizer_cls: type = torch.optim.SGD,
-        optimizer_kwargs: Optional[dict] = None,
         update_temperature: bool = False,
         from_probs: bool = False,
         grad_safe: bool = False):
-        """
-        Update logits (and optionally log_temperature) using new_logits or posterior.
-        Safe for any context shape using _tensor_shape.
-        """
-        lr = update_rate or 1.0
-        optimizer_kwargs = optimizer_kwargs or {}
 
-        # -------------------- Direct new_logits update --------------------
+        lr = float(update_rate) if update_rate is not None else 1.0
         if new_logits is not None:
             if from_probs:
                 new_logits = torch.log(new_logits.clamp_min(EPS))
+
             if temperature is not None:
-                new_logits = new_logits / max(temperature, EPS)
+                new_logits = self._apply_temperature(new_logits, temperature)
 
             new_logits = self._tensor_shape(new_logits)
             if new_logits.shape != self.logits.shape:
-                lead_dims = new_logits.ndim - len(self._shape)
-                if lead_dims > 0:
-                    new_logits = new_logits.mean(dim=tuple(range(lead_dims)))
+                lead = new_logits.ndim - len(self._shape)
+                if lead > 0:
+                    new_logits = new_logits.mean(dim=tuple(range(lead)))
 
-            with torch.no_grad():
-                self.logits.data.mul_(1 - lr).add_(lr * new_logits)
+            self.logits.data.mul_(1.0 - lr).add_(lr * new_logits)
             self._reset_buffers()
             self._invalidate_cache()
             return
 
-        # -------------------- Posterior-based update --------------------
-        if posterior is None:
-            return
-
-        # Enable gradients
-        if not self.logits.requires_grad:
-            self.logits.requires_grad_(True)
-        if update_temperature and not self.log_temperature.requires_grad:
-            self.log_temperature.requires_grad_(True)
-
-        # Compute modulated logits
-        mod_logits = self._modulate(context=context, temperature=temperature, grad_safe=False)
-
-        # Normalize posterior safely
+        if posterior is None: return
         psum = posterior.sum(dim=-1, keepdim=True)
         posterior = posterior / psum.clamp_min(EPS)
+        posterior = self._tensor_shape(posterior)
 
-        # Ensure trailing dims match logits
-        posterior = self._tensor_shape(posterior).expand_as(mod_logits)
+        if posterior.shape != self.logits.shape:
+            lead = posterior.ndim - len(self._shape)
+            if lead > 0:
+                posterior = posterior.mean(dim=tuple(range(lead)))
 
-        # Compute cross-entropy loss
-        log_probs = F.log_softmax(mod_logits, dim=-1)
-        loss = -(posterior * log_probs).sum() / posterior.sum().clamp_min(EPS)
+        new_logits = torch.log(posterior.clamp_min(EPS))
+        if temperature is not None:
+            new_logits = new_logits / max(float(temperature), EPS)
 
-        # Persistent optimizer
-        if not hasattr(self, "_optimizer") or self._optimizer is None:
-            params = [self.logits]
-            if update_temperature:
-                params.append(self.log_temperature)
-            self._optimizer = optimizer_cls(params, lr=lr, **optimizer_kwargs)
-        else:
-            for pg in self._optimizer.param_groups:
-                pg['lr'] = lr
+        self.logits.data.mul_(1.0 - lr).add_(lr * new_logits)
+        if update_temperature:
+            entropy = -(posterior * new_logits).sum(dim=-1).mean()
+            self.log_temperature.data.copy_(entropy.clamp_min(EPS).log())
 
-        self._optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        self._optimizer.step()
-
-        # Update buffers and cache
         self._reset_buffers()
         self._invalidate_cache()
 
@@ -759,10 +645,9 @@ class Initial(Neural):
             final_activation="tanh",
         )
 
-        # Initialize logits
         self._init_params(mode=init_mode)
 
-    def _init_params(self, mode: str, jitter: float = 1e-3) -> torch.Tensor:
+    def _init_params(self, mode: str, jitter: float = 1e-5) -> torch.Tensor:
         if mode == "uniform":
             logits = torch.full((self.n_states,), -math.log(self.n_states), dtype=DTYPE)
         elif mode == "biased":
@@ -773,27 +658,22 @@ class Initial(Neural):
         else:
             raise ValueError(f"Unknown init_mode '{mode}'")
 
-        # Add small jitter to break exact ties
         if jitter > 0.0:
             logits = logits + torch.randn_like(logits) * jitter
 
         logits = self._validate_logits(logits)
         self.logits.data.copy_(logits)
+
         self._reset_buffers()
         self._invalidate_cache()
-        return logits
 
     @torch.no_grad()
     def initialize(self, mode: str = "uniform", context: Optional[torch.Tensor] = None, **dist_kwargs) -> Distribution:
-        logits = self._init_params(mode)
-        return self._dist(**self._dist_params(logits, **dist_kwargs))
+        self._init_params(mode)
+        self._invalidate_cache()
+        return self._dist(**self._dist_params(self.logits, **dist_kwargs))
 
-    def _dist_params(self, logits: torch.Tensor, **dist_kwargs) -> Dict[str, torch.Tensor]:
-        return {"logits": logits, **dist_kwargs}
-
-    def _apply_constraints(self,
-        logits: torch.Tensor,
-        mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _apply_constraints(self, logits: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         logits = torch.clamp(logits, min=-1e6, max=1e6)
         if mask is not None:
             logits = logits.masked_fill(~mask, -1e9)
@@ -813,46 +693,28 @@ class Initial(Neural):
         )
 
     def _modulate(self, context=None, temperature=None, timestep=None, grad_safe=False):
-        tau = float(self.temperature if temperature is None else max(temperature, EPS))
         logits = super()._modulate(context=context, temperature=temperature, timestep=timestep, grad_safe=grad_safe)
-        logits = logits / tau  # scale logits by temperature
+        logits = self._apply_constraints(logits)
         return logits
 
-    def log_matrix(self, context=None, temperature=None, timestep=None, return_dist=False, T=None, **dist_kwargs):
+    def log_matrix(self, context=None, temperature=None, timestep=None, T=None, **dist_kwargs):
         logits = self._modulate(context=context, temperature=temperature, timestep=timestep)
-        
-        # Ensure batch dimension
+
         if logits.ndim == 1:          # [K]
             logits = logits.unsqueeze(0)  # [1, K]
-        
-        # Ensure batch + timestep dimension
         if logits.ndim == 2:          # [B, K]
             logits = logits.unsqueeze(1)  # [B, 1, K]
-
-        # Broadcast T if provided
         if T is not None and logits.shape[1] == 1:
             logits = logits.expand(-1, T, -1)  # [B, T, K]
-
-        if return_dist:
-            return self._dist(**self._dist_params(logits, **dist_kwargs))
         return logits  # [B, T, K]
 
     def expected_probs(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
-        timestep: Optional[int] = None,
-        return_dist: bool = False,
-        **dist_kwargs):
+        timestep: Optional[int] = None, **dist_kwargs):
 
         mod = self._modulate(context=context, temperature=temperature, timestep=timestep)
-        dist = self._dist(**self._dist_params(mod, **dist_kwargs))
-        if return_dist:
-            return dist
-
         probs = F.softmax(mod, dim=-1)
-
-        # Canonicalize shape for consistency: always [B,T,K]
-        # (Initial has no duration dim)
         if probs.ndim == 1:          # (K,)
             probs = probs.unsqueeze(0).unsqueeze(0)
         elif probs.ndim == 2:        # (B,K)
@@ -860,37 +722,48 @@ class Initial(Neural):
 
         return probs
 
-    def update(self,
+    @torch.no_grad()
+    def update(
+        self,
         new_logits: Optional[torch.Tensor] = None,
         posterior: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
-        optimizer_cls: type = torch.optim.SGD,
-        optimizer_kwargs: Optional[dict] = None,
         update_rate: Optional[float] = None,
         temperature: Optional[float] = None,
         update_temperature: bool = False,
         from_probs: bool = False,
         grad_safe: bool = False):
-        """
-        Wrapper around Neural.update() ensuring safe tensor shapes for Initial.
-        """
-        # Ensure trailing dims match _shape before delegating
+
         if new_logits is not None:
             new_logits = self._tensor_shape(new_logits)
-        if posterior is not None:
-            posterior = self._tensor_shape(posterior)
+            if new_logits.ndim > 1:
+                new_logits = new_logits.mean(dim=tuple(range(new_logits.ndim - 1)))
+
+            super().update(
+                new_logits=new_logits,
+                context=None,
+                update_rate=update_rate,
+                temperature=temperature,
+                from_probs=from_probs,
+                update_temperature=update_temperature,
+                grad_safe=grad_safe
+            )
+            return
+
+        if posterior is None: return
+        posterior = self._tensor_shape(posterior)
+
+        # Accept [B,K], [B,T,K], [S,B,T,K]
+        if posterior.ndim >= 3: posterior = posterior[..., 0, :]
+        posterior = posterior / posterior.sum(dim=-1, keepdim=True).clamp_min(EPS)
+        posterior = posterior.mean(dim=tuple(range(posterior.ndim - 1)))
 
         super().update(
-            new_logits=new_logits,
             posterior=posterior,
-            context=context,
+            context=None,
             update_rate=update_rate,
-            temperature=temperature,
-            from_probs=from_probs,
-            grad_safe=grad_safe,
-            optimizer_cls=optimizer_cls,
-            optimizer_kwargs=optimizer_kwargs,
-            update_temperature=update_temperature
+            update_temperature=update_temperature,
+            grad_safe=grad_safe
         )
 
 
@@ -907,6 +780,7 @@ class Duration(Neural):
         init_mode: str = "uniform",
         temperature: float = 1.0,
     ):
+        self.init_mode = init_mode
         self.n_states = int(n_states)
         self.max_duration = int(max_duration)
         self._shape = (self.n_states, self.max_duration)
@@ -922,15 +796,13 @@ class Duration(Neural):
             activation="tanh",
             final_activation="tanh",
         )
-
-        self.log_duration = nn.Parameter(torch.zeros(self._shape, dtype=DTYPE))
         self._init_params(mode=init_mode)
 
     @torch.no_grad()
     def _init_params(self, mode: str) -> torch.Tensor:
         if mode == "uniform":
             logits = torch.full(self._shape, -math.log(self.max_duration), dtype=DTYPE)
-        elif mode == "short_bias":
+        elif mode == "biased":
             w = torch.linspace(0.7, 0.3, self.max_duration, dtype=DTYPE)
             w = w.unsqueeze(0).expand(self.n_states, -1)
             w = (w / w.sum(dim=1, keepdim=True)).clamp_min(EPS)
@@ -944,45 +816,34 @@ class Duration(Neural):
 
         logits = self._validate_logits(logits)
         self.logits.data.copy_(logits)
+
         self._reset_buffers()
-        return logits
+        self._invalidate_cache()
 
     @torch.no_grad()
     def initialize(self, mode: str = "uniform", context: Optional[torch.Tensor] = None, **dist_kwargs) -> Distribution:
-        logits = self._init_params(mode)
-        self._invalidate_cache()
-        return self._dist(**self._dist_params(logits, **dist_kwargs))
+        self._init_params(mode)
+        return self._dist(**self._dist_params(self.logits, **dist_kwargs))
 
     def _apply_constraints(self, logits: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # All durations valid by default; placeholder for future per-state masking
-        return logits
+        return logits - logits.logsumexp(dim=-1, keepdim=True)
 
-    def _apply_context(
-        self,
+    def _apply_context(self,
         base: torch.Tensor,
         context: Optional[torch.Tensor] = None,
         timestep: Optional[int] = None,
         grad_scale: Optional[float] = None) -> torch.Tensor:
-        """
-        Returns only the delta to add to the base (which already includes log_duration).
-        Avoids double-counting log_duration in _modulate.
-        """
-        if context is None or self.context_net is None:
-            return torch.zeros_like(base, requires_grad=base.requires_grad)
         return super()._apply_context(base, context=context, timestep=timestep, grad_scale=grad_scale, skip_adapters=True)
 
-    def _modulate(
-        self,
+    def _modulate(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
         timestep: Optional[int] = None,
         grad_safe: bool = False) -> torch.Tensor:
 
-        # Base tensor includes log_duration exactly once
-        base = self._tensor_shape(self.logits + self.log_duration)
+        base = self._tensor_shape(self.logits)
         tau = float(self.temperature if temperature is None else max(temperature, EPS))
 
-        # Cache key
         key = f"duration-{self._context_hash(context)}-T{tau:.6g}"
         if timestep is not None:
             key += f"-step{int(timestep)}"
@@ -992,10 +853,8 @@ class Duration(Neural):
             if cached is not None:
                 return cached.clone().detach() if grad_safe else cached.clone()
 
-        # Compute delta from context
         delta = self._apply_context(base, context=context, timestep=timestep)
-        mod = base + delta
-        mod = self._apply_constraints(mod)
+        mod = self._apply_constraints(base + delta)
         mod = self._validate_logits(mod)
         mod = self._apply_temperature(mod, tau)
 
@@ -1004,54 +863,27 @@ class Duration(Neural):
 
         return mod.detach() if grad_safe else mod
 
-    def _dist_params(self, logits: torch.Tensor, **dist_kwargs) -> Dict[str, torch.Tensor]:
-        return {"logits": logits, **dist_kwargs}
-
     def _get_dist(self, context: Optional[torch.Tensor] = None, temperature: Optional[float] = None, timestep: Optional[int] = None, **dist_kwargs):
         mod = self._modulate(context=context, temperature=temperature, timestep=timestep)
         return self._dist(**self._dist_params(mod, **dist_kwargs))
 
-    def log_matrix(self, context=None, temperature=None, timestep=None, return_dist=False, T=None, **dist_kwargs):
+    def log_matrix(self, context=None, temperature=None, timestep=None, T=None, **dist_kwargs):
         mod = self._modulate(context=context, temperature=temperature, timestep=timestep)
         logp = F.log_softmax(mod, dim=-1)  # [B, K, Dmax] or [K, Dmax]
-
-        # Ensure batch dimension
         if logp.ndim == 2:  # [K, Dmax]
             logp = logp.unsqueeze(0)  # [1, K, Dmax]
-        
-        # Add timestep dimension for forward
         logp = logp.unsqueeze(1) if logp.ndim == 3 else logp  # [B, 1, K, Dmax]
-
-        # Broadcast T if provided
         if T is not None and logp.shape[1] == 1:
             logp = logp.expand(-1, T, -1, -1)  # [B, T, K, Dmax]
-
-        if return_dist:
-            dist = self._dist(**self._dist_params(mod, **dist_kwargs))
-            return dist
-
         return logp  # [B, T, K, Dmax]
 
     def expected_probs(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
-        timestep: Optional[int] = None,
-        return_dist: bool = False,
-        **dist_kwargs):
-        """
-        Return expected probabilities for durations, with optional distribution object.
+        timestep: Optional[int] = None, **dist_kwargs):
 
-        Shapes are canonicalized to [S,B,T,K,D] where possible.
-        """
         mod = self._modulate(context=context, temperature=temperature, timestep=timestep)
-        dist = self._dist(**self._dist_params(mod, **dist_kwargs))
-        
-        if return_dist:
-            return dist
-
         probs = F.softmax(mod, dim=-1)
-
-        # Squeeze leading singleton dims intelligently
         if self._process_mode == "scalar":
             probs = probs.squeeze(0).squeeze(0)        # -> (K,D)
         elif self._process_mode in ("batch", "sequence"):
@@ -1060,58 +892,65 @@ class Duration(Neural):
         elif self._process_mode == "sample_batch":
             while probs.ndim > 4 and probs.shape[2] == 1:
                 probs = probs.squeeze(2)               # remove timestep dim
-
         return probs
 
     def sample(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
-        timestep: Optional[int] = None,
-        return_dist: bool = False,
-        **dist_kwargs):
+        timestep: Optional[int] = None, **dist_kwargs):
         dist = self._get_dist(context, temperature, timestep, **dist_kwargs)
         s = dist.sample()  # categorical sample (int indices)
-
-        # convert to one-hot with trailing dim = max_duration
         s_onehot = F.one_hot(s.long(), num_classes=self.max_duration)
         s_onehot = s_onehot.to(dtype=DTYPE)
-
-        if return_dist:
-            return dist
         return s_onehot
 
+    @torch.no_grad()
     def update(self,
         new_logits: Optional[torch.Tensor] = None,
         posterior: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
-        optimizer_cls: type = torch.optim.SGD,
-        optimizer_kwargs: Optional[dict] = None,
         update_rate: Optional[float] = None,
         temperature: Optional[float] = None,
-        update_temperature: bool = False,
         from_probs: bool = False,
         grad_safe: bool = False):
-        """
-        Wrapper around Neural.update() ensuring safe tensor shapes for Initial.
-        """
-        # Ensure trailing dims match _shape before delegating
-        if new_logits is not None:
-            new_logits = self._tensor_shape(new_logits)
-        if posterior is not None:
-            posterior = self._tensor_shape(posterior)
 
-        super().update(
-            new_logits=new_logits,
-            posterior=posterior,
-            context=context,
-            update_rate=update_rate,
-            temperature=temperature,
-            from_probs=from_probs,
-            grad_safe=grad_safe,
-            optimizer_cls=optimizer_cls,
-            optimizer_kwargs=optimizer_kwargs,
-            update_temperature=update_temperature
-        )
+        lr = float(update_rate) if update_rate is not None else 1.0
+        if new_logits is not None:
+            logits = self._tensor_shape(new_logits)
+
+            # Reduce to [K, D]
+            if logits.ndim > 2:
+                logits = logits.mean(dim=tuple(range(logits.ndim - 2)))
+            if from_probs:
+                logits = torch.log(logits.clamp_min(EPS))
+            if temperature is not None:
+                logits = self._apply_temperature(logits, temperature)
+
+            self.logits.data.mul_(1.0 - lr).add_(lr * logits)
+
+            self._reset_buffers()
+            self._invalidate_cache()
+            return
+
+        if posterior is None: return
+        posterior = self._tensor_shape(posterior)
+
+        # Accept:
+        #   [K, D]
+        #   [B, K, D]
+        #   [B, T, K, D]
+        #   [S, B, T, K, D]
+        if posterior.ndim > 2:
+            posterior = posterior / posterior.sum(dim=-1, keepdim=True).clamp_min(EPS)
+            posterior = posterior.mean(dim=tuple(range(posterior.ndim - 2)))
+
+        # posterior → [K, D]
+        posterior = posterior.clamp_min(EPS)
+        target_logits = torch.log(posterior)
+        self.logits.data.mul_(1.0 - lr).add_(lr * target_logits)
+
+        self._reset_buffers()
+        self._invalidate_cache()
 
 
 class Transition(Neural):
@@ -1125,9 +964,10 @@ class Transition(Neural):
         context_dim: Optional[int] = None,
         hidden_dim: Optional[int] = None,
         transition_type: Union[str, constraints.Transitions] = "ergodic",
-        init_mode: str = "diag_bias",
+        init_mode: str = "biased",
         temperature: float = 1.0,
     ):
+        self.init_mode = init_mode
         self.n_states = int(n_states)
         self._shape = (n_states, n_states)
         self.transition_type = constraints._resolve_type(transition_type, constraints.Transitions)
@@ -1146,7 +986,7 @@ class Transition(Neural):
     def _init_params(self, mode: str) -> torch.Tensor:
         if mode == "uniform":
             logits = torch.full(self._shape, -math.log(self.n_states), dtype=DTYPE)
-        elif mode == "diag_bias":
+        elif mode == "biased":
             m = torch.full(self._shape, 0.1, dtype=DTYPE)
             m.fill_diagonal_(0.7)
             m /= m.sum(dim=-1, keepdim=True)
@@ -1158,16 +998,16 @@ class Transition(Neural):
 
         logits = self._validate_logits(logits)
         self.logits.data.copy_(logits)
+
         self._reset_buffers()
-        return logits
+        self._invalidate_cache()
 
     @torch.no_grad()
-    def initialize(self, mode: str = "diag_bias", context: Optional[torch.Tensor] = None, **dist_kwargs):
-        logits = self._init_params(mode)
-        self._invalidate_cache()
-        return self._dist(**self._dist_params(logits, **dist_kwargs))
+    def initialize(self, mode: str = "biased", context: Optional[torch.Tensor] = None, **dist_kwargs):
+        self._init_params(mode)
+        return self._dist(**self._dist_params(self.logits, **dist_kwargs))
 
-    def _apply_constraints(self, logits: torch.Tensor) -> torch.Tensor:
+    def _apply_constraints(self, logits: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         n = self.n_states
         out = logits.clone()
         if self.transition_type == "semi":
@@ -1185,7 +1025,6 @@ class Transition(Neural):
         context: Optional[torch.Tensor] = None,
         timestep: Optional[int] = None,
         grad_scale: Optional[float] = None) -> torch.Tensor:
-        # Align with Neural API, skip adapters for Transition
         return super()._apply_context(base, context=context, timestep=timestep, grad_scale=grad_scale, skip_adapters=True)
 
     def _modulate(self,
@@ -1193,7 +1032,8 @@ class Transition(Neural):
         temperature: Optional[float] = None,
         timestep: Optional[int] = None,
         grad_safe: bool = False) -> torch.Tensor:
-        key = f"trans-{self._context_hash(context)}"
+
+        key = f"transition-{self._context_hash(context)}"
         if timestep is not None:
             key += f"-step{int(timestep)}"
         tau = float(self.temperature if temperature is None else max(temperature, EPS))
@@ -1204,8 +1044,9 @@ class Transition(Neural):
             if cached is not None:
                 return cached.clone().detach() if grad_safe else cached.clone()
 
-        mod = self.logits + self._apply_context(self.logits, context=context, timestep=timestep)
-        mod = self._apply_constraints(mod)
+        base = self.logits
+        delta = self._apply_context(base, context=context, timestep=timestep)
+        mod = self._apply_constraints(base + delta)
         mod = self._apply_temperature(mod, tau)
         mod = self._validate_logits(mod)
 
@@ -1214,47 +1055,25 @@ class Transition(Neural):
 
         return mod.detach() if grad_safe else mod
 
-    def _dist_params(self, logits: torch.Tensor, **dist_kwargs) -> Dict[str, torch.Tensor]:
-        return {"logits": logits, **dist_kwargs}
-
-    def log_matrix(self, context=None, temperature=None, timestep=None, return_dist=False, T=None, **dist_kwargs):
+    def log_matrix(self, context=None, temperature=None, timestep=None, T=None, **dist_kwargs):
         mod = self._modulate(context=context, temperature=temperature, timestep=timestep)
         logp = F.log_softmax(mod, dim=-1)
-
-        # Ensure batch + timestep dims
         if logp.ndim == 2:       # [K, K]
             logp = logp.unsqueeze(0).unsqueeze(0)  # [1, 1, K, K]
         elif logp.ndim == 3:     # [B, K, K]
             logp = logp.unsqueeze(1)               # [B, 1, K, K]
 
-        # Broadcast T if provided
         if T is not None and logp.shape[1] == 1:
             logp = logp.expand(-1, T, -1, -1)      # [B, T, K, K]
-
-        if return_dist:
-            return self._dist(**self._dist_params(mod, **dist_kwargs))
         return logp  # [B, T, K, K]
 
     def expected_probs(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
-        timestep: Optional[int] = None,
-        return_dist: bool = False,
-        **dist_kwargs):
-        """
-        Return expected transition probabilities, optionally the distribution object.
+        timestep: Optional[int] = None, **dist_kwargs):
 
-        Canonicalizes output to [S,B,T,K,D] or squeezes leading singleton dims intelligently.
-        """
         mod = self._modulate(context=context, temperature=temperature, timestep=timestep)
-        dist = self._dist(**self._dist_params(mod, **dist_kwargs))
-        
-        if return_dist:
-            return dist
-
         probs = F.softmax(mod, dim=-1)
-
-        # Squeeze leading singleton dims intelligently
         if self._process_mode == "scalar":
             probs = probs.squeeze(0).squeeze(0)        # -> (K,D)
         elif self._process_mode in ("batch", "sequence"):
@@ -1263,52 +1082,74 @@ class Transition(Neural):
         elif self._process_mode == "sample_batch":
             while probs.ndim > 4 and probs.shape[2] == 1:
                 probs = probs.squeeze(2)               # remove timestep dim
-
         return probs
 
     def sample(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
-        timestep: Optional[int] = None,
-        **dist_kwargs,) -> torch.Tensor:
+        timestep: Optional[int] = None, **dist_kwargs,) -> torch.Tensor:
+
         logits = self._modulate(context=context, temperature=temperature, timestep=timestep)
         dist = self._dist(**self._dist_params(logits, **dist_kwargs))
         s = dist.sample()
         return F.one_hot(s.long(), num_classes=self.n_states).to(dtype=DTYPE)
 
+    @torch.no_grad()
     def update(self,
         new_logits: Optional[torch.Tensor] = None,
         posterior: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
-        optimizer_cls: type = torch.optim.SGD,
-        optimizer_kwargs: Optional[dict] = None,
         update_rate: Optional[float] = None,
         temperature: Optional[float] = None,
-        update_temperature: bool = False,
         from_probs: bool = False,
         grad_safe: bool = False):
-        if new_logits is not None:
-            new_logits = self._tensor_shape(new_logits)
-        if posterior is not None:
-            posterior = self._tensor_shape(posterior)
+        """
+        EM-style update of transition logits.
+        Supports new_logits (direct) or posterior (expected counts).
+        """
 
-        super().update(
-            new_logits=new_logits,
-            posterior=posterior,
-            context=context,
-            update_rate=update_rate,
-            temperature=temperature,
-            from_probs=from_probs,
-            grad_safe=grad_safe,
-            optimizer_cls=optimizer_cls,
-            optimizer_kwargs=optimizer_kwargs,
-            update_temperature=update_temperature
-        )
+        lr = float(update_rate) if update_rate is not None else 1.0
+
+        # Direct update from new_logits
+        if new_logits is not None:
+            logits = self._tensor_shape(new_logits)
+
+            # Reduce extra dims: [B, T, K, K] -> [K, K]
+            if logits.ndim > 2:
+                logits = logits.mean(dim=tuple(range(logits.ndim - 2)))
+            if from_probs:
+                logits = torch.log(logits.clamp_min(EPS))
+            if temperature is not None:
+                logits = self._apply_temperature(logits, temperature)
+
+            self.logits.data.mul_(1.0 - lr).add_(lr * logits)
+
+            self._reset_buffers()
+            self._invalidate_cache()
+            return
+
+        # Update from posterior counts
+        if posterior is None:
+            return
+
+        posterior = self._tensor_shape(posterior)
+
+        # Normalize and reduce dimensions to [K, K]
+        if posterior.ndim > 2:
+            posterior = posterior / posterior.sum(dim=-1, keepdim=True).clamp_min(EPS)
+            posterior = posterior.mean(dim=tuple(range(posterior.ndim - 2)))
+
+        # Clamp and convert to logits
+        posterior = posterior.clamp_min(EPS)
+        target_logits = torch.log(posterior)
+
+        self.logits.data.mul_(1.0 - lr).add_(lr * target_logits)
+
+        self._reset_buffers()
+        self._invalidate_cache()
 
 
 class Emission(Neural):
-
-    _dist_factory = None
 
     def __init__(
         self,
@@ -1321,25 +1162,9 @@ class Emission(Neural):
         context_dim: Optional[int] = None,
         hidden_dim: Optional[int] = None,
         allow_projection: bool = True,
-        temperature: float = 1.0,
+        temperature: float = 1.0
     ):
-
-        self.n_states = n_states
-        self.n_features = n_features
         self._shape = (n_states, n_features)
-        self.emission_type = emission_type
-        self.modulate_var = modulate_var
-        self.temperature = temperature
-        self.min_covar = min_covar
-        self.init_mode = init_mode
-        self.dof = 5.0
-
-        if self.emission_type == "gaussian":
-            self._dist_factory = MultivariateNormal
-        elif self.emission_type == "studentt":
-            self._dist_factory = lambda **kwargs: Independent(StudentT(df=self.dof, **kwargs), 1)
-        else:
-            raise ValueError(f"Unsupported emission_type: {self.emission_type}")
 
         super().__init__(
             hidden_dim=hidden_dim,
@@ -1348,82 +1173,67 @@ class Emission(Neural):
             allow_projection=allow_projection,
         )
 
-        self._init_params(mode=self.emission_type)
+        self.n_states = n_states
+        self.n_features = n_features
+        self.emission_type = emission_type
+        self.modulate_var = modulate_var
+        self.temperature = temperature
+        self.min_covar = min_covar
+        self.init_mode = init_mode
+        self.dof = 5.0  # for student-t
+
+        # Setup distribution factory
+        if emission_type == "gaussian":
+            self._dist_factory = MultivariateNormal
+        elif emission_type == "studentt":
+            self._dist_factory = lambda **kwargs: Independent(StudentT(df=self.dof, **kwargs), 1)
+        else:
+            raise ValueError(f"Unsupported emission_type: {emission_type}")
+
+        # Buffers for fast access
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.register_buffer("_emission_covs", torch.zeros(n_states, n_features, n_features, dtype=DTYPE, device=device))
+        self.register_buffer("_emission_means", torch.zeros(n_states, n_features, dtype=DTYPE, device=device))
+
+        self._init_params()
         self._invalidate_cache()
 
-    def _init_params(self, mode: Optional[str] = None):
-        """
-        Legacy initializer retained for API compatibility.
-        Delegates to _init_params and ignores mode except for validation.
-        """
-        if mode is not None and mode != self.emission_type:
-            raise ValueError(f"Emission initialized with emission_type={self.emission_type}, got mode={mode}")
-
-        K, F = self.n_states, self.n_features
-
-        self.register_buffer("_emission_covs", torch.zeros(K, F, F, dtype=DTYPE))
-        self.register_buffer("_emission_means", torch.zeros(K, F, dtype=DTYPE))
-
+    def _init_params(self, mode: Optional[str] = None) -> None:
+        device = self._emission_means.device
         if self.emission_type == "gaussian":
-            self.log_var = nn.Parameter(torch.full((K, F), -1.0, dtype=DTYPE))
-            self.mu = nn.Parameter(torch.randn(K, F, dtype=DTYPE) * 0.1)
-
+            self.log_var = nn.Parameter(torch.full((self.n_states, self.n_features), -1.0, dtype=DTYPE, device=device))
+            self.mu = nn.Parameter(torch.randn(self.n_states, self.n_features, dtype=DTYPE, device=device) * 0.1)
         else:
-            self.scale_param = nn.Parameter(torch.full((K, F), 0.1, dtype=DTYPE))
-            self.loc = nn.Parameter(torch.randn(K, F, dtype=DTYPE) * 0.1)
+            self.scale_param = nn.Parameter(torch.full((self.n_states, self.n_features), 0.1, dtype=DTYPE, device=device))
+            self.loc = nn.Parameter(torch.randn(self.n_states, self.n_features, dtype=DTYPE, device=device) * 0.1)
 
         self._reset_buffers()
-
-    def _reset_buffers(self) -> None:
-        if self.emission_type == "gaussian":
-            var = F.softplus(self.log_var).clamp_min(self.min_covar)
-            self._emission_covs.copy_(torch.diag_embed(var))
-            self._emission_means.copy_(self.mu)
-        else:  # studentt
-            # Use softplus for positive scale and squared for covariance
-            scale = F.softplus(self.scale_param).clamp_min(self.min_covar)
-            self._emission_covs.copy_(torch.diag_embed(scale ** 2))
-            self._emission_means.copy_(self.loc)
-        super()._reset_buffers()
-
-    def _tensor_shape(self, tensor: torch.Tensor) -> torch.Tensor:
-        """
-        Wrap super()._tensor_shape to ensure broadcasting for HSMM EM.
-
-        Ensures tensor has shape [1, 1, K, F] if currently [K, F],
-        so it can be safely expanded to [B, T, K, F].
-        """
-        tensor = super()._tensor_shape(tensor)
-
-        if tensor.ndim == 2:  # [K, F] -> [1, 1, K, F]
-            K, F = tensor.shape
-            tensor = tensor.view(1, 1, K, F)
-        elif tensor.ndim == 3:  # [K, F, something] unexpected but handled
-            tensor = tensor.unsqueeze(0)  # prepend batch dim
-
-        return tensor
+        self._invalidate_cache()
 
     @torch.no_grad()
     def initialize(self, context: Optional[torch.Tensor] = None, mode: Optional[str] = None):
         K, F = self.n_states, self.n_features
+        device = self._emission_means.device
         mode = mode or getattr(self, "init_mode", "spread")
+        self._init_params(mode)
 
         if mode == "random":
-            init_mean = torch.randn(K, F, dtype=DTYPE) * 0.1
+            init_mean = torch.randn(K, F, dtype=DTYPE, device=device) * 0.1
         elif mode == "spread":
-            init_mean = torch.zeros(K, F, dtype=DTYPE)
-            for f in range(F):
-                linspace = torch.linspace(-1.0, 1.0, steps=K, dtype=DTYPE)
-                init_mean[:, f] = linspace[torch.randperm(K)]
+            linspace = torch.linspace(-1.0, 1.0, steps=K, dtype=DTYPE, device=device)
+            # shuffle along features
+            init_mean = torch.stack([linspace[torch.randperm(K, device=device)] for _ in range(F)], dim=1)
             init_mean += torch.randn_like(init_mean) * 0.05
         else:
             raise ValueError(f"Unsupported mode: {mode}")
 
+        # Modulate with context if available
         if context is not None:
             init_mean = self._modulate(base=init_mean, context=context, grad_safe=True)
 
-        mean_spread = init_mean.std(dim=0, keepdim=True).clamp_min(1e-2)
-        init_var = mean_spread ** 2 + torch.rand(K, F, dtype=DTYPE) * 0.01
+        # Ensure minimal spread for stability
+        mean_spread = init_mean.std(dim=0, keepdim=True).clamp_min(self.min_covar)
+        init_var = mean_spread ** 2 + torch.rand(K, F, dtype=DTYPE, device=device) * 0.01
 
         if self.emission_type == "gaussian":
             self.mu.copy_(init_mean)
@@ -1432,16 +1242,46 @@ class Emission(Neural):
             self.loc.copy_(init_mean)
             self.scale_param.copy_(init_var.sqrt())
 
-        self._reset_buffers(), self._invalidate_cache()
-        base = self.mu if self.emission_type == "gaussian" else self.loc
-        return self._get_dist(base)
+        self._reset_buffers()
+        self._invalidate_cache()
+
+        return self._get_dist(init_mean)
+
+    def _reset_buffers(self) -> None:
+        """Update internal emission mean and covariance buffers."""
+        if self.emission_type == "gaussian":
+            var = F.softplus(self.log_var).clamp_min(self.min_covar)
+            self._emission_covs.copy_(torch.diag_embed(var))
+            self._emission_means.copy_(self.mu)
+        else:  # student-t
+            scale = F.softplus(self.scale_param).clamp_min(self.min_covar)
+            self._emission_covs.copy_(torch.diag_embed(scale ** 2))
+            self._emission_means.copy_(self.loc)
+
+        super()._reset_buffers()
+
+    def _tensor_shape(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Ensures tensor is in canonical shape [B, T, K, F] for emissions.
+        - 2D tensors [K, F] -> [1, 1, K, F]
+        - 3D tensors [B, K, F] -> [B, 1, K, F]
+        """
+        tensor = super()._tensor_shape(tensor)
+        if tensor.ndim == 2:  # [K, F]
+            tensor = tensor.unsqueeze(0).unsqueeze(0)  # [1, 1, K, F]
+        elif tensor.ndim == 3:  # [B, K, F]
+            tensor = tensor.unsqueeze(1)  # [B, 1, K, F]
+        return tensor
 
     def _apply_context(self,
         base: torch.Tensor,
         context: Optional[torch.Tensor] = None,
         timestep: Optional[int] = None,
         grad_scale: Optional[float] = None) -> torch.Tensor:
-
+        """
+        Applies context transformation to the base tensor.
+        Ensures the output has compatible dimensions for broadcasting.
+        """
         delta = super()._apply_context(
             base,
             context=context,
@@ -1449,67 +1289,64 @@ class Emission(Neural):
             grad_scale=grad_scale,
             skip_adapters=True
         )
+        # Broadcast to match base ndim if needed
         if delta.ndim < base.ndim:
-            delta = delta.unsqueeze(1)  # [B,1,...] -> [B,n_states,...] via broadcasting later
+            delta = delta.unsqueeze(1)  # [B,1,...] -> [B,n_states,...]
         return delta
 
     def _modulate(self,
-        base: torch.Tensor,
+        base: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
-        timestep: Optional[int] = None, grad_safe: bool = False) -> torch.Tensor:
+        timestep: Optional[int] = None,
+        grad_safe: bool = False) -> torch.Tensor:
 
+        if base is None:
+            base = self.mu if self.emission_type == "gaussian" else self.loc
         if context is None or not self.modulate_var:
             return base
-
         if context.ndim == 3 and context.shape[1] == 1:
             context = context.squeeze(1)
 
         delta = self._apply_context(base=base, context=context, timestep=timestep)
-        while delta.ndim < base.ndim:
-            delta = delta.unsqueeze(1)
+        if delta.ndim < base.ndim:
+            delta = delta.view(*([delta.shape[0]] + [1]*(base.ndim - delta.ndim)) + list(delta.shape[1:]))
 
         tau = float(self.temperature if temperature is None else max(temperature, EPS))
         mod = self._apply_constraints(base + delta)
         mod = self._apply_temperature(mod, tau)
-
+        mod = self._tensor_shape(mod)
         return mod.detach() if grad_safe else mod
 
-    def _apply_constraints(self, tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        """No-op constraint hook kept for API compatibility."""
+    def _apply_constraints(self, tensor: Optional[torch.Tensor], mask: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
         return tensor
 
     def _dist_params(self, loc: torch.Tensor, **dist_kwargs) -> dict:
-        """Return distribution parameters compatible with _dist factory."""
         if self.emission_type == "gaussian":
             var = F.softplus(self.log_var).clamp_min(self.min_covar)
-            cov = torch.diag_embed(var)
+            cov = torch.diag_embed(var)  # [K, F, F]
             return {"loc": loc, "covariance_matrix": cov, **dist_kwargs}
-
-        # Student-t
-        scale = F.softplus(self.scale_param).clamp_min(self.min_covar)
-        return {"loc": loc, "scale": scale, **dist_kwargs}
+        elif self.emission_type == "studentt":
+            scale = F.softplus(self.scale_param).clamp_min(self.min_covar)
+            return {"loc": loc, "scale": scale, **dist_kwargs}
+        else:
+            raise ValueError(f"Unsupported emission_type: {self.emission_type}")
 
     def _get_dist(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
         timestep: Optional[int] = None, **dist_kwargs):
-        base = self.mu if self.emission_type == "gaussian" else self.loc
-        base = self._modulate(base=base, context=context, timestep=timestep)
-        base = self._tensor_shape(base)
+        base = self._modulate(context=context, temperature=temperature, timestep=timestep)
         return self._dist(**self._dist_params(base, **dist_kwargs))
 
     def forward(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
         return_dist: bool = False, **dist_kwargs):
-
         dist = self._get_dist(context=context, temperature=temperature, **dist_kwargs)
         if return_dist: return dist
-
         if self.emission_type == "gaussian":
             return self._tensor_shape(dist.mean), self._tensor_shape(dist.covariance_matrix)
-
         return self._tensor_shape(dist.loc), self._tensor_shape(dist.scale)
 
     def log_prob(self,
@@ -1517,29 +1354,21 @@ class Emission(Neural):
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None, **dist_kwargs) -> torch.Tensor:
         K, F = self.n_states, self.n_features
-
         dist = self._get_dist(context=context, temperature=temperature, **dist_kwargs)
-
-        if x.ndim == 1:
-            x = x.view(1, 1, F)
-        elif x.ndim == 2:
-            x = x.unsqueeze(0)
-
+        if x.ndim == 1: x = x.view(1, 1, F)
+        elif x.ndim == 2: x = x.unsqueeze(0)
         x = x.unsqueeze(2).expand(-1, -1, K, -1)
         logp = dist.log_prob(x)
-        if logp.ndim == 4:
-            logp = logp.sum(-1)
+        if logp.ndim == 4: logp = logp.sum(-1)
         return logp
 
     def expect_probs(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None, **dist_kwargs) -> torch.Tensor:
-
         dist = self._get_dist(context=context, temperature=temperature, **dist_kwargs)
         loc = dist.mean if self.emission_type == "gaussian" else dist.base_dist.loc
         loc = self._tensor_shape(loc)
-        if loc.ndim == 4:
-            loc = loc.mean(-1)
+        if loc.ndim == 4: loc = loc.mean(-1)
         return torch.softmax(loc, dim=-1)
 
     @torch.no_grad()

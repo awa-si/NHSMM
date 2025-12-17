@@ -50,7 +50,7 @@ def test_context_encoder():
 
     # --- Non-uniform temperature scaling ---
     print("\n=== Testing Non-uniform Temperature ===")
-    dur = Duration(n_states=n_states, max_duration=7, init_mode="short_bias")
+    dur = Duration(n_states=n_states, max_duration=7, init_mode="biased")
     logits = dur.logits.detach().clone()
     print("Raw logits:", logits)
     for temp in [0.1, 1.0, 5.0]:
