@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 import numpy as np
 import polars as pl
-from typing import Optional
+from typing import Optional, Dict, Tuple
 
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import (
@@ -93,51 +93,66 @@ def load_ohlcv_tensor(
     return X, true_states, label_map
 
 
-def best_permutation_accuracy(true, pred, n_classes, label_map=None):
+def best_permutation_accuracy(
+    true: np.ndarray | list,
+    pred: torch.Tensor,
+    n_classes: int,
+    label_map: Optional[Dict[int, str]] = None) -> Tuple[float, np.ndarray, Dict[int, int], Dict[str, str]]:
+
     true = np.array(true)
     pred = pred.detach().cpu().numpy()
 
-    C = confusion_matrix(true, pred, labels=list(range(n_classes)))
+    # Compute confusion matrix
+    C = confusion_matrix(true, pred, labels=np.arange(n_classes))
+    
+    # Solve assignment problem for best matching
     row_ind, col_ind = linear_sum_assignment(-C)
     mapping = {col: row for row, col in zip(row_ind, col_ind)}
+
+    # Apply mapping to predictions
     mapped_pred = np.array([mapping.get(p, p) for p in pred])
-    acc = (mapped_pred == true).mean()
-    readable = (
-        {
-            f"model_{m} ({label_map.get(m, m)})": f"true_{t} ({label_map.get(t, t)})"
-            for m, t in mapping.items()
-        }
-        if label_map
-        else mapping
-    )
+    acc = float((mapped_pred == true).mean())
+
+    # Build readable mapping if label_map provided
+    readable = {}
+    if label_map:
+        for m, t in mapping.items():
+            readable[f"model_{m} ({label_map.get(m, m)})"] = f"true_{t} ({label_map.get(t, t)})"
+    else:
+        readable = mapping.copy()
+
     return acc, mapped_pred, mapping, readable
 
 
 def print_duration_summary(model):
     with torch.no_grad():
-        D = torch.exp(model.duration_module.log_matrix()).cpu().numpy()
-        V = (
-            torch.exp(model.duration_module.log_var()).cpu().numpy()
-            if hasattr(model.duration_module, "log_var")
-            else None
-        )
+        # log_matrix returns [B, T, K, Dmax]; squeeze to [K, Dmax]
+        log_D = model.duration_module.log_matrix()
+        if log_D.ndim > 2:
+            log_D = log_D.squeeze(0).squeeze(0)
+        D = torch.exp(log_D).cpu().numpy()
 
-    logger.info("Learned duration statistics:")
+        # Check for Gaussian-like log_var for variance
+        V = getattr(model.duration_module, "log_var", None)
+        if V is not None:
+            V = torch.exp(V).cpu().numpy()  # variance in original scale
+
+    print("Learned duration statistics:")
     for i, row in enumerate(D):
         mode = int(np.argmax(row)) + 1
         mean_dur = float((np.arange(1, len(row) + 1) * row).sum())
         if V is not None:
             var_dur = float((np.arange(1, len(row) + 1) ** 2 * V[i]).sum())
-            logger.info(f" state {i}: mode={mode}, mean={mean_dur:.2f}, var={var_dur:.2f}")
+            print(f" state {i}: mode={mode}, mean={mean_dur:.2f}, var={var_dur:.2f}")
         else:
-            logger.info(f" state {i}: mode={mode}, mean={mean_dur:.2f}")
+            print(f" state {i}: mode={mode}, mean={mean_dur:.2f}")
 
 
 if __name__ == "__main__":
     torch.manual_seed(0)
     np.random.seed(0)
 
-    MAX_ITER = 3
+    MAX_ITER = 9
     MAX_DURATION = 30
     SYMBOL = "BTC/USDT:USDT"
     DATA_DIR = "/opt/trader/user_data/data/bybit/futures_"
@@ -159,9 +174,6 @@ if __name__ == "__main__":
     X_scaled = scaler.fit_transform(X_torch)
     X_torch = torch.tensor(X_scaled, dtype=DTYPE)
 
-    # --- Add batch dimension for encoder [B, T, F] ---
-    X_torch_batched = X_torch.unsqueeze(0)  # [1, T, F]
-
     # Build encoder and NHSMM
     hidden_dim = max(32, min(64, n_features * 2))
     encoder = CNN_LSTM_Encoder(n_features=n_features, cnn_channels=5, hidden_dim=hidden_dim)
@@ -174,25 +186,19 @@ if __name__ == "__main__":
         emission_type="gaussian",
         max_duration=MAX_DURATION,
         seed=DEFAULT_RNG_SEED,
-        min_covar=1e-3,
+        min_covar=1e-6,
         alpha=1.0,
     )
     print("[Init] Duration logits differentiated per state.")
 
     t0 = time.time()
     print("\n=== EM Training ===")
-    model.fit(
-        X_torch_batched,
-        n_init=3,
-        tol=1e-4,
-        max_iter=MAX_ITER,
-        verbose=True,
-    )
+    model.fit(X_torch, n_init=3, tol=1e-4, max_iter=MAX_ITER, verbose=True)
     elapsed = time.time() - t0
 
     # --- Decode ---
     print("\n=== Decoding ===")
-    v_path = model.decode(X_torch_batched, algorithm="viterbi")
+    v_path = model.decode(X_torch, algorithm="viterbi")
 
     # --- Accuracy metrics ---
     if true_states is not None:
@@ -281,6 +287,6 @@ if __name__ == "__main__":
             print("matplotlib not installed — skipping plot")
 
     # --- Save model ---
-    # torch.save(model.state_dict(), "gaussianhsmm_debug_state.pt")
+    # torch.save(model.state_dict(), "hsmm_debug_state.pt")
     print("\n✅ Model state saved to gaussianhsmm_debug_state.pt")
 

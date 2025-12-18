@@ -106,39 +106,47 @@ class HSMM(nn.Module):
         finally:
             self.encoder.train()
 
-    def _init_modules(
-        self,
+    def _init_modules(self,
         transition_type: str,
         emission_type: str,
         modulate_var: bool,
         max_duration: int,
         temperature: float,
-        min_covar: float,
-    ):
+        min_covar: float):
         device, debug = self.device, self.debug
 
         self.emission_module = Emission(
-            n_states=self.n_states, n_features=self.n_features,
-            emission_type=emission_type, context_dim=self.context_dim,
-            hidden_dim=self.hidden_dim, modulate_var=modulate_var,
-            temperature=temperature, min_covar=min_covar
+            n_states=self.n_states,
+            n_features=self.n_features,
+            emission_type=emission_type,
+            context_dim=self.context_dim,
+            hidden_dim=self.hidden_dim,
+            modulate_var=modulate_var,
+            temperature=temperature,
+            min_covar=min_covar
         )
 
         self.initial_module = Initial(
-            n_states=self.n_states, context_dim=self.context_dim,
+            n_states=self.n_states,
+            context_dim=self.context_dim,
             hidden_dim=self.hidden_dim
         )
 
         self.duration_module = Duration(
-            n_states=self.n_states, max_duration=max_duration,
-            context_dim=self.context_dim, hidden_dim=self.hidden_dim,
+            n_states=self.n_states,
+            max_duration=max_duration,
+            context_dim=self.context_dim,
+            hidden_dim=self.hidden_dim,
             temperature=temperature
         )
 
         self.transition_module = Transition(
-            n_states=self.n_states, n_features=self.n_features,
-            transition_type=transition_type, context_dim=self.context_dim,
-            hidden_dim=self.hidden_dim, temperature=temperature
+            n_states=self.n_states,
+            n_features=self.n_features,
+            transition_type=transition_type,
+            context_dim=self.context_dim,
+            hidden_dim=self.hidden_dim,
+            temperature=temperature
         )
 
         try:
@@ -246,15 +254,20 @@ class HSMM(nn.Module):
         duration_logits = self.duration_module.log_matrix(context=router.context)  # [B,T,K,Dmax]
         transition_logits = self.transition_module.log_matrix(context=router.context)  # [B,T,K,K]
 
+        # cumsum_emit: [B, T+1, K]
         cumsum_emit = torch.zeros((B, T + 1, K), device=device, dtype=dtype)
         cumsum_emit[:, 1:, :] = torch.cumsum(router.log_probs, dim=1)
+        d_range = torch.arange(1, Dmax + 1, device=device)  # [Dmax]
+        t_range = torch.arange(T, device=device).unsqueeze(1)  # [T,1]
+        start_idx = (t_range - d_range + 1).clamp(min=0)  # [T,Dmax]
+        end_idx = (t_range + 1).expand(-1, Dmax)  # [T,Dmax]
 
-        time_idx = torch.arange(T, device=device)
-        emit_sums = torch.empty((B, T, K, Dmax), device=device, dtype=dtype)
-        for d in range(1, Dmax + 1):
-            start = (time_idx - d + 1).clamp(min=0)
-            end = time_idx + 1
-            emit_sums[:, :, :, d - 1] = cumsum_emit[:, end, :] - cumsum_emit[:, start, :]
+        # Add batch and state dimensions: B x T x K x Dmax
+        b_idx = torch.arange(B, device=device).view(B, 1, 1, 1).expand(B, T, K, Dmax)
+        k_idx = torch.arange(K, device=device).view(1, 1, K, 1).expand(B, T, K, Dmax)
+        t_idx_start = start_idx.view(1, T, 1, Dmax).expand(B, T, K, Dmax)
+        t_idx_end = end_idx.view(1, T, 1, Dmax).expand(B, T, K, Dmax)
+        emit_sums = cumsum_emit[b_idx, t_idx_end, k_idx] - cumsum_emit[b_idx, t_idx_start, k_idx]  # [B,T,K,Dmax]
 
         # --- Initialize alpha ---
         alpha = torch.full((B, T, K, Dmax), NEG_INF, device=device, dtype=dtype)
@@ -303,20 +316,23 @@ class HSMM(nn.Module):
         B, T, K = router.log_probs.shape
         device = router.context.device
 
-        # --- Module logits ---
         duration_logits = self.duration_module.log_matrix(context=router.context)
         transition_logits = self.transition_module.log_matrix(context=router.context)
 
         # --- Precompute cumulative emission sums ---
-        cumsum_emit = torch.zeros((B, T + 1, K), device=device, dtype=dtype)
+        cumsum_emit = torch.zeros((B, T + 1, K), device=device, dtype=dtype) # cumsum_emit: [B, T+1, K]
         cumsum_emit[:, 1:, :] = torch.cumsum(router.log_probs, dim=1)
+        d_range = torch.arange(1, Dmax + 1, device=device)  # [Dmax]
+        t_range = torch.arange(T, device=device).unsqueeze(1)  # [T,1]
+        start_idx = (t_range - d_range + 1).clamp(min=0)  # [T,Dmax]
+        end_idx = (t_range + 1).expand(-1, Dmax)  # [T,Dmax]
 
-        emit_sums = torch.empty((B, T, K, Dmax), device=device, dtype=dtype)
-        time_idx = torch.arange(T, device=device)
-        for d in range(1, Dmax + 1):
-            start = (time_idx - d + 1).clamp(min=0)
-            end = time_idx + 1
-            emit_sums[:, :, :, d - 1] = cumsum_emit[:, end, :] - cumsum_emit[:, start, :]
+        # Add batch and state dimensions: B x T x K x Dmax
+        b_idx = torch.arange(B, device=device).view(B, 1, 1, 1).expand(B, T, K, Dmax)
+        k_idx = torch.arange(K, device=device).view(1, 1, K, 1).expand(B, T, K, Dmax)
+        t_idx_start = start_idx.view(1, T, 1, Dmax).expand(B, T, K, Dmax)
+        t_idx_end = end_idx.view(1, T, 1, Dmax).expand(B, T, K, Dmax)
+        emit_sums = cumsum_emit[b_idx, t_idx_end, k_idx] - cumsum_emit[b_idx, t_idx_start, k_idx]  # [B,T,K,Dmax]
 
         # --- Initialize beta ---
         beta = torch.full((B, T, K, Dmax), NEG_INF, device=device, dtype=dtype)
@@ -349,16 +365,8 @@ class HSMM(nn.Module):
         beta = beta.masked_fill(~mask_exp, NEG_INF)
         return beta
 
-    def _compute_posteriors(self, X: SequenceSet,
-        theta: Optional[Union[torch.Tensor, ContextRouter]] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Compute HSMM posteriors for a batch of sequences.
+    def _compute_posteriors(self, X: SequenceSet, theta: Optional[Union[torch.Tensor, ContextRouter]] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
-        Returns:
-            gamma : [B, T, K]        state posteriors
-            xi    : [B, T-1, K, K]   transition posteriors
-            eta   : [B, T, K, Dmax]  duration posteriors
-        """
         B = len(X.sequences)
         T_max = max(X.lengths) if B > 0 else 0
         K, Dmax = self.n_states, self.max_duration
@@ -370,89 +378,97 @@ class HSMM(nn.Module):
             xi = torch.zeros((B, max(T_max - 1, 0), K, K), dtype=DTYPE, device=device)
             return gamma, xi, eta
 
-        # ---- Context handling ----
+        # --- Context handling ---
         router = theta if isinstance(theta, ContextRouter) else ContextRouter.from_tensor(X, theta=theta)
-        mask = router.mask.squeeze(-1) if router.mask.ndim == 3 else router.mask
-        mask_TK = mask.unsqueeze(-1)           # [B, T, 1]
-        mask_TKD = mask.unsqueeze(-1).unsqueeze(-1)  # [B, T, 1, 1]
 
-        # ---- Forward / backward ----
+        # --- Forward / backward ---
         alpha = self._forward(X, theta=router)  # [B, T, K, Dmax]
         beta = self._backward(X, theta=router)  # [B, T, K, Dmax]
 
-        # ---- Eta: duration posteriors ----
-        eta_log = alpha + beta                  # [B, T, K, Dmax]
+        # --- Masks ---
+        mask = router.mask.bool().squeeze(-1) if router.mask.ndim == 3 else router.mask.bool()  # [B,T]
+        mask_TK = mask.unsqueeze(-1)      # [B, T, 1]
+        mask_TKD = mask.unsqueeze(-1).unsqueeze(-1)  # [B, T, 1, 1]
+
+        # --- Duration posteriors eta ---
+        eta_log = alpha + beta            # [B, T, K, Dmax]
         eta_flat = eta_log.reshape(B, T_max, -1)
         eta_norm = torch.logsumexp(eta_flat, dim=-1, keepdim=True)
         eta = (eta_flat - eta_norm).reshape(B, T_max, K, Dmax).exp()
-        eta = eta * mask_TKD
+        eta = eta * mask_TKD             # mask out padding
 
-        # ---- Gamma: state posteriors ----
-        gamma = eta.sum(-1)                     # [B, T, K]
+        # --- State posteriors gamma ---
+        gamma = eta.sum(-1)               # [B, T, K]
         gamma = gamma * mask_TK
         gamma = gamma / gamma.sum(-1, keepdim=True).clamp_min(EPS)
 
-        # ---- Xi: transition posteriors ----
+        # --- Transition posteriors xi ---
         xi = torch.zeros((B, max(T_max - 1, 0), K, K), dtype=DTYPE, device=device)
         if T_max > 1:
-            trans_logits = self.transition_module.log_matrix(router.context)  # [B, T, K, K]
+            # Transition logits: [B,T,K,K]
+            trans_logits = self.transition_module.log_matrix(router.context)
             if trans_logits.ndim == 2:
                 trans_logits = trans_logits.unsqueeze(0).unsqueeze(1).expand(B, T_max, K, K)
 
-            # Compute log_xi for valid timesteps
-            a_prev = torch.logsumexp(alpha[:, :T_max - 1], dim=-1)  # [B, T-1, K]
-            b_next = torch.logsumexp(beta[:, 1:], dim=-1)           # [B, T-1, K]
+            # Compute xi for each valid timestep
+            # alpha and beta must be duration-marginalized for transitions
+            alpha_marg = torch.logsumexp(alpha[:, :T_max - 1], dim=-1)  # [B,T-1,K]
+            beta_marg = torch.logsumexp(beta[:, 1:], dim=-1)             # [B,T-1,K]
 
             log_xi = (
-                a_prev.unsqueeze(-1)        # [B, T-1, K, 1]
-                + trans_logits[:, :T_max - 1]  # [B, T-1, K, K]
-                + b_next.unsqueeze(-2)      # [B, T-1, 1, K]
+                alpha_marg.unsqueeze(-1)            # [B,T-1,K,1]
+                + trans_logits[:, :T_max - 1]       # [B,T-1,K,K]
+                + beta_marg.unsqueeze(-2)           # [B,T-1,1,K]
             )
             log_xi = log_xi - torch.logsumexp(log_xi, dim=(2, 3), keepdim=True)
             xi = log_xi.exp()
 
-            # Apply sequence-length mask
+            # Mask out padded timesteps
             lengths = torch.as_tensor(X.lengths, device=device)
             valid = torch.arange(T_max - 1, device=device).unsqueeze(0) < lengths.unsqueeze(1)  # [B, T-1]
             xi = xi * valid.unsqueeze(-1).unsqueeze(-1)
 
         return gamma, xi, eta
 
-    def _model_params(self, X: SequenceSet, theta: Optional[Union[torch.Tensor, ContextRouter]] = None) -> dict:
+    def _model_params(self,
+        X: SequenceSet,
+        theta: Optional[Union[torch.Tensor, ContextRouter]] = None) -> dict:
         router = theta if isinstance(theta, ContextRouter) else ContextRouter.from_tensor(X, theta=theta)
         gamma, xi, eta = self._compute_posteriors(X, theta=router)
 
-        init_counts = gamma[:, 0].sum(0)          # [K]
-        dur_counts = eta.sum(1)                   # [K, Dmax]
-        trans_counts = xi.sum(1)                  # [K, K]
-
-        # --- Normalize to probabilities ---
-        init_probs = init_counts / init_counts.sum().clamp_min(EPS)
-        dur_probs = dur_counts / dur_counts.sum(dim=1, keepdim=True).clamp_min(EPS)
-        trans_probs = trans_counts / trans_counts.sum(dim=1, keepdim=True).clamp_min(EPS)
-
-        # --- Deterministic M-step updates ---
+        # Initial distribution: p(z0 | canonical context)
         self.initial_module.update(
-            new_logits=init_probs,
-            context=router.canonical,
-            from_probs=True
+            posterior=gamma[:, 0],          # [B, K]
+            context=router.canonical         # [B, H]
         )
+        # Duration distribution: p(d | z, context_t)
         self.duration_module.update(
-            new_logits=dur_probs,
-            context=router.canonical,
-            from_probs=True
+            posterior=eta,                  # [B, T, K, D]
+            context=router.context           # [B, T, H]
         )
+        # Transition distribution: p(z_t | z_{t-1}, context_t)
         self.transition_module.update(
-            new_logits=trans_probs,
-            context=router.canonical,
-            from_probs=True
+            posterior=xi,                   # [B, T, K, K]
+            context=router.context           # [B, T, H]
         )
-
+        # --- Return learned conditional distributions ---
         params = {
-            "initial_dist": self.initial_module.forward(context=router.canonical, return_dist=True),
-            "duration_dist": self.duration_module.forward(context=router.canonical, return_dist=True),
-            "transition_dist": self.transition_module.forward(context=router.canonical, return_dist=True),
-            "emission_dist": self.emission_module.forward(context=router.context, return_dist=True),
+            "initial_dist": self.initial_module.forward(
+                context=router.canonical,
+                return_dist=True
+            ),
+            "duration_dist": self.duration_module.forward(
+                context=router.canonical,
+                return_dist=True
+            ),
+            "transition_dist": self.transition_module.forward(
+                context=router.canonical,
+                return_dist=True
+            ),
+            "emission_dist": self.emission_module.forward(
+                context=router.context,
+                return_dist=True
+            ),
         }
         return params
 
@@ -467,31 +483,29 @@ class HSMM(nn.Module):
         router = theta if isinstance(theta, ContextRouter) else ContextRouter.from_tensor(X, theta=theta)
         device = router.log_probs.device
         B, T_max, _ = router.log_probs.shape
+
         durations_full = torch.arange(1, Dmax + 1, device=device)
 
         for b in range(B):
-            L = int(router.mask[b].sum().item())
+            L = int(router.mask[b].sum())
             if L == 0:
                 predicted.append(torch.empty(0, dtype=torch.long, device=device))
                 continue
 
-            ctx_seq = router.context[b:b+1, :L]   # [1, L, H]
-            canon_seq = router.canonical[b:b+1]   # [1, 1, H]
+            ctx = router.context[b:b+1,:L]
+            canon = router.canonical[b:b+1]
 
-            # --- Module logits ---
-            init_logits = self.initial_module.log_matrix(context=canon_seq, T=L)[0]    # [L, K]
-            dur_logits = self.duration_module.log_matrix(context=ctx_seq, T=L)[0]      # [L, K, Dmax]
-            trans_logits = self.transition_module.log_matrix(context=ctx_seq, T=L)[0]  # [L, K, K]
+            init_logits = self.initial_module.log_matrix(context=canon)[0, 0]
+            dur_logits = self.duration_module.log_matrix(context=ctx)[0]
+            trans_logits = self.transition_module.log_matrix(context=ctx)[0]
 
             if duration_weight != 0.0:
                 dur_logits = dur_logits * (1.0 - duration_weight)
 
-            # --- Emission sums ---
-            emit_log = router.log_probs[b, :L]  # [L, K]
-            cumsum_emit = torch.vstack((torch.zeros((1, K), device=device, dtype=emit_log.dtype),
-                                        torch.cumsum(emit_log, dim=0)))  # [L+1, K]
+            emit_log = router.log_probs[b, :L]
+            cumsum_emit = torch.zeros((L + 1, K), device=device, dtype=emit_log.dtype)
+            cumsum_emit[1:] = torch.cumsum(emit_log, dim=0)
 
-            # --- DP initialization ---
             V = torch.full((L, K), NEG_INF, device=device, dtype=emit_log.dtype)
             back_ptr = torch.full((L, K), -1, device=device, dtype=torch.long)
             best_dur = torch.zeros((L, K), device=device, dtype=torch.long)
@@ -499,35 +513,39 @@ class HSMM(nn.Module):
             for t in range(L):
                 max_d = min(Dmax, t + 1)
                 durations = durations_full[:max_d]
-                starts = t - durations + 1  # [max_d]
+                starts = t - durations + 1
 
-                # --- Batched emission sums for all durations ---
-                emit_sums = (cumsum_emit[t + 1].unsqueeze(0) - cumsum_emit[starts]).T  # [K, max_d]
+                emit_sums = (cumsum_emit[t + 1] - cumsum_emit[starts]).T
+                scores_dur = dur_logits[t, :, :max_d] + emit_sums
 
                 if t == 0:
-                    scores = init_logits[t][:, None] + dur_logits[t, :, :max_d] + emit_sums
+                    scores = init_logits[:, None] + scores_dur
                     V[t], idx = scores.max(dim=1)
                     best_dur[t] = durations[idx]
                     continue
 
-                # --- Transition scores ---
-                prev_scores = V[torch.clamp(starts - 1, min=0)].T.unsqueeze(2) + trans_logits[t].unsqueeze(1)  # [K, max_d, K]
-                mask_starts0 = (starts == 0)
-                if mask_starts0.any():
-                    prev_scores[:, mask_starts0, :] = init_logits[t].unsqueeze(0)
+                prev_t = torch.clamp(starts - 1, min=0)
+                prev_V = V[prev_t].T.unsqueeze(2)
+                trans = trans_logits[t].unsqueeze(1)
 
-                prev_max, prev_arg = prev_scores.max(dim=0)  # [max_d, K]
-                scores = prev_max.T + dur_logits[t, :, :max_d] + emit_sums  # [K, max_d]
+                prev_scores = prev_V + trans
+
+                mask_start0 = (starts == 0)
+                if mask_start0.any():
+                    prev_scores[:, mask_start0, :] = init_logits[None, None, :]
+
+                prev_max, prev_arg = prev_scores.max(dim=0)
+                scores = prev_max.T + scores_dur
 
                 V[t], dur_idx = scores.max(dim=1)
                 best_dur[t] = durations[dur_idx]
+
                 back_ptr[t] = torch.where(
                     best_dur[t] == 1,
-                    torch.full((K,), -1, device=device, dtype=torch.long),
+                    -1,
                     prev_arg[dur_idx, torch.arange(K, device=device)]
                 )
 
-            # --- Backtrace ---
             t = L - 1
             state = int(V[t].argmax())
             segments = []
@@ -542,8 +560,11 @@ class HSMM(nn.Module):
                     state = prev
 
             segments.reverse()
-            path = torch.cat([torch.full((end - start + 1,), st, device=device, dtype=torch.long)
-                              for start, end, st in segments])
+            path = torch.cat([
+                torch.full((end - start + 1,), st, device=device, dtype=torch.long)
+                for start, end, st in segments
+            ])
+
             predicted.append(path[:L])
 
         return predicted
@@ -621,8 +642,7 @@ class HSMM(nn.Module):
         n_init: int = 1,
         tol: float = 1e-4,
         max_iter: int = 20,
-        theta: Optional[torch.Tensor] = None,
-        verbose: bool = True):
+        theta: Optional[torch.Tensor] = None, verbose: bool = True):
 
         patience = 1
         adapt_factor = 10.0
@@ -639,76 +659,56 @@ class HSMM(nn.Module):
 
         B = X.shape[0] if X.ndim == 3 else 1
 
-        def _reset_parameters(run_idx: int):
-            self.initial_module.reset_parameters()
-            self.transition_module.reset_parameters()
-            self.duration_module.reset_parameters()
-            self.emission_module.reset_parameters()
-
-            if self.encoder is not None:
-                self.encoder.reset()
-
-            if hasattr(self, "_emission_optimizer") and self._emission_optimizer is not None:
-                for pg in self._emission_optimizer.param_groups:
-                    pg['lr'] = 0.0  # will be set adaptively later
-
-            if hasattr(self, "_convergence") and self._convergence is not None:
-                self._convergence.converged_flags[run_idx] = False
-
         for run_idx in range(n_init):
             if verbose:
                 print(f"\n=== Run {run_idx + 1}/{n_init} ===")
 
-            _reset_parameters(run_idx)
-
             prev_ll = None
+            self._reset_parameters(run_idx)
+
             for it in range(max_iter + 1):
-                X_valid = self._prepare(X, theta=theta)
-                seq_tensor, mask, F_dim = X_valid.sequences, X_valid.masks, X_valid.sequences.shape[-1]
+                seq_set = self._prepare(X, theta=theta)
+                seq_tensor, mask, F_dim = seq_set.sequences, seq_set.masks, seq_set.sequences.shape[-1]
+                log_probs_tensor = seq_set.log_probs
 
-                mask_exp = mask.unsqueeze(-1)
-
-                log_probs_tensor = X_valid.log_probs  # already [B, T, K]
-                ll = log_probs_tensor.sum(dim=(0, 1)) if B > 1 else log_probs_tensor.sum()
-                ll_val = float(ll)
-
+                ll_val = float(log_probs_tensor.sum(dim=(0, 1)) if B > 1 else log_probs_tensor.detach().sum())
                 self._convergence.update(ll_val, it, run_idx)
 
                 if verbose and it > 0:
                     delta_ll = ll_val - prev_ll if prev_ll is not None else float("nan")
                     print(f"[Iter {it:02d}] LL={ll_val:.6f} Δ={delta_ll:.3e}")
 
-                if prev_ll is not None:
-                    adaptive_rate = min(update_rate_max, max(update_rate_min, adapt_factor * abs(ll_val - prev_ll)))
-                else:
-                    adaptive_rate = update_rate_max
-
+                # --- Adaptive learning rate ---
+                adaptive_rate = (
+                    min(update_rate_max, max(update_rate_min, adapt_factor * abs(ll_val - prev_ll)))
+                    if prev_ll is not None else update_rate_max
+                )
                 prev_ll = ll_val
 
+                # --- Convergence check ---
                 if it == max_iter or self._convergence.converged_flags[run_idx]:
                     if verbose and self._convergence.converged_flags[run_idx]:
                         print(f"[Run {run_idx + 1}] Converged at iteration {it}.")
                     break
 
-                # ---------------- E-step ----------------
-                gamma, xi, eta = self._compute_posteriors(X_valid, theta=theta)
+                # --- Compute posteriors ---
+                gamma, xi, eta = self._compute_posteriors(seq_set, theta=theta)
 
-                # ---------------- M-step ----------------
-                init_counts = gamma[:, 0].sum(0)
-                self.initial_module.update(new_logits=init_counts, from_probs=True)
-
-                dur_counts = eta.sum(dim=0)
-                self.duration_module.update(new_logits=dur_counts, from_probs=True)
-
-                if xi is not None:
-                    trans_counts = xi.sum(dim=(0, 1))
-                    self.transition_module.update(new_logits=trans_counts, from_probs=True)
-
+                # --- Flatten once for M-step updates ---
                 flat_mask = mask.view(-1)
                 flat_X = seq_tensor.reshape(-1, F_dim)[flat_mask]
                 flat_gamma = gamma.reshape(-1, self.n_states)[flat_mask]
-                flat_theta = theta.reshape(-1, theta.shape[-1])[flat_mask] if theta is not None else None
+                flat_theta = (
+                    theta.reshape(-1, theta.shape[-1])[flat_mask] if theta is not None else None
+                )
 
+                # --- Update initial, duration, and transition modules ---
+                self.initial_module.update(new_logits=gamma[:, 0].sum(0), from_probs=True)
+                self.duration_module.update(new_logits=eta.sum(dim=0), from_probs=True)
+                if xi is not None:
+                    self.transition_module.update(new_logits=xi.sum(dim=(0, 1)), from_probs=True)
+
+                # --- Update emission module ---
                 if neural_update:
                     for p in self.emission_module.parameters():
                         p.requires_grad_(True)
@@ -720,19 +720,16 @@ class HSMM(nn.Module):
                             pg['lr'] = adaptive_rate
 
                     self._emission_optimizer.zero_grad()
-
                     log_probs = self.emission_module.log_prob(flat_X)
                     loss = -(flat_gamma.detach() * log_probs).sum() / flat_gamma.detach().sum().clamp_min(EPS)
                     loss.backward()
                     self._emission_optimizer.step()
-
-                    emission_dist = self.emission_module.forward(context=flat_theta, return_dist=True)
                 else:
                     self.emission_module.update(posterior=flat_gamma, context=flat_theta, update_rate=adaptive_rate)
-                    emission_dist = self.emission_module.forward(context=flat_theta, return_dist=True)
 
-                self._params["emission_dist"] = emission_dist
+                self._params["emission_dist"] = self.emission_module.forward(context=flat_theta, return_dist=True)
 
+            # --- Snapshot best run ---
             if ll_val > best_score:
                 best_score = ll_val
                 self._params.update({
@@ -743,13 +740,51 @@ class HSMM(nn.Module):
                 })
                 self._snapshot_best_params()
 
+        # --- Restore best parameters after all runs ---
+        if n_init > 1:
+            self._restore_best_params()
+
         return self
+
+    def _reset_parameters(self, run_idx: int, preserve_best: bool = True) -> None:
+        """
+        Reset parameters for a new EM run.
+
+        Args:
+            run_idx: Index of the current initialization run.
+            preserve_best: If True, do not reset parameters that were previously learned
+                           (i.e., keep the last best parameters).
+        """
+        # Reset modules conditionally
+        for module_name in ["initial_module", "transition_module", "duration_module", "emission_module"]:
+            module = getattr(self, module_name)
+            if preserve_best and hasattr(self, "_best_state") and module_name.replace("_module","") in self._best_state:
+                # Load best parameters instead of random reset
+                module.load_state_dict(self._best_state[module_name.replace("_module","")])
+            else:
+                module.reset_parameters()
+
+        # Reset encoder if present
+        if self.encoder is not None:
+            if preserve_best and hasattr(self, "_best_state") and "encoder" in self._best_state:
+                self.encoder.load_state_dict(self._best_state["encoder"])
+            else:
+                self.encoder.reset()
+
+        # Reset optimizer LR to 0 (will be set adaptively later)
+        if hasattr(self, "_emission_optimizer") and self._emission_optimizer is not None:
+            for pg in self._emission_optimizer.param_groups:
+                pg['lr'] = 0.0
+
+        # Reset convergence flags
+        if hasattr(self, "_convergence") and self._convergence is not None:
+            self._convergence.converged_flags[run_idx] = False
 
     def _snapshot_best_params(self):
         self._best_state = {
             "initial": self.initial_module.state_dict(),
-            "transition": self.transition_module.state_dict(),
             "duration": self.duration_module.state_dict(),
+            "transition": self.transition_module.state_dict(),
             "emission": self.emission_module.state_dict(),
         }
         if self.encoder is not None:
@@ -865,22 +900,7 @@ class HSMM(nn.Module):
         algorithm: Literal["viterbi", "map"] = "viterbi",
         context: Optional[torch.Tensor | list[torch.Tensor]] = None,
         first_only: bool = True, verbose: bool = True) -> torch.Tensor | list[torch.Tensor]:
-        """
-        Decode hidden states from input sequence(s) using Viterbi or MAP.
-        Supports variable-length sequences, batched inputs, and optional context.
 
-        Args:
-            X: Input sequence(s), tensor or list of tensors
-            algorithm: "viterbi" or "map"
-            first_only: If True, return only first sequence (single-sequence use)
-                        If False, return list of tensors for all sequences
-            context: Optional context tensor or list matching X sequences
-            verbose: Print debug info
-
-        Returns:
-            torch.Tensor or list[torch.Tensor] of predicted states
-        """
-        # --- Normalize input to list of tensors ---
         if torch.is_tensor(X):
             X_list = [X] if X.ndim == 2 else [X[i] for i in range(X.shape[0])]
         elif isinstance(X, list):
@@ -889,7 +909,6 @@ class HSMM(nn.Module):
         else:
             raise TypeError(f"Unsupported input type {type(X)} for decode()")
 
-        # --- Normalize context to list of tensors ---
         context_list: Optional[list[torch.Tensor]] = None
         if context is not None:
             if torch.is_tensor(context):
