@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 from typing import Optional, List, Tuple, Any, Literal, Dict
-import math
 
 import torch
 import torch.nn as nn
@@ -926,7 +925,6 @@ class HSMM(nn.Module):
         preds = self.predict(X_list, algorithm=algorithm, context=context_list, verbose=verbose)
 
         return preds[0] if first_only and preds else preds
-
 
     @torch.no_grad()
     def score(self,
