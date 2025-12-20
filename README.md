@@ -1,10 +1,11 @@
 
 # NHSMM — (Neural) Hidden Semi-Markov Models
 - *Documentation: [wiki](Wiki)*
-- *Version: 0.2.0-alpha.1*
+- *Version: 0.0.2-alpha*
 
-> ⚠️ NHSMM is currently released as an **alpha version (0.2.0-alpha.1)**.
+> ⚠️ NHSMM is currently released as an **alpha version (0.0.2-alpha)**.
 > The public API may change prior to the first stable `1.0.0` release.
+
 
 [![PyPI](https://img.shields.io/pypi/v/nhsmm.svg)](https://pypi.org/project/nhsmm/) [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0) [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 
@@ -78,9 +79,9 @@ nhsmm/
 ├── distributions/
 │   ├── default.py         # Initial, Duration, Transition, Emission
 │   └── __init__.py
+├── __vesion__.py
 └── __init__.py
 ```
-
 ---
 
 ## 🧠 Usage Example — Market Regime Detection (HSMM)

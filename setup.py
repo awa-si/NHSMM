@@ -9,8 +9,8 @@ version = (repo / "version").read_text(encoding="utf-8")
 setup(
     name="nhsmm",
     author="AWA",
-    license="Apache 2.0",
     version=version,
+    license="Apache 2.0",
     author_email="dev@awa.si",
     long_description=long_description,
     url="https://github.com/awa-si/NHSMM",

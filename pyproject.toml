@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nhsmm"
-version = "0.2.0-alpha.1"
-description = "Neural Hidden Semi-Markov Model (HSMM) implementation in PyTorch"
 readme = "README.md"
+version = "0.0.2-alpha"
 requires-python = ">=3.9"
+description = "Neural Hidden Semi-Markov Model (HSMM) implementation in PyTorch"
 keywords = ["HSMM", "Neural HSMM", "PyTorch", "sequence modeling", "temporal modeling"]
 authors = [
     { name = "AWA", email = "dev@awa.si" }
@@ -18,7 +18,7 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
-    "License :: OSI Approved :: Apache 2.0 License",
+    "License :: OSI Approved :: Apache Software License",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
@@ -27,8 +27,7 @@ dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
     "scikit-learn>=1.2",
-    "optuna>=3.0",
-    "tqdm>=4.66",
+    "optuna>=3.0"
 ]
 
 [project.urls]
