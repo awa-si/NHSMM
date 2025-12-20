@@ -7,18 +7,16 @@ long_description = (here / "README.md").read_text(encoding="utf-8")
 
 setup(
     name="nhsmm",
-    version="0.1.0",
     author="AWA",
-    author_email="dev@awa.si",
-    description="Neural Hidden Semi-Markov Models with contextual duration and emission modeling.",
-    long_description=long_description,
-    long_description_content_type="text/markdown",
-    url="https://github.com/awa-si/NHSMM",
     license="MIT",
-
+    version="0.1.0",
+    author_email="dev@awa.si",
+    long_description=long_description,
+    url="https://github.com/awa-si/NHSMM",
+    long_description_content_type="text/markdown",
+    description="Neural Hidden Semi-Markov Models with contextual duration and emission modeling.",
     packages=find_packages(exclude=("tests", "examples", "notebooks", "docs")),
     python_requires=">=3.9",
-
     install_requires=[
         "torch>=2.0",
         "numpy>=1.24",
@@ -42,7 +40,6 @@ setup(
             "seaborn",
         ],
     },
-
     classifiers=[
         "Development Status :: 3 - Alpha",
         "Intended Audience :: Science/Research",
@@ -54,7 +51,6 @@ setup(
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
     ],
-
     keywords="neural-hsmm, hidden-semi-markov-model, probabilistic, deep-learning, pytorch, regime-detection",
     include_package_data=True,
     zip_safe=False,
