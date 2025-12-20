@@ -9,11 +9,11 @@ setup(
     name="nhsmm",
     version="0.1.0",
     author="AWA",
-    author_email="andre@awwea.com",
+    author_email="dev@awa.si",
     description="Neural Hidden Semi-Markov Models with contextual duration and emission modeling.",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/awwea/NeuralHSMM",
+    url="https://github.com/awa-si/NHSMM",
     license="MIT",
 
     packages=find_packages(exclude=("tests", "examples", "notebooks", "docs")),
