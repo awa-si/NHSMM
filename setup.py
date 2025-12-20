@@ -2,19 +2,20 @@
 from setuptools import setup, find_packages
 import pathlib
 
-here = pathlib.Path(__file__).parent.resolve()
-long_description = (here / "README.md").read_text(encoding="utf-8")
+repo = pathlib.Path(__file__).parent.resolve()
+long_description = (repo / "README.md").read_text(encoding="utf-8")
+version = (repo / "version").read_text(encoding="utf-8")
 
 setup(
     name="nhsmm",
     author="AWA",
-    license="MIT",
-    version="0.1.0",
+    license="Apache 2.0",
+    version=version,
     author_email="dev@awa.si",
     long_description=long_description,
     url="https://github.com/awa-si/NHSMM",
     long_description_content_type="text/markdown",
-    description="Neural Hidden Semi-Markov Models with contextual duration and emission modeling.",
+    description="Neural Hidden Semi-Markov Models with contextual duration, transition and emission modeling.",
     packages=find_packages(exclude=("tests", "examples", "notebooks", "docs")),
     python_requires=">=3.9",
     install_requires=[
@@ -23,6 +24,7 @@ setup(
         "scipy>=1.10",
         "scikit-learn>=1.2",
         "tqdm>=4.66",
+        "optuna>=3.0",
         "matplotlib>=3.9",
         "typing_extensions>=4.11",
     ],
