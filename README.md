@@ -65,60 +65,106 @@ pip install nhsmm;
 nhsmm/
 ├── context.py             # Contextual Encoder
 ├── constants.py           # Default configuration
+├── constraints.py
+├── convergence.py
+├── data.py
+├── seed.py
 ├── models/
 │   ├── base.py            # Core HSMM model & inference
 │   └── __init__.py
 ├── distributions/
 │   ├── default.py         # Initial, Duration, Transition, Emission
 │   └── __init__.py
-├── tools/
-│   ├── constraints.py
-│   ├── convergence.py
-│   ├── utils.py
-│   ├── seed.py
-│   └── __init__.py
 └── __init__.py
 ```
 
 ---
 
-## 🧠 Usage Example (Context-Aware)
+## 🧠 Usage Example — Market Regime Detection (HSMM)
+
+This example demonstrates **Hidden Semi-Markov regime detection** on OHLC-style time-series data using **NHSMM**.  
+The same pattern applies to **IoT signals, health data, robotics telemetry, or cybersecurity logs**.
+
+---
+
+### 1. Prepare Data
 
 ```python
 import torch
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+
 from nhsmm.models import HSMM
+from nhsmm.context import CNN_LSTM_Encoder
+from nhsmm.constants import DTYPE
 
-# Example input sequence: 256 time steps, 32 features
-X = torch.randn(256, 32)
+# Synthetic example: [T, F] = time × features
+T, F = 512, 4
+X = np.random.randn(T, F)
 
-# Optional external context: market indicators, sensor readings, embeddings, etc.
-context = torch.randn(256, 16)  # 16-dimensional covariates
+# Scale features
+X = StandardScaler().fit_transform(X)
+X = torch.tensor(X, dtype=DTYPE)
+```
 
-# Initialize a 4-state Neural HSMM
-model = HSMM(
-    n_states=4,
-    context_dim=context.shape[1],  # enable context-aware modulation
-    hidden_dim=64,                 # hidden dimension for neural adapters
+### 2. Build Context Encoder (Optional but Recommended)
+
+Context enables non-stationary transitions and durations.
+
+```python
+encoder = CNN_LSTM_Encoder(
+    n_features=F,
+    cnn_channels=4,
+    hidden_dim=64,
 )
+```
 
-# Forward pass: compute log-likelihood
-log_prob = model.log_prob(X, context=context)
+### 3. Initialize Neural HSMM
 
-# Decode most likely state sequence (Viterbi)
-states = model.viterbi(X, context=context)
+```python
+model = HSMM(
+    encoder=encoder,
+    n_states=3,              # e.g. range / bull / bear
+    n_features=F,
+    emission_type="gaussian",
+    max_duration=30,
+    seed=0,
+)
+```
 
-# Sample synthetic sequences conditioned on context
-samples = model.sample(context=context)
+### 4. Train with EM-Style Optimization
 
-# Compute expected state durations
-expected_durations = model.duration.expected_duration(context=context)
+```python
+model.fit(
+    X,
+    n_init=3,
+    max_iter=10,
+    tol=1e-4,
+    verbose=True,
+)
+```
 
-print("Log-likelihood:", log_prob.item())
-print("Most likely states:", states.shape)
-print("Sampled states:", samples.shape)
-print("Expected durations per state:", expected_durations)
+### 5. Decode Hidden States (Viterbi) / Inspect
 
-# Explore tests and scripts for more examples
+```python
+states = model.decode(X, algorithm="viterbi")
+
+print("Decoded states shape:", states.shape)
+print("Unique states:", torch.unique(states))
+
+# Inspect Learned Durations
+with torch.no_grad():
+    durations = torch.exp(model.duration_module.log_matrix())
+    durations = durations.mean(dim=(0, 1))  # [K, D]
+
+for i, row in enumerate(durations):
+    mean_dur = (torch.arange(1, len(row) + 1) * row).sum()
+    print(f"State {i}: mean duration ≈ {mean_dur:.2f}")
+
+# Log-Likelihood Scoring
+log_likelihood = model.score(X)
+print("Sequence log-likelihood:", log_likelihood.item())
+
 ```
 
 ---

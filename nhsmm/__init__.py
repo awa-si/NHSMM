@@ -1,10 +1,9 @@
-from .convergence import ConvergenceTracker
-from . import constraints, utils
-from .seed import SeedGenerator
+from nhsmm.convergence import ConvergenceTracker
+from nhsmm.seed import SeedGenerator
+from nhsmm import constraints
 
 __all__ = [
     'ConvergenceTracker'
     'SeedGenerator',
     'constraints',
-    'utils',
 ]
