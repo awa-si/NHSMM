@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"
 keywords = ["HSMM", "Neural HSMM", "PyTorch", "sequence modeling", "temporal modeling"]
 authors = [
-    { name = "AWA", email = "your-email@example.com" }
+    { name = "AWA", email = "dev@awa.si" }
 ]
 license = { file = "LICENSE" }
 classifiers = [
@@ -20,7 +20,6 @@ classifiers = [
     "Programming Language :: Python :: 3.9",
     "License :: OSI Approved :: MIT License",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
-    "Framework :: PyTorch",
 ]
 
 dependencies = [
@@ -32,5 +31,5 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/awwea/NeuralHSMM"
-Repository = "https://github.com/awwea/NeuralHSMM"
+Homepage = "https://github.com/awa-si/NHSMM"
+Repository = "https://github.com/awa-si/NHSMM"
