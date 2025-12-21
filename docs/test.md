@@ -1,6 +1,10 @@
-## 🧪 State Occupancy & Transition Diagnostics
+## 🧪 State Occupancy & Duration/Transition Diagnostics
 
 This test demonstrates **how to inspect and validate the internal states of an NHSMM model** after training. It provides insights into the **initial distribution, transition probabilities, state durations, and inferred state occupancy**.
+
+```python
+    python3 NHSMM/scripts/main.py
+```
 
 ### Key Components
 
