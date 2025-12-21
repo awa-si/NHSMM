@@ -1,4 +1,3 @@
----
 
 # NHSMM — (Neural) Hidden Semi-Markov Models
 - *Repository: [NHSMM on GitHub](https://github.com/awa-si/nhsmm)*
