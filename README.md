@@ -1,7 +1,7 @@
 
 # NHSMM — (Neural) Hidden Semi-Markov Models
 - *Repository: [NHSMM on GitHub](https://github.com/awa-si/nhsmm)*
-- *Documentation: [wiki](https://github.com/awa-si/nhsmm/Wiki)*
+- *Documentation: [wiki](https://github.com/awa-si/nhsmm/wiki)*
 - *Version: 0.0.2-alpha*
 
 [![PyPI](https://img.shields.io/pypi/v/nhsmm.svg)](https://pypi.org/project/nhsmm/) [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0) [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
@@ -105,6 +105,8 @@ nhsmm/
 
 ## 🧠 Usage Example — Market Regime Detection (HSMM)
 
+* Please look also [State Occupancy & Transition Diagnostics](docs/test.md)
+
 This example demonstrates **Hidden Semi-Markov regime detection** on OHLC-style time-series data using **NHSMM**.  
 The same pattern applies to **IoT signals, health data, robotics telemetry, or cybersecurity logs**.
 
@@ -189,7 +191,6 @@ log_likelihood = model.score(X)
 print("Sequence log-likelihood:", log_likelihood.item())
 
 ```
-
 ---
 
 ## 🔍 Conceptual Flow Diagram
@@ -276,6 +277,6 @@ The **State Aware Engine (SAE)**, powered by **NHSMM**, is designed for **flexib
 ## 🧾 License
 
 This project is released under the **Apache License 2.0** © 2024 **AWA.SI**.  
-For full license terms and conditions, please see the [LICENSE](https://github.com/awa-si/nhsmm/LICENSE) file.
+For full license terms and conditions, please see the [LICENSE](https://github.com/awa-si/NHSMM/blob/develop/LICENSE) file.
 
 ---
