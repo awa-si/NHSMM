@@ -141,7 +141,7 @@ class Neural(nn.Module, ABC):
         spatial_adapter: bool = False,
         allow_projection: bool = True,
         learnable_scale: bool = True,
-        cache_enabled: bool = True,
+        cache_enabled: bool = False,
         layer_norm: bool = False,
         batch_norm: bool = False,
         max_delta: float = 0.5,
@@ -223,9 +223,9 @@ class Neural(nn.Module, ABC):
             "tanh": nn.Tanh(),
             "relu": nn.ReLU(),
             "gelu": nn.GELU(),
-            "leaky_relu": nn.LeakyReLU(0.01),
             "softplus": nn.Softplus(),
             "identity": nn.Identity(),
+            "leaky_relu": nn.LeakyReLU(0.01),
         }.get(name.lower(), nn.Identity())
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -458,7 +458,7 @@ class Neural(nn.Module, ABC):
     def sample(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
-        timestep: Optional[int] = None, **dist_kwargs):
+        timestep: Optional[int] = None, **dist_kwargs) -> torch.Tensor:
 
         n_states = self._shape[-1]
         dist = self._get_dist(context=context, temperature=temperature, timestep=timestep, **dist_kwargs)
@@ -485,7 +485,10 @@ class Neural(nn.Module, ABC):
             s = s.view(*s.shape[:-1], n_states)
         return s
 
-    def expected_probs(self, context: Optional[torch.Tensor] = None, temperature: Optional[float] = None, timestep: Optional[int] = None, **dist_kwargs):
+    def expected_probs(self,
+        context: Optional[torch.Tensor] = None,
+        temperature: Optional[float] = None,
+        timestep: Optional[int] = None, **dist_kwargs) -> torch.Tensor:
         mod_logits = self._modulate(context=context, temperature=temperature, timestep=timestep)
         return F.softmax(mod_logits, dim=-1)
 
@@ -648,14 +651,11 @@ class Initial(Neural):
     def __init__(
         self,
         n_states: int,
-        context_dim: Optional[int] = None,
+        init_mode: str = "normal",
         hidden_dim: Optional[int] = None,
-        init_mode: str = "uniform",
+        context_dim: Optional[int] = None,
     ):
         self._shape = (n_states,)
-        self.n_states = n_states
-        self.init_mode = init_mode
-
         super().__init__(
             target_dim=n_states,
             context_dim=context_dim,
@@ -663,7 +663,8 @@ class Initial(Neural):
             activation="tanh",
             final_activation="tanh",
         )
-
+        self.n_states = n_states
+        self.init_mode = init_mode
         self._init_params(mode=init_mode)
 
     def _init_params(self, mode: str, context: Optional[torch.Tensor] = None, jitter: float = 1e-5) -> torch.Tensor:
@@ -809,10 +810,10 @@ class Duration(Neural):
         self,
         n_states: int,
         max_duration: int = 40,
-        context_dim: Optional[int] = None,
-        hidden_dim: Optional[int] = None,
-        init_mode: str = "uniform",
         temperature: float = 1.0,
+        init_mode: str = "normal",
+        hidden_dim: Optional[int] = None,
+        context_dim: Optional[int] = None,
     ):
         self.init_mode = init_mode
         self.n_states = int(n_states)
@@ -1016,11 +1017,11 @@ class Transition(Neural):
         self,
         n_states: int,
         n_features: int,
-        context_dim: Optional[int] = None,
-        hidden_dim: Optional[int] = None,
-        transition_type: Union[str, constraints.Transitions] = "ergodic",
-        init_mode: str = "uniform",
         temperature: float = 1.0,
+        init_mode: str = "normal",
+        hidden_dim: Optional[int] = None,
+        context_dim: Optional[int] = None,
+        transition_type: Union[str, constraints.Transitions] = "ergodic",
     ):
         self.init_mode = init_mode
         self.n_states = int(n_states)
@@ -1263,7 +1264,7 @@ class Emission(Neural):
         self._invalidate_cache()
 
     @torch.no_grad()
-    def _init_params(self, mode: str, context: Optional[str] = None, jitter: float = 1e-5) -> None:
+    def _init_params(self, mode: str, context: Optional[torch.Tensor] = None, jitter: float = 1e-5) -> None:
         if mode == "random":
             init_mean = torch.randn(self.n_states, self.n_features, dtype=DTYPE) * 0.1
         elif mode == "spread":
@@ -1321,6 +1322,9 @@ class Emission(Neural):
             tensor = tensor.unsqueeze(1)  # [B, 1, K, F]
         return tensor
 
+    def _apply_constraints(self, tensor: Optional[torch.Tensor], mask: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
+        return tensor
+
     def _apply_context(self,
         base: torch.Tensor,
         context: Optional[torch.Tensor] = None,
@@ -1363,14 +1367,10 @@ class Emission(Neural):
             delta = delta.view(delta.shape[0], *shape_pad, *delta.shape[1:])
 
         tau = float(self.temperature if temperature is None else max(temperature, EPS))
-        mod = base + delta
-        mod = self._apply_constraints(mod)
+        mod = self._apply_constraints(base + delta)
         mod = self._apply_temperature(mod, tau)
         mod = self._tensor_shape(mod)
         return mod.detach() if grad_safe else mod
-
-    def _apply_constraints(self, tensor: Optional[torch.Tensor], mask: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
-        return tensor
 
     def _dist_params(self, loc: torch.Tensor, **dist_kwargs) -> dict:
         if self.emission_type == "gaussian":

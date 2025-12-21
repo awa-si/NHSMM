@@ -152,8 +152,8 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     np.random.seed(0)
 
-    MAX_ITER = 9
-    MAX_DURATION = 30
+    MAX_ITER = 3
+    MAX_DURATION = 35
     SYMBOL = "BTC/USDT:USDT"
     DATA_DIR = "/opt/trader/user_data/data/bybit/futures_"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -186,6 +186,7 @@ if __name__ == "__main__":
         emission_type="gaussian",
         max_duration=MAX_DURATION,
         seed=DEFAULT_RNG_SEED,
+        modulate_var=True,
         min_covar=1e-6,
         alpha=1.0,
     )

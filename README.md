@@ -1,51 +1,77 @@
+---
 
 # NHSMM — (Neural) Hidden Semi-Markov Models
-- *Documentation: [wiki](Wiki)*
+- *Repository: [NHSMM on GitHub](https://github.com/awa-si/nhsmm)*
+- *Documentation: [wiki](https://github.com/awa-si/nhsmm/Wiki)*
 - *Version: 0.0.2-alpha*
-
-> ⚠️ NHSMM is currently released as an **alpha version (0.0.2-alpha)**.
-> The public API may change prior to the first stable `1.0.0` release.
-
 
 [![PyPI](https://img.shields.io/pypi/v/nhsmm.svg)](https://pypi.org/project/nhsmm/) [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0) [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 
 ---
 
-**Overview:**  
-This document serves as a **self-contained guide** for NHSMM, the modular PyTorch library that forms the foundation for **State Aware Engine (SAE)**. It is suitable for **developers, data scientists, and system integrators** to understand, download, and start using the library across multiple domains.
+**Overview**  
+This document provides a **self-contained guide** to **NHSMM**, a modular PyTorch library that underpins the **State Aware Engine (SAE)**. It is designed for **developers, data scientists, and system integrators**, enabling them to quickly understand, deploy, and extend the library across diverse application domains.
 
-**Highlights HSMM + neural + contextual + hierarchical features**
+**Highlights**  
+- Combines **Hidden Semi-Markov Models (HSMMs)** with **neural parameterization**  
+- Supports **contextual modulation** of initial, transition, duration, and emission distributions  
+- Enables **hierarchical and flexible model architectures** for sequential data  
+- Fully **PyTorch-compatible**, GPU-ready, and extensible for multi-domain use
+
+> ⚠️ **NHSMM is currently in alpha** (v0.0.2-alpha) and provided as a **proof-of-concept**.  
+> It **will be enhanced for production**, and the public API is **subject to change** prior to the first stable `1.0.0` release.
+
 ---
 
 ## Overview
 
-**NHSMM** enables **temporal sequence modeling** and **hidden-state detection** using **Hidden Semi-Markov Models (HSMMs)**.
+**NHSMM** provides a **modular, time-aware framework** for **temporal sequence modeling** and **hidden-state inference** using **Hidden Semi-Markov Models (HSMMs)**. It explicitly models **state durations** and **context-dependent transitions**, making it suitable for **non-stationary, real-world sequences**.  
 
-It powers **SAE** State Aware Engine, a **cross-domain platform** for detecting hidden regimes in **IoT, Health, Security, Robotics, and Finance**. Anyway it can serve as solid base for any research project based on hsmm.
+It forms the foundation of the **State Aware Engine (SAE)**, a **cross-domain platform** for detecting **hidden regimes** and **temporal patterns** in domains such as **IoT, health, cybersecurity, robotics, and finance**. NHSMM can also serve as a robust base for **research projects and experimental HSMM applications**.
 
-**SAE** leverages NHSMM for:  
-- **Cloud-first SaaS deployment** for immediate access  
-- **On-prem / Edge deployment** for low-latency or privacy-sensitive systems  
-- **Quantum/hardware accelerator readiness** for next-generation predictive modeling
+Key deployment modes powered by SAE & NHSMM (Upcoming):  
+- **Cloud-first SaaS** — for scalable, multi-user access to sequence analytics  
+- **On-prem / Edge** — low-latency, privacy-sensitive inference for real-time systems  
+- **Hardware/Accelerator-ready** — GPU, TPU, or quantum-ready operations for high-throughput temporal modeling  
 
 ---
 
 ## 🚀 Key Features
 
-* Duration Models — explicit discrete duration distributions, context-modulated  
-* Emission Models — Gaussian, Multinomial, or Bernoulli outputs, fully differentiable  
-* Transition Models — learnable, covariate-aware transitions with gating and temperature scaling  
-* Contextual HSMM — external covariates dynamically modulate emissions, durations, and transitions  
-* HSMM-HMM Hybrid Inference — forward-backward and Viterbi algorithms adapted for neural components  
-* Subclassable Distributions — Initial, Duration, Transition, and Emission inherit from PyTorch `Distribution`  
-* EM-style Updates & Initialization — maximum likelihood or differentiable updates with temperature annealing  
-* Multi-Domain Usage — supports trading, IoT, robotics, wearable health, cybersecurity applications and even more...
-* Extensible — foundation for SAE adapters and API integration for multi-domain systems  
-* GPU-ready Implementation — fully batched operations for fast training and inference  
+* **Contextual HSMM** — external covariates dynamically modulate **initial, transition, duration, and emission distributions**, enabling **non-stationary and time-aware sequence modeling**. Supports continuous or discrete context inputs.  
+* **Duration Models** — explicit discrete duration distributions per state, optionally **context-modulated**, to capture **state dwell-times** accurately. Supports both short- and long-term temporal dependencies.  
+* **Emission Models** — Gaussian, Student-t, or discrete outputs (e.g., Multinomial/Bernoulli), fully differentiable and **context-aware**, allowing neural adaptation to evolving observation patterns.  
+* **Transition Models** — learnable, **covariate-aware transitions** with gating and **temperature scaling** to control stochasticity and enforce smooth or sharp transitions. Supports low-rank factorization for large state spaces.  
+* **Hybrid HSMM-HMM Inference** — forward-backward and Viterbi algorithms adapted for **neural-parameterized latent states**, providing exact or approximate **sequence likelihoods and most probable paths**.  
+* **Subclassable Distributions** — Initial, Duration, Transition, and Emission modules inherit from PyTorch `Distribution`, allowing **custom probabilistic modules** or integration of specialized neural layers.  
+* **EM-style Updates & Initialization** — supports **maximum likelihood**, differentiable updates, and **temperature annealing** for stable and adaptive training of neural-HSMM parameters.  
+* **Neural Context Encoders** — optional CNN, LSTM, or hybrid encoders to inject **time-varying covariates** into emission, duration, and transition probabilities.  
+* **GPU-Ready Implementation** — fully batched operations for **fast training and inference** on modern accelerators (CUDA-ready).  
+* **Multi-Domain Usage** — flexible for **finance (market regime detection), IoT (predictive maintenance), robotics (behavior monitoring), wearable health (activity and state detection), cybersecurity (anomaly detection)**, and other sequential applications.  
+* **Extensible Architecture** — modular foundation for SAE adapters, API integration, multi-domain extensions, and **future research projects** in sequence modeling.  
+* **Robust Initialization & Adaptivity** — supports **spread or random initialization**, learning rate adaptation, and state-wise parameter modulation for stable convergence across domains.  
+* **Hybrid Update Modes** — allows **neural gradient-based updates** and **closed-form EM-style updates**, optionally combined in alternating schemes for best performance.  
+
+---
+
+## 📌 Milestones
+
+| Stage                  | Status  | Notes                                                |
+|------------------------|---------|----------------------------------------------------- |
+| Proof of Concept       | ✅ Done | Alpha release (0.0.2-alpha)                          |
+| Enhancement            | ⚠️ Todo | Improve performance, stability, and extend API       |
+| Testing                | ⚠️ Todo | Rigorous validation, benchmarking, and QA            |
+| Production Release     | ⚠️ Todo | Full 1.0.0 release with documentation and stable API |
 
 ---
 
 ## 📦 Installation
+
+### From PyPI (now available)
+
+```bash
+pip install nhsmm;
+```
 
 ### From Source (Recommended for Development)
 
@@ -53,12 +79,6 @@ It powers **SAE** State Aware Engine, a **cross-domain platform** for detecting 
 git clone https://github.com/awa-si/NHSMM.git;
 cd NHSMM;
 pip install -e .;
-```
-
-### From PyPI (Upcoming)
-
-```bash
-pip install nhsmm;
 ```
 
 ---
@@ -176,41 +196,56 @@ print("Sequence log-likelihood:", log_likelihood.item())
 ## 🔍 Conceptual Flow Diagram
 
 ```
-    ┌───────────────┐
-    │ External Input│  ← covariates, features, embeddings
-    └───────┬───────┘
-            │
-            ▼
-┌─────────────────────────┐
-│ Neural Initial State    │  ← context-modulated initial probabilities
-│ Distribution            │
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│ Neural Transition       │  ← context-gated, temperature-scaled transitions
-│ Distribution            │
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│ Neural Duration         │  ← context-aware duration probabilities per state
-│ Distribution            │
-└───────────┬─────────────┘
-            │
-            ▼
-┌─────────────────────────┐
-│ Emission Model          │  ← context-modulated observation likelihoods
-│ (Gaussian / Multinomial)│
-└─────────────────────────┘
+┌─────────────────────────────┐
+│      External Input         │  ← covariates, features, embeddings
+└─────────────┬───────────────┘
+              │
+              ▼
+┌─────────────────────────────┐
+│  Neural Initial State Module│  ← context-modulated initial probabilities π
+└─────────────┬───────────────┘
+              │
+              ▼
+┌─────────────────────────────┐
+│  Neural Transition Module   │  ← context-gated, temperature-scaled transitions A
+└─────────────┬───────────────┘
+              │
+              ▼
+┌─────────────────────────────┐
+│  Neural Duration Module     │  ← context-aware duration probabilities D
+└─────────────┬───────────────┘
+              │
+              ▼
+┌─────────────────────────────┐
+│      Emission Module        │  ← context-modulated observation likelihoods
+│   (Gaussian / Student-t / …)│
+└─────────────┬───────────────┘
+              │
+              ▼
+      ┌─────────────┐
+      │ Posterior   │  ← gamma, xi, eta (inference)
+      └─────────────┘
+              ▲
+              │
+   ┌──────────┴──────────┐
+   │ Backprop / EM Update │
+   └─────────────────────┘
+
 ```
 
 ---
 
 ## ⚙️ Development
 
+> NHSMM is actively developed and **contributions are welcome**!
+> Whether you want to report bugs, suggest features, or improve documentation, your input helps make the library stronger and more versatile.
+
 ```bash
-# Install in development mode
+# Fork or clone the repository
+git clone https://github.com/awa-si/nhsmm.git
+cd nhsmm
+
+# Install in development mode with optional dev dependencies
 pip install -e ".[dev]"
 
 # Run tests
@@ -225,17 +260,23 @@ ruff check nhsmm
 
 ## 🌐 Multi-Domain Applicability
 
-SAE (built on NHSMM) can be applied to:
+The **State Aware Engine (SAE)**, powered by **NHSMM**, is designed for **flexible, context-aware temporal modeling** across diverse domains:
 
-* Security / Cyber-Physical Systems — Identify hidden network or operational states  
-* Finance / Trading — Market regime detection and adaptive strategy modeling
-* IoT / Industrial Systems — Predict machine regime changes for maintenance  
-* Health / Wearables — Detect activity and physiological state transitions  
-* Robotics / Motion — Monitor robot behavior for unexpected transitions  
+* **Security & Cyber-Physical Systems** — Detect hidden operational or network states, anomalies, and potential threats in real time. Supports **log analysis, sensor fusion, and adaptive monitoring**.  
+* **Finance & Trading** — Identify market regimes, model **adaptive strategies**, and forecast **state transitions** for portfolios, trading signals, or risk scenarios. Captures both **short-term fluctuations and long-term trends**.  
+* **IoT & Industrial Systems** — Monitor machines, sensors, and processes to predict **regime changes**, enabling **predictive maintenance**, fault detection, and operational optimization.  
+* **Health & Wearables** — Track activity, physiological signals, and **state transitions** for personalized health monitoring, anomaly detection, or chronic condition management. Supports **multimodal time-series fusion**.  
+* **Robotics & Motion Analytics** — Observe robotic behaviors, detect **unexpected transitions**, optimize task performance, and ensure **safe human-robot interaction**.  
+* **Telecommunications & Network Analytics** — Monitor network traffic patterns, detect **latent congestion states**, and predict **temporal anomalies** for automated response.  
+* **Energy & Smart Grids** — Track operational states of energy systems, detect **load or failure regimes**, and optimize resource allocation over time.  
+* **Cross-Domain Research & AI Applications** — Serve as a foundation for **temporal sequence modeling**, hybrid HSMM-HMM experiments, or **research in neural probabilistic models**.  
 
 ---
 
+
 ## 🧾 License
 
-Apache 2.0 © 2025 AWA.SI
-*See [LICENSE](LICENSE) for details.*
+This project is released under the **Apache License 2.0** © 2024 **AWA.SI**.  
+For full license terms and conditions, please see the [LICENSE](https://github.com/awa-si/nhsmm/LICENSE) file.
+
+---
