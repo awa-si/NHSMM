@@ -78,6 +78,59 @@ def test_basic():
     print("Sample vector:", sample_vec.detach().cpu().numpy())
     print("Sample index (argmax):", sample_vec.argmax().item())
 
+def test_initialize():
+    print("\n=== TEST: initialize() for all init modes ===")
+
+    n_states = 5
+    modes = ["uniform", "biased", "normal"]
+
+    for mode in modes:
+        print(f"\n--- init_mode={mode} ---")
+        init = Initial(n_states=n_states, init_mode=mode)
+
+        dist = init.initialize(mode=mode)
+        logits = init.logits.detach()
+
+        print("Logits:", logits.cpu().numpy())
+        print("Dist:", dist)
+
+        assert logits.shape == (n_states,)
+        assert torch.isfinite(logits).all()
+
+        probs = torch.softmax(logits, dim=-1)
+        print("Probs:", probs.cpu().numpy())
+        print("Sum probs:", probs.sum().item())
+
+        assert torch.allclose(probs.sum(), torch.tensor(1.0), atol=1e-5)
+        assert torch.all(probs >= 0)
+
+    print("\n=== TEST: initialize() with context ===")
+
+    context_dim = 4
+    hidden_dim = 16
+    ctx = torch.randn(3, context_dim)
+
+    init = Initial(
+        n_states=n_states,
+        init_mode="normal",
+        context_dim=context_dim,
+        hidden_dim=hidden_dim
+    )
+
+    dist = init.initialize(mode="normal", context=ctx)
+    logits = init.logits.detach()
+
+    print("Context shape:", ctx.shape)
+    print("Context-conditioned logits:", logits.cpu().numpy())
+
+    assert logits.shape == (n_states,)
+    assert torch.isfinite(logits).all()
+
+    probs = torch.softmax(logits, dim=-1)
+    assert torch.allclose(probs.sum(), torch.tensor(1.0), atol=1e-5)
+
+    print("\n✓ initialize() passed all modes and context cases")
+
 def test_temperature():
     print("\n=== TEST: Temperature Scaling ===")
     init = Initial(n_states=4, init_mode="uniform")
@@ -249,6 +302,7 @@ def test_update_and_cache():
 
 if __name__ == "__main__":
     test_basic()
+    test_initialize()
     test_temperature()
     test_context_single()
     test_context_batch()

@@ -9,7 +9,6 @@ from nhsmm.context import CNN_LSTM_Encoder, ContextEncoder
 def set_seed(seed: int = 42):
     torch.manual_seed(seed)
 
-# ---------------- ContextEncoder + CNN_LSTM_Encoder ----------------
 def test_context_encoder():
     print("\n=== TEST: ContextEncoder + CNN_LSTM_Encoder with Transition ===")
     B, T, F_in = 4, 8, 6
@@ -47,7 +46,6 @@ def test_context_encoder():
 
         # Verify row sums = 1
         assert torch.allclose(probs.sum(dim=-1), torch.ones(B, n_states), atol=1e-5)
-
 
 def test_context_encoder_sequence():
     print("\n=== TEST: Sequence Context + ContextEncoder + CNN_LSTM_Encoder with Transition ===")
@@ -88,8 +86,6 @@ def test_context_encoder_sequence():
             # Verify each row sums to 1
             assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
 
-
-# ---------------- Basic Functionality ----------------
 def test_basic():
     print("\n=== TEST: Basic Functionality ===")
     tr = Transition(n_states=3, n_features=3)
@@ -104,8 +100,62 @@ def test_basic():
     print("Sample vector shape:", sample_vec.shape)
     print("Sample argmax per row:", sample_vec.argmax(dim=-1))
 
+def test_initialize():
+    print("\n=== TEST: Transition.initialize() for all init modes ===")
 
-# ---------------- Temperature Scaling ----------------
+    n_states = 5
+    modes = ["uniform", "biased", "normal"]
+
+    for mode in modes:
+        print(f"\n--- init_mode={mode} ---")
+        transition = Transition(n_states=n_states, n_features=n_states, init_mode=mode)
+
+        dist = transition.initialize(mode=mode)
+        logits = transition.logits.detach()
+
+        print("Logits:\n", logits.cpu().numpy())
+        print("Dist:", dist)
+
+        assert logits.shape == (n_states, n_states)
+        assert torch.isfinite(logits).all()
+
+        probs = torch.softmax(logits, dim=-1)
+        print("Probs:\n", probs.cpu().numpy())
+        print("Row sums:", probs.sum(dim=-1).cpu().numpy())
+
+        assert torch.allclose(probs.sum(dim=-1), torch.ones(n_states), atol=1e-5)
+        assert torch.all(probs >= 0)
+
+    print("\n=== TEST: initialize() with context ===")
+
+    context_dim = 4
+    hidden_dim = 16
+    batch_size = 3
+    ctx = torch.randn(batch_size, context_dim)
+
+    transition = Transition(
+        n_states=n_states,
+        n_features=n_states,
+        init_mode="normal",
+        context_dim=context_dim,
+        hidden_dim=hidden_dim
+    )
+
+    # Context-conditioned initialization
+    dist = transition.initialize(mode="normal", context=ctx)
+    logits = transition.logits.detach()
+
+    print("Context shape:", ctx.shape)
+    print("Context-conditioned logits:\n", logits.cpu().numpy())
+
+    assert logits.shape == (n_states, n_states)
+    assert torch.isfinite(logits).all()
+
+    probs = torch.softmax(logits, dim=-1)
+    assert torch.allclose(probs.sum(dim=-1), torch.ones(n_states), atol=1e-5)
+
+    print("\n✓ Transition.initialize() passed all modes and context cases")
+
 def test_temperature():
     print("\n=== TEST: Temperature Scaling ===")
     tr = Transition(n_states=3, n_features=3)
@@ -118,8 +168,6 @@ def test_temperature():
     assert cold.shape[-2:] == (tr.n_states, tr.n_states)
     assert hot.shape[-2:] == (tr.n_states, tr.n_states)
 
-
-# ---------------- Context Tests ----------------
 def test_context_single():
     print("\n=== TEST: Context Single ===")
     tr = Transition(n_states=2, n_features=2, context_dim=4, hidden_dim=8)
@@ -128,7 +176,6 @@ def test_context_single():
     print("Single context probs shape:", probs.shape)
     print("Row sums:", probs.sum(dim=-1))
     assert torch.allclose(probs.sum(dim=-1), torch.ones_like(probs[..., 0]), atol=1e-5)
-
 
 def test_context_batch():
     print("\n=== TEST: Context Batch ===")
@@ -139,8 +186,6 @@ def test_context_batch():
     print("Row sums per batch:", probs.sum(dim=-1))
     assert torch.allclose(probs.sum(dim=-1), torch.ones_like(probs[..., 0]), atol=1e-5)
 
-
-# ---------------- Timestep Handling ----------------
 def test_timestep():
     print("\n=== TEST: Timestep Handling ===")
     tr = Transition(n_states=2, n_features=2)
@@ -148,8 +193,6 @@ def test_timestep():
     print("mod(t=3) shape:", mod.shape)
     assert mod.shape[-2:] == (tr.n_states, tr.n_states)
 
-
-# ---------------- Constraint Tests ----------------
 def test_constraints():
     print("\n=== TEST: Constraint Types ===")
     tr_ltr = Transition(n_states=3, n_features=3, transition_type="left-to-right")
@@ -158,8 +201,6 @@ def test_constraints():
     tr_semi = Transition(n_states=3, n_features=3, transition_type="semi")
     print("Semi-Markov mask logits:\n", tr_semi.log_matrix().detach())
 
-
-# ---------------- Sampling Correctness ----------------
 def test_sampling_correctness(N: int = 5000):
     print("\n=== TEST: Sampling Correctness ===")
     tr = Transition(n_states=2, n_features=2, init_mode="uniform")
@@ -176,8 +217,6 @@ def test_sampling_correctness(N: int = 5000):
     print("Difference:\n", empirical - probs)
     assert torch.allclose(empirical, probs, atol=0.05)
 
-
-# ---------------- Gradient Flow ----------------
 def test_gradient_flow():
     print("\n=== TEST: Gradient Flow ===")
     tr = Transition(n_states=2, n_features=2, context_dim=3, hidden_dim=6)
@@ -197,8 +236,6 @@ def test_gradient_flow():
     tr.expected_probs().sum().backward()
     print("Logits grad norm (no context):", tr.logits.grad.norm().item())
 
-
-# ---------------- Edge Cases ----------------
 def test_edge_cases():
     print("\n=== TEST: Edge Cases ===")
     tr1 = Transition(n_states=1, n_features=1)
@@ -208,8 +245,6 @@ def test_edge_cases():
     out = tr_large.sample()
     print("Large batch sample shape:", out.shape)
 
-
-# ---------------- Update and Cache ----------------
 def test_update_cache():
     print("\n=== TEST: Update and Cache ===")
     tr = Transition(n_states=2, n_features=2, context_dim=3, hidden_dim=8)
@@ -224,8 +259,6 @@ def test_update_cache():
     out3 = tr.sample(context=ctx)
     print("Updated sample shape:", out3.shape)
 
-
-# ---------------- Batch + Timestep Modulation ----------------
 def test_batch_timestep_modulation():
     print("\n=== TEST: Batch + Timestep Modulation ===")
     tr = Transition(n_states=3, n_features=3)
@@ -241,8 +274,6 @@ def test_batch_timestep_modulation():
     single_mod = torch.stack([tr._modulate(timestep=t) for t in range(2, 4)], dim=0)
     print("Single batch modulated logits shape:", single_mod.shape)
 
-
-# ---------------- Log Matrix ----------------
 def test_log_matrix():
     print("\n=== TEST: Transition Log Matrix ===")
 
@@ -267,10 +298,10 @@ def test_log_matrix():
     )
 
 
-# ---------------- Main ----------------
 if __name__ == "__main__":
     set_seed()
     test_basic()
+    test_initialize()
     test_temperature()
     test_context_single()
     test_context_batch()

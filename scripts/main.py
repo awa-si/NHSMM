@@ -258,6 +258,7 @@ if __name__ == "__main__":
     torch.manual_seed(DEFAULT_RNG_SEED)
     np.random.seed(DEFAULT_RNG_SEED)
 
+    INIT_MAX = 3
     MAX_ITER = 3
     MAX_DURATION = 35
     SYMBOL = "BTC/USDT:USDT"
@@ -300,7 +301,7 @@ if __name__ == "__main__":
     # --- EM Training ---
     t0 = time.time()
     print("\n=== EM Training ===")
-    model.fit(X_torch, n_init=3, tol=1e-4, max_iter=MAX_ITER, verbose=True)
+    model.fit(X_torch, n_init=INIT_MAX, tol=1e-4, max_iter=MAX_ITER, verbose=True)
     elapsed = time.time() - t0
 
     # --- Decode hidden states ---
@@ -336,10 +337,10 @@ if __name__ == "__main__":
 
     # --- State occupancy & transition diagnostics ---
     with torch.no_grad():
-        # ---- Initial state distribution ----
-        log_init = model.initial_module.log_matrix()      # [B,T,K]
-        log_init_mean = log_init.mean(dim=(0, 1))         # [K]
-        init_probs = torch.softmax(log_init_mean, dim=-1).cpu().numpy()
+        # ---- Initial state distribution (t=0 only) ----
+        log_init = model.initial_module.log_matrix()  # [B,T,K]
+        init_probs = torch.softmax(log_init[:, 0], dim=-1).mean(dim=0)  # only timestep 0
+        init_probs = init_probs.cpu().numpy().flatten()
 
         print("\n=== Initial State Distribution ===")
         for i, p in enumerate(init_probs):

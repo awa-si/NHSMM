@@ -1,5 +1,6 @@
 
 # NHSMM — (Neural) Hidden Semi-Markov Models
+
 - *Repository: [NHSMM on GitHub](https://github.com/awa-si/nhsmm)*
 - *Documentation: [wiki](https://github.com/awa-si/nhsmm/wiki)*
 - *Version: 0.0.2-alpha*
@@ -8,7 +9,9 @@
 
 ---
 
-**Overview**  
+> ⚠️ **NHSMM is currently in alpha** (v0.0.2-alpha) and provided as a **proof-of-concept**.  
+> It **will be enhanced for production**, and the public API is **subject to change** prior to the first stable `1.0.0` release.
+
 This document provides a **self-contained guide** to **NHSMM**, a modular PyTorch library that underpins the **State Aware Engine (SAE)**. It is designed for **developers, data scientists, and system integrators**, enabling them to quickly understand, deploy, and extend the library across diverse application domains.
 
 **Highlights**  
@@ -16,9 +19,6 @@ This document provides a **self-contained guide** to **NHSMM**, a modular PyTorc
 - Supports **contextual modulation** of initial, transition, duration, and emission distributions  
 - Enables **hierarchical and flexible model architectures** for sequential data  
 - Fully **PyTorch-compatible**, GPU-ready, and extensible for multi-domain use
-
-> ⚠️ **NHSMM is currently in alpha** (v0.0.2-alpha) and provided as a **proof-of-concept**.  
-> It **will be enhanced for production**, and the public API is **subject to change** prior to the first stable `1.0.0` release.
 
 ---
 
@@ -66,7 +66,7 @@ Key deployment modes powered by SAE & NHSMM (Upcoming):
 
 ## 📦 Installation
 
-### From PyPI (now available)
+### From PyPI (now also available)
 
 ```bash
 pip install nhsmm;
@@ -76,6 +76,7 @@ pip install nhsmm;
 
 ```bash
 git clone https://github.com/awa-si/NHSMM.git;
+
 cd NHSMM;
 pip install -e .;
 ```
@@ -105,9 +106,9 @@ nhsmm/
 
 ## 🧠 Usage Example — Market Regime Detection (HSMM)
 
-* Please look also [State Occupancy & Transition Diagnostics](docs/test.md)
+* Please tke a look also at test: [State Occupancy & Duration/Transition Diagnostics](docs/test.md)
 
-This example demonstrates **Hidden Semi-Markov regime detection** on OHLC-style time-series data using **NHSMM**.  
+This example demonstrates **Hidden Semi-Markov regime detection** on OHLCV-style time-series data using **NHSMM**.  
 The same pattern applies to **IoT signals, health data, robotics telemetry, or cybersecurity logs**.
 
 ---
@@ -124,7 +125,7 @@ from nhsmm.context import CNN_LSTM_Encoder
 from nhsmm.constants import DTYPE
 
 # Synthetic example: [T, F] = time × features
-T, F = 512, 4
+T, F = 512, 5
 X = np.random.randn(T, F)
 
 # Scale features
@@ -191,6 +192,7 @@ log_likelihood = model.score(X)
 print("Sequence log-likelihood:", log_likelihood.item())
 
 ```
+
 ---
 
 ## 🔍 Conceptual Flow Diagram

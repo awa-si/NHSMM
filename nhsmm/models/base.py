@@ -505,22 +505,8 @@ class HSMM(nn.Module):
     def _viterbi(self,
         X: SequenceSet,
         theta: Optional[Union[torch.Tensor, ContextRouter]] = None,
-        duration_temp: float = 0.0,
-        transition_temp: float = 0.0,
-        duration_weight: float = 0.0) -> list[torch.Tensor]:
-        """
-        Viterbi decoding for HSMM.
+        duration_temp: float = 0.0, transition_temp: float = 0.0, duration_weight: float = 0.0) -> list[torch.Tensor]:
 
-        Args:
-            X: SequenceSet with sequences, masks, contexts
-            theta: optional context router
-            duration_temp: temperature scaling for durations
-            transition_temp: temperature scaling for transitions
-            duration_weight: weight for duration logits in score
-
-        Returns:
-            List of tensors [Ti] with predicted states
-        """
         K, Dmax = self.n_states, self.max_duration
         predicted: list[torch.Tensor] = []
 
@@ -531,6 +517,7 @@ class HSMM(nn.Module):
 
         for b in range(B):
             L = int(router.mask[b].sum())
+            print(f"[DEBUG][Batch {b}] sequence length L={L}, max_duration={Dmax}")
             if L == 0:
                 predicted.append(torch.empty(0, dtype=torch.long, device=device))
                 continue
@@ -538,7 +525,6 @@ class HSMM(nn.Module):
             ctx = router.context[b:b+1, :L]
             canon = router.canonical[b:b+1]
 
-            # Initial / duration / transition logits
             init_logits = self.initial_module.log_matrix(context=canon)[0, 0]
             dur_logits = self.duration_module.log_matrix(context=ctx)[0]
             trans_logits = self.transition_module.log_matrix(context=ctx)[0]
@@ -554,24 +540,31 @@ class HSMM(nn.Module):
             back_ptr = torch.full((L, K), -1, device=device, dtype=torch.long)
             best_dur = torch.zeros((L, K), device=device, dtype=torch.long)
 
+            log_every = 50  # only log every 10 steps
             for t in range(L):
                 max_d = min(Dmax, t + 1)
                 durations = durations_full[:max_d]
                 starts = t - durations + 1
 
-                emit_sums = (cumsum_emit[t + 1] - cumsum_emit[starts]).T
-                scores_dur = dur_logits[t, :, :max_d] + emit_sums
+                emit_sums = (cumsum_emit[t + 1] - cumsum_emit[starts]).T  # [K, max_d]
+                scores_dur = dur_logits[t, :, :max_d] + emit_sums          # [K, max_d]
+
+                if (t % log_every == 0 or t == L-1):
+                    print(f"[DEBUG][Batch {b}][t={t}] max_d={max_d}, "
+                          f"durations={durations.tolist()}, "
+                          f"scores_dur max={scores_dur.max().item():.2f}, "
+                          f"min={scores_dur.min().item():.2f}")
 
                 if t == 0:
                     scores = init_logits[:, None] + scores_dur
                     V[t], idx = scores.max(dim=1)
+                    idx = idx.clamp(max=len(durations)-1)
                     best_dur[t] = durations[idx]
                     continue
 
                 prev_t = torch.clamp(starts - 1, min=0)
                 prev_V = V[prev_t].T.unsqueeze(2)
                 trans = trans_logits[t].unsqueeze(1)
-
                 prev_scores = prev_V + trans
 
                 mask_start0 = (starts == 0)
@@ -579,16 +572,12 @@ class HSMM(nn.Module):
                     prev_scores[:, mask_start0, :] = init_logits[None, None, :]
 
                 prev_max, prev_arg = prev_scores.max(dim=0)
+                prev_arg = prev_arg.clamp(max=K-1)
                 scores = prev_max.T + scores_dur
-
                 V[t], dur_idx = scores.max(dim=1)
+                dur_idx = dur_idx.clamp(max=len(durations)-1)
                 best_dur[t] = durations[dur_idx]
-
-                back_ptr[t] = torch.where(
-                    best_dur[t] == 1,
-                    -1,
-                    prev_arg[dur_idx, torch.arange(K, device=device)]
-                )
+                back_ptr[t] = torch.where(best_dur[t] == 1, -1, prev_arg[dur_idx, torch.arange(K, device=device)])
 
             # Backtracking
             t = L - 1
@@ -610,6 +599,8 @@ class HSMM(nn.Module):
                 for start, end, st in segments
             ])
             predicted.append(path[:L])
+
+        return predicted
 
         return predicted
 
@@ -782,7 +773,7 @@ class HSMM(nn.Module):
             if preserve_best and hasattr(self, "_best_state") and module_name.replace("_module","") in self._best_state:
                 module.load_state_dict(self._best_state[module_name.replace("_module","")])
             else:
-                module.reset_parameters()
+                module.initialize()
 
         if self.encoder is not None:
             if preserve_best and hasattr(self, "_best_state") and "encoder" in self._best_state:

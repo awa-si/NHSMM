@@ -9,7 +9,6 @@ from nhsmm.context import CNN_LSTM_Encoder, ContextEncoder
 def set_seed(seed: int = 42):
     torch.manual_seed(seed)
 
-# ---------------- Basic Functionality ----------------
 def test_basic():
     print("\n=== TEST: Basic Functionality ===")
     dur = Duration(n_states=3, max_duration=5)
@@ -22,7 +21,66 @@ def test_basic():
     print("Sample argmax shape:", sample_vec.argmax(dim=-1).shape)
     assert torch.allclose(probs.sum(dim=-1), torch.ones(dur.n_states), atol=1e-5)
 
-# ---------------- Temperature Scaling ----------------
+def test_initialize():
+    print("\n=== TEST: Duration.initialize() for all init modes ===")
+
+    n_states = 5
+    max_duration = 10
+    modes = ["uniform", "biased", "normal"]
+
+    for mode in modes:
+        print(f"\n--- init_mode={mode} ---")
+        duration = Duration(n_states=n_states, max_duration=max_duration, init_mode=mode)
+
+        dist = duration.initialize(mode=mode)
+        logits = duration.logits.detach()
+
+        print("Logits:\n", logits.cpu().numpy())
+        print("Dist:", dist)
+
+        # Check shape
+        assert logits.shape == (n_states, max_duration)
+        # Ensure all finite values
+        assert torch.isfinite(logits).all()
+
+        probs = torch.softmax(logits, dim=-1)
+        print("Probs:\n", probs.cpu().numpy())
+        print("Sum probs per state:", probs.sum(dim=-1).cpu().numpy())
+
+        # Each row sums to 1
+        assert torch.allclose(probs.sum(dim=-1), torch.ones(n_states), atol=1e-5)
+        # All probabilities non-negative
+        assert torch.all(probs >= 0)
+
+    print("\n=== TEST: Duration.initialize() with context ===")
+
+    context_dim = 4
+    hidden_dim = 16
+    ctx = torch.randn(3, context_dim)
+
+    duration = Duration(
+        n_states=n_states,
+        max_duration=max_duration,
+        init_mode="normal",
+        context_dim=context_dim,
+        hidden_dim=hidden_dim
+    )
+
+    dist = duration.initialize(mode="normal", context=ctx)
+    logits = duration.logits.detach()
+
+    print("Context shape:", ctx.shape)
+    print("Context-conditioned logits:\n", logits.cpu().numpy())
+
+    # Check shape and finite values
+    assert logits.shape == (n_states, max_duration)
+    assert torch.isfinite(logits).all()
+
+    probs = torch.softmax(logits, dim=-1)
+    assert torch.allclose(probs.sum(dim=-1), torch.ones(n_states), atol=1e-5)
+
+    print("\n✓ Duration.initialize() passed all modes and context cases")
+
 def test_temperature():
     print("\n=== TEST: Temperature Scaling ===")
     dur = Duration(n_states=2, max_duration=4)
@@ -32,7 +90,6 @@ def test_temperature():
     print("Hot logits shape:", hot.shape)
     assert cold.shape == hot.shape
 
-# ---------------- Context Tests ----------------
 def test_context():
     print("\n=== TEST: Context ===")
     dur = Duration(n_states=2, max_duration=4, context_dim=3, hidden_dim=8)
@@ -45,7 +102,6 @@ def test_context():
     assert torch.allclose(probs_single.sum(dim=-1), torch.ones(dur.n_states), atol=1e-5)
     assert torch.allclose(probs_batch.sum(dim=-1), torch.ones_like(probs_batch.sum(dim=-1)), atol=1e-5)
 
-# ---------------- Log Matrix ----------------
 def test_log_matrix():
     print("\n=== TEST: Log Matrix ===")
     dur = Duration(n_states=2, max_duration=4)
@@ -55,7 +111,6 @@ def test_log_matrix():
     print("Softmax row sums:", probs.sum(-1))
     assert torch.allclose(probs.sum(-1), torch.ones_like(probs[..., 0]), atol=1e-6)
 
-# ---------------- Sequence Log Prob ----------------
 def test_sequence_log_prob():
     print("\n=== TEST: Sequence Log Prob ===")
     dur = Duration(n_states=2, max_duration=4)
@@ -65,7 +120,6 @@ def test_sequence_log_prob():
     idx_log_probs = torch.gather(log_probs, -1, seqs)
     print("Sequences shape:", seqs.shape, "log_probs shape:", log_probs.shape, "Indexed shape:", idx_log_probs.shape)
 
-# ---------------- Sampling Correctness ----------------
 def test_sampling_correctness(N=5000):
     print("\n=== TEST: Sampling Correctness ===")
     dur = Duration(n_states=2, max_duration=4)
@@ -80,7 +134,6 @@ def test_sampling_correctness(N=5000):
     print("Difference:", empirical - probs[0])
     assert torch.allclose(empirical, probs[0], atol=0.05)
 
-# ---------------- Gradient Flow ----------------
 def test_gradient_flow():
     print("\n=== TEST: Gradient Flow ===")
     dur = Duration(n_states=2, max_duration=4, context_dim=3, hidden_dim=8)
@@ -98,7 +151,6 @@ def test_gradient_flow():
     dur.expected_probs().sum().backward()
     print("Logits grad norm (no context):", dur.logits.grad.norm().item())
 
-# ---------------- Edge Cases ----------------
 def test_edge_cases():
     print("\n=== TEST: Edge Cases ===")
     dur1 = Duration(n_states=1, max_duration=1)
@@ -107,7 +159,6 @@ def test_edge_cases():
     out = dur.sample()
     print("Large batch (context=None) OK, sample shape:", out.shape)
 
-# ---------------- Update and Cache ----------------
 def test_update_cache():
     print("\n=== TEST: Update and Cache ===")
     dur = Duration(n_states=2, max_duration=4, context_dim=3, hidden_dim=8)
@@ -120,7 +171,6 @@ def test_update_cache():
     out3 = dur.sample(context=ctx)
     print("Updated sample shape:", out3.shape)
 
-# ---------------- Timestep & Batch Modulation ----------------
 def test_batch_timestep_modulation():
     print("\n=== TEST: Batch + Timestep Modulation ===")
     dur = Duration(n_states=3, max_duration=5)
@@ -133,7 +183,6 @@ def test_batch_timestep_modulation():
     single_mod = torch.stack([dur._modulate(timestep=t) for t in range(2, 4)], dim=0)
     print("Single batch modulated logits shape:", single_mod.shape)
 
-# ---------------- ContextEncoder + CNN_LSTM ----------------
 def test_context_encoder():
     print("\n=== TEST: ContextEncoder + CNN_LSTM_Encoder with Duration ===")
     B, T, F_in = 4, 8, 6
@@ -211,6 +260,7 @@ def test_hsmm_forward_backward():
 if __name__ == "__main__":
     set_seed()
     test_basic()
+    test_initialize()
     test_temperature()
     test_context()
     test_log_matrix()
