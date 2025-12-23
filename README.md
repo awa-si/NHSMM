@@ -3,13 +3,13 @@
 
 - *Repository: [NHSMM on GitHub](https://github.com/awa-si/nhsmm)*
 - *Documentation: [wiki](https://github.com/awa-si/nhsmm/wiki)*
-- *Version: 0.0.2-alpha*
+- *Version: 0.0.3-alpha*
 
 [![PyPI](https://img.shields.io/pypi/v/nhsmm.svg)](https://pypi.org/project/nhsmm/) [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0) [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 
 ---
 
-> ⚠️ **NHSMM is currently in alpha** (v0.0.2-alpha) and provided as a **proof-of-concept**.  
+> ⚠️ **NHSMM is currently in alpha** (v0.0.3-alpha) and provided as a **proof-of-concept**.  
 > It **will be enhanced for production**, and the public API is **subject to change** prior to the first stable `1.0.0` release.
 
 This document provides a **self-contained guide** to **NHSMM**, a modular PyTorch library that underpins the **State Aware Engine (SAE)**. It is designed for **developers, data scientists, and system integrators**, enabling them to quickly understand, deploy, and extend the library across diverse application domains.
@@ -24,14 +24,17 @@ This document provides a **self-contained guide** to **NHSMM**, a modular PyTorc
 
 ## Overview
 
-**NHSMM** provides a **modular, time-aware framework** for **temporal sequence modeling** and **hidden-state inference** using **Hidden Semi-Markov Models (HSMMs)**. It explicitly models **state durations** and **context-dependent transitions**, making it suitable for **non-stationary, real-world sequences**.  
+**NHSMM** provides a **modular, time-aware framework** for **temporal sequence modeling** and **hidden-state inference** using **Hidden Semi-Markov Models (HSMMs)**. It explicitly models **state durations** and **context-dependent transitions**, making it suitable for **non-stationary, real-world sequences**.
 
-It forms the foundation of the **State Aware Engine (SAE)**, a **cross-domain platform** for detecting **hidden regimes** and **temporal patterns** in domains such as **IoT, health, cybersecurity, robotics, and finance**. NHSMM can also serve as a robust base for **research projects and experimental HSMM applications**.
+NHSMM underpins the **State Aware Engine (SAE)** — a cross-domain platform for detecting **hidden regimes** and **temporal patterns** across finance, IoT, health, cybersecurity, robotics, and related domains.
 
-Key deployment modes powered by SAE & NHSMM (Upcoming):  
-- **Cloud-first SaaS** — for scalable, multi-user access to sequence analytics  
-- **On-prem / Edge** — low-latency, privacy-sensitive inference for real-time systems  
-- **Hardware/Accelerator-ready** — GPU, TPU, or quantum-ready operations for high-throughput temporal modeling  
+The library is suitable both as a **research framework** and as a **foundation for production-oriented systems**, with a strong emphasis on modularity, extensibility, and accelerator-friendly execution.
+
+Key deployment modes enabled by SAE & NHSMM (planned):
+
+- **Cloud-first SaaS** — scalable, multi-tenant sequence analytics
+- **On-prem / Edge** — low-latency, privacy-sensitive inference
+- **Accelerator-ready** — GPU, TPU, and future hardware backends for high-throughput temporal modeling
 
 ---
 
@@ -64,6 +67,15 @@ Key deployment modes powered by SAE & NHSMM (Upcoming):
 
 ---
 
+## Support This Project
+
+Development and research around **NHSMM** are supported via
+**GitHub Sponsors**, **Patreon**, **Medium**, and **Open Collective**.
+
+See [FUNDING.md](./FUNDING.md) for details on how to contribute and what support enables.
+
+---
+
 ## 📦 Installation
 
 ### From PyPI (now also available)
@@ -87,26 +99,28 @@ pip install -e .;
 
 ```
 nhsmm/
-├── context.py             # Contextual Encoder
-├── constants.py           # Default configuration
+├── context.py
+├── constants.py
 ├── constraints.py
 ├── convergence.py
 ├── data.py
 ├── seed.py
 ├── models/
-│   ├── base.py            # Core HSMM model & inference
+│   ├── base.py
 │   └── __init__.py
 ├── distributions/
-│   ├── default.py         # Initial, Duration, Transition, Emission
+│   ├── default.py
 │   └── __init__.py
-├── __vesion__.py
+├── __version__.py
 └── __init__.py
+
 ```
 ---
 
 ## 🧠 Usage Example — Market Regime Detection (HSMM)
 
-* Please tke a look also at test: [State Occupancy & Duration/Transition Diagnostics](docs/test.md)
+Please also see:
+[State Occupancy & Duration/Transition Diagnostics](docs/test.md)
 
 This example demonstrates **Hidden Semi-Markov regime detection** on OHLCV-style time-series data using **NHSMM**.  
 The same pattern applies to **IoT signals, health data, robotics telemetry, or cybersecurity logs**.
@@ -242,6 +256,8 @@ print("Sequence log-likelihood:", log_likelihood.item())
 > NHSMM is actively developed and **contributions are welcome**!
 > Whether you want to report bugs, suggest features, or improve documentation, your input helps make the library stronger and more versatile.
 
+For planned features and research directions, see the project roadmap in the GitHub issues and discussions.
+
 ```bash
 # Fork or clone the repository
 git clone https://github.com/awa-si/nhsmm.git
@@ -280,5 +296,6 @@ The **State Aware Engine (SAE)**, powered by **NHSMM**, is designed for **flexib
 
 This project is released under the **Apache License 2.0** © 2024 **AWA.SI**.  
 For full license terms and conditions, please see the [LICENSE](https://github.com/awa-si/NHSMM/blob/develop/LICENSE) file.
+If you use NHSMM in academic work, please cite the repository.
 
 ---

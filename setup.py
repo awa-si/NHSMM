@@ -34,6 +34,7 @@ setup(
             "black>=24.0",
             "ruff>=0.6",
             "mypy>=1.11",
+            "polars>=1.36",
             "build",
             "twine",
         ],
