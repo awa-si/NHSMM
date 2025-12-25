@@ -17,12 +17,13 @@ Dependencies:
 
 import os
 import time
-from typing import Optional, Dict, Tuple
-
 import numpy as np
 import polars as pl
+from typing import Optional, Dict, Tuple
+
 import torch
 import torch.nn.functional as F
+
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
 from scipy.optimize import linear_sum_assignment
@@ -32,12 +33,9 @@ from nhsmm.constants import DEBUG, DTYPE, EPS, logger
 from nhsmm.context import CNN_LSTM_Encoder
 from nhsmm.models import HSMM
 
-# -----------------------------
-# Default configuration
-# -----------------------------
+
 DEFAULT_RNG_SEED = 0
 DEFAULT_LABELS = ["range", "bull", "bear"]
-
 
 # -----------------------------
 # Synthetic OHLCV generator
@@ -46,8 +44,7 @@ def generate_ohlcv(
     n_segments: int = 12,
     seg_len_low: int = 15,
     seg_len_high: int = 40,
-    rng_seed: Optional[int] = None
-) -> Tuple[np.ndarray, np.ndarray, Dict[int, str]]:
+    rng_seed: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, Dict[int, str]]:
     """
     Generate synthetic OHLCV-like sequences with distinct regimes/states.
     Returns:
@@ -92,8 +89,7 @@ def load_ohlcv_tensor(
     feature_cols: list[str] = ["open", "high", "low", "close"],
     state_col: str = "state",
     default_labels: list[str] = DEFAULT_LABELS,
-    rng_seed: int = DEFAULT_RNG_SEED
-) -> Tuple[torch.Tensor, Optional[np.ndarray], Dict[int, str]]:
+    rng_seed: int = DEFAULT_RNG_SEED) -> Tuple[torch.Tensor, Optional[np.ndarray], Dict[int, str]]:
     """
     Load OHLCV data or generate synthetic if not found.
     Returns:

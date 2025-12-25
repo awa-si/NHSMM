@@ -1,6 +1,7 @@
 # nhsmm/models/base.py
 
 from __future__ import annotations
+from abc import ABC, abstractmethod
 from typing import Optional, List, Tuple, Any, Literal, Dict, Union
 
 import torch
@@ -12,8 +13,9 @@ from nhsmm.distributions import Initial, Emission, Duration, Transition
 from nhsmm.context import ContextEncoder, ContextRouter, SequenceSet
 from nhsmm import constraints, SeedGenerator, ConvergenceTracker
 
+# torch.autograd.set_detect_anomaly(True)
 
-class HSMM(nn.Module):
+class HSMM(nn.Module, ABC):
 
     def __init__(
         self,
@@ -169,29 +171,35 @@ class HSMM(nn.Module):
         theta: Optional[torch.Tensor | list] = None,
         mask: Optional[torch.BoolTensor] = None) -> SequenceSet:
 
-        if isinstance(X, list):
-            X = torch.nn.utils.rnn.pad_sequence(X, batch_first=True)
-        if isinstance(theta, list):
-            theta = torch.nn.utils.rnn.pad_sequence(theta, batch_first=True)
+        device = X[0].device if isinstance(X, list) else X.device
 
+        # --- pad sequences if list ---
+        if isinstance(X, list):
+            X = torch.nn.utils.rnn.pad_sequence(
+                [x.to(dtype=DTYPE, device=device) for x in X],
+                batch_first=True
+            )
+        if isinstance(theta, list):
+            theta = torch.nn.utils.rnn.pad_sequence(
+                [t.to(dtype=DTYPE, device=device) for t in theta],
+                batch_first=True
+            )
+
+        # --- ensure batch dimension ---
         if X.ndim == 2:
             X = X.unsqueeze(0)
-
         B, T, F = X.shape
         K = self.n_states
-        device = X.device
-        debug = self.debug
 
         # --- mask ---
         if mask is None:
             mask = torch.ones(B, T, 1, dtype=torch.bool, device=device)
         else:
-            mask = mask.bool().to(device)
+            mask = mask.to(device).bool()
             if mask.ndim == 2:
                 mask = mask.unsqueeze(-1)
             elif mask.ndim != 3:
                 mask = mask.view(B, T, 1)
-
         lengths = mask.squeeze(-1).sum(dim=1).to(torch.long)
 
         # --- context ---
@@ -203,8 +211,8 @@ class HSMM(nn.Module):
         else:
             if T == 0:
                 H = self.context_dim
-                context = torch.zeros(B, 0, H, device=device, dtype=X.dtype)
-                canonical = torch.zeros(B, 1, H, device=device, dtype=X.dtype)
+                context = torch.zeros(B, 0, H, device=device, dtype=DTYPE)
+                canonical = torch.zeros(B, 1, H, device=device, dtype=DTYPE)
             else:
                 context, canonical = self.encoder._emcode(
                     X,
@@ -212,25 +220,21 @@ class HSMM(nn.Module):
                     detach=False
                 )
 
-        if debug:
-            print(f"[Prepare] context={context.shape}, canonical={canonical.shape}")
-
         # --- emission log-probs ---
         if T == 0:
-            log_probs = torch.empty(B, 0, K, device=device, dtype=X.dtype)
+            log_probs = torch.empty(B, 0, K, device=device, dtype=DTYPE)
         else:
             dist = self.emission_module.forward(context=context, return_dist=True)
-
-            if hasattr(dist, "log_prob"):
-                X_exp = X.unsqueeze(2).expand(B, T, K, F)
-                log_probs = dist.log_prob(X_exp)
-            else:
+            if not hasattr(dist, "log_prob"):
                 raise RuntimeError("Emission distribution does not support log_prob")
 
+            # expand X safely for broadcast
+            X_exp = X.unsqueeze(2).expand(B, T, K, F)
+            log_probs = dist.log_prob(X_exp)
             log_probs = log_probs.masked_fill(~mask, float("-inf"))
 
-        if debug:
-            print(f"[Prepare] log_probs={log_probs.shape}")
+        if getattr(self, "debug", False):
+            print(f"[Prepare] X={X.shape}, context={context.shape}, canonical={canonical.shape}, log_probs={log_probs.shape}")
 
         return SequenceSet(
             sequences=X,
@@ -253,7 +257,7 @@ class HSMM(nn.Module):
         transition_logits = self.transition_module.log_matrix(context=router.context)  # [B,T,K,K]
 
         # cumsum_emit: [B, T+1, K]
-        cumsum_emit = torch.zeros((B, T + 1, K), device=device, dtype=dtype)
+        cumsum_emit = torch.zeros((B, T + 1, K), device=device, dtype=DTYPE)
         cumsum_emit[:, 1:, :] = torch.cumsum(router.log_probs, dim=1)
         d_range = torch.arange(1, Dmax + 1, device=device)  # [Dmax]
         t_range = torch.arange(T, device=device).unsqueeze(1)  # [T,1]
@@ -268,7 +272,7 @@ class HSMM(nn.Module):
         emit_sums = cumsum_emit[b_idx, t_idx_end, k_idx] - cumsum_emit[b_idx, t_idx_start, k_idx]  # [B,T,K,Dmax]
 
         # --- Initialize alpha ---
-        alpha = torch.full((B, T, K, Dmax), NEG_INF, device=device, dtype=dtype)
+        alpha = torch.full((B, T, K, Dmax), NEG_INF, device=device, dtype=DTYPE)
         alpha[:, 0, :, 0] = initial_logits.squeeze(1) + duration_logits[:, 0, :, 0] + emit_sums[:, 0, :, 0]
 
         # --- Recursion over time ---
@@ -276,7 +280,7 @@ class HSMM(nn.Module):
             max_d = min(Dmax, t + 1)
 
             # Previous alpha sums for all durations
-            prev_alpha = torch.full((B, max_d, K), NEG_INF, device=device, dtype=dtype)
+            prev_alpha = torch.full((B, max_d, K), NEG_INF, device=device, dtype=DTYPE)
             for d in range(1, max_d + 1):
                 t_prev = t - d
                 mask_valid = (t < X.lengths).view(B, 1)  # [B,1] valid timestep
@@ -314,11 +318,11 @@ class HSMM(nn.Module):
         B, T, K = router.log_probs.shape
         device = router.context.device
 
-        duration_logits = self.duration_module.log_matrix(context=router.context)
-        transition_logits = self.transition_module.log_matrix(context=router.context)
+        initial_logits = self.initial_module.log_matrix(context=router.canonical)  # [B,1,K]
+        duration_logits = self.duration_module.log_matrix(context=router.context)  # [B,T,K,Dmax]
+        transition_logits = self.transition_module.log_matrix(context=router.context)  # [B,T,K,K]
 
-        # --- Precompute cumulative emission sums ---
-        cumsum_emit = torch.zeros((B, T + 1, K), device=device, dtype=dtype) # cumsum_emit: [B, T+1, K]
+        cumsum_emit = torch.zeros((B, T + 1, K), device=device, dtype=DTYPE) # cumsum_emit: [B, T+1, K]
         cumsum_emit[:, 1:, :] = torch.cumsum(router.log_probs, dim=1)
         d_range = torch.arange(1, Dmax + 1, device=device)  # [Dmax]
         t_range = torch.arange(T, device=device).unsqueeze(1)  # [T,1]
@@ -333,13 +337,13 @@ class HSMM(nn.Module):
         emit_sums = cumsum_emit[b_idx, t_idx_end, k_idx] - cumsum_emit[b_idx, t_idx_start, k_idx]  # [B,T,K,Dmax]
 
         # --- Initialize beta ---
-        beta = torch.full((B, T, K, Dmax), NEG_INF, device=device, dtype=dtype)
+        beta = torch.full((B, T, K, Dmax), NEG_INF, device=device, dtype=DTYPE)
         beta[:, -1, :, 0] = 0.0  # last timestep, duration=1
 
         # --- Backward recursion over time ---
         for t in reversed(range(T)):
             max_d = min(Dmax, T - t)
-            prev_beta = torch.full((B, max_d, K), NEG_INF, device=device, dtype=dtype)
+            prev_beta = torch.full((B, max_d, K), NEG_INF, device=device, dtype=DTYPE)
 
             for d in range(1, max_d + 1):
                 t_next = t + d
@@ -378,15 +382,13 @@ class HSMM(nn.Module):
             xi = torch.zeros((B, max(T_max - 1, 0), K, K), dtype=DTYPE, device=device)
             return gamma, xi, eta
 
-        # --- Context router ---
         router = theta if isinstance(theta, ContextRouter) else ContextRouter.from_tensor(X, theta=theta)
-
-        # --- Forward / backward ---
         alpha = self._forward(X, theta=router)      # [B,T,K,Dmax]
         beta = self._backward(X, theta=router)      # [B,T,K,Dmax]
 
         # --- Masks ---
-        mask = router.mask.bool().squeeze(-1) if router.mask.ndim == 3 else router.mask.bool()
+        mask = router.mask
+        mask = mask.bool().squeeze(-1) if mask.ndim == 3 else mask.bool()
         mask_TK = mask.unsqueeze(-1)                # [B,T,1]
         mask_TKD = mask_TK.unsqueeze(-1)            # [B,T,1,1]
 
@@ -457,59 +459,44 @@ class HSMM(nn.Module):
 
     def _model_params(self,
         X: SequenceSet,
-        theta: Optional[Union[torch.Tensor, ContextRouter]] = None) -> dict:
+        theta: Optional[Union[torch.Tensor, ContextRouter]] = None,
+        detach: bool = False) -> dict:
 
         router = theta if isinstance(theta, ContextRouter) else ContextRouter.from_tensor(X, theta=theta)
-        gamma, xi, eta = self._compute_posteriors(X, theta=router)
-
-        # Initial state distribution: p(z0 | canonical context)
-        self.initial_module.update(
-            posterior=gamma[:, 0],          # [B, K]
-            context=router.canonical         # [B, H]
-        )
-
-        # Duration distribution: p(d | z, context_t)
-        self.duration_module.update(
-            posterior=eta,                  # [B, T, K, D]
-            context=router.context           # [B, T, H]
-        )
-
-        # Transition distribution: p(z_t | z_{t-1}, context_t)
-        self.transition_module.update(
-            posterior=xi,                   # [B, T, K, K]
-            context=router.context           # [B, T, H]
-        )
-
-        # --- Prepare learned conditional distributions ---
+        canonical = router.canonical.detach() if detach else router.canonical
+        context = router.context.detach() if detach else router.context
         params = {
             "initial_dist": self.initial_module.forward(
-                context=router.canonical,
+                context=canonical,
                 return_dist=True
             ),
             "duration_dist": self.duration_module.forward(
-                context=router.canonical,
+                context=canonical,
                 return_dist=True
             ),
             "transition_dist": self.transition_module.forward(
-                context=router.canonical,
+                context=canonical,
                 return_dist=True
             ),
             "emission_dist": self.emission_module.forward(
-                context=router.context,
+                context=context,
                 return_dist=True
             ),
         }
-
+        self._params.update(params)
         return params
 
     def _viterbi(self,
         X: SequenceSet,
         theta: Optional[Union[torch.Tensor, ContextRouter]] = None,
-        duration_temp: float = 0.0, transition_temp: float = 0.0, duration_weight: float = 0.0) -> list[torch.Tensor]:
+        duration_temp: float = 0.0,
+        transition_temp: float = 0.0,
+        duration_weight: float = 0.0) -> list[torch.Tensor]:
 
         K, Dmax = self.n_states, self.max_duration
         predicted: list[torch.Tensor] = []
 
+        # Context router
         router = theta if isinstance(theta, ContextRouter) else ContextRouter.from_tensor(X, theta=theta)
         device = router.log_probs.device
         B, T_max, _ = router.log_probs.shape
@@ -517,22 +504,21 @@ class HSMM(nn.Module):
 
         for b in range(B):
             L = int(router.mask[b].sum())
-            print(f"[DEBUG][Batch {b}] sequence length L={L}, max_duration={Dmax}")
             if L == 0:
                 predicted.append(torch.empty(0, dtype=torch.long, device=device))
                 continue
 
-            ctx = router.context[b:b+1, :L]
-            canon = router.canonical[b:b+1]
+            ctx = router.context[b:b+1, :L]       # [1, L, H]
+            canon = router.canonical[b:b+1]       # [1, 1, H]
 
-            init_logits = self.initial_module.log_matrix(context=canon)[0, 0]
-            dur_logits = self.duration_module.log_matrix(context=ctx)[0]
-            trans_logits = self.transition_module.log_matrix(context=ctx)[0]
+            init_logits = self.initial_module.log_matrix(context=canon)[0, 0]       # [K]
+            dur_logits = self.duration_module.log_matrix(context=ctx)[0]            # [L, K, Dmax]
+            trans_logits = self.transition_module.log_matrix(context=ctx)[0]        # [L, K, K]
 
             if duration_weight != 0.0:
                 dur_logits = dur_logits * (1.0 - duration_weight)
 
-            emit_log = router.log_probs[b, :L]
+            emit_log = router.log_probs[b, :L]  # [L, K]
             cumsum_emit = torch.zeros((L + 1, K), device=device, dtype=emit_log.dtype)
             cumsum_emit[1:] = torch.cumsum(emit_log, dim=0)
 
@@ -563,19 +549,18 @@ class HSMM(nn.Module):
                     continue
 
                 prev_t = torch.clamp(starts - 1, min=0)
-                prev_V = V[prev_t].T.unsqueeze(2)
-                trans = trans_logits[t].unsqueeze(1)
-                prev_scores = prev_V + trans
+                prev_V = V[prev_t].T.unsqueeze(2)                          # [K, max_d, 1]
+                trans = trans_logits[t].unsqueeze(1)                       # [K, 1, K]
+                prev_scores = prev_V + trans                                # [K, max_d, K]
 
+                # Handle start-of-sequence
                 mask_start0 = (starts == 0)
                 if mask_start0.any():
-                    prev_scores[:, mask_start0, :] = init_logits[None, None, :]
+                    prev_scores[:, mask_start0, :] = init_logits[:, None]
 
-                prev_max, prev_arg = prev_scores.max(dim=0)
-                prev_arg = prev_arg.clamp(max=K-1)
-                scores = prev_max.T + scores_dur
+                prev_max, prev_arg = prev_scores.max(dim=0)                # [max_d, K]
+                scores = prev_max.T + scores_dur                           # [K, max_d]
                 V[t], dur_idx = scores.max(dim=1)
-                dur_idx = dur_idx.clamp(max=len(durations)-1)
                 best_dur[t] = durations[dur_idx]
                 back_ptr[t] = torch.where(best_dur[t] == 1, -1, prev_arg[dur_idx, torch.arange(K, device=device)])
 
@@ -602,9 +587,7 @@ class HSMM(nn.Module):
 
         return predicted
 
-        return predicted
-
-    def _map(self,
+    def _map(self, # Just as reference
         log_probs_seq: torch.Tensor,      # [T, n_features] or [T, n_states]
         init_logits: torch.Tensor,        # [n_states]
         trans_logits: torch.Tensor,       # [n_states, n_states]
@@ -678,51 +661,68 @@ class HSMM(nn.Module):
         tol: float = 1e-4,
         max_iter: int = 20,
         theta: Optional[torch.Tensor] = None, verbose: bool = True):
+        """
+        Fully differentiable HSMM fit loop without explicit E-step.
+        Uses neural or parametric emissions directly and updates other modules
+        via differentiable parameters.
+        """
 
         patience = 1
         adapt_factor = 10.0
         best_score = -float("inf")
-        B = X.shape[0] if X.ndim == 3 else 1
-        update_rate_min, update_rate_max = 1e-3, 1.0  # lower min LR for Adam stability
+        update_rate_min, update_rate_max = 1e-3, 1.0
 
         self._convergence = ConvergenceTracker(
-            tol=tol, rel_tol=tol, n_init=n_init, max_iter=max_iter, patience=patience, verbose=verbose
+            tol=tol,
+            rel_tol=tol,
+            n_init=n_init,
+            max_iter=max_iter,
+            patience=patience,
+            verbose=verbose
         )
-        neural_update = getattr(self, "encoder", None) is not None and any(
-            p.requires_grad for p in self.emission_module.parameters()
+
+        neural_update = (
+            self.encoder is not None
+            and any(p.requires_grad for p in self.emission_module.parameters())
         )
 
         for run_idx in range(n_init):
             if verbose:
                 print(f"\n=== Run {run_idx + 1}/{n_init} ===")
 
-            prev_ll = self._reset_parameters(run_idx)
+            self._reset_parameters(run_idx)
+            prev_ll = None
+
+            # Optimizer for neural emissions
+            self._optimizer = None
+            if neural_update:
+                self._optimizer = torch.optim.SGD(
+                    self.emission_module.parameters(),
+                    lr=update_rate_max
+                )
 
             for it in range(max_iter + 1):
                 seq_set = self._prepare(X, theta=theta)
-                seq_tensor, mask, F_dim = seq_set.sequences, seq_set.masks, seq_set.sequences.shape[-1]
+                params = self._model_params(seq_set, theta=theta, detach=False)
 
-                gamma, xi, eta = self._compute_posteriors(seq_set, theta=theta)
+                # Log-likelihood via differentiable score
+                ll_val = self.score(X, theta=theta, reduce=True)
+                self._convergence.update(ll_val.item(), it, run_idx)
 
-                flat_mask = mask.view(-1)
-                flat_X = seq_tensor.reshape(-1, F_dim)[flat_mask]
-                flat_gamma = gamma.reshape(-1, self.n_states)[flat_mask]
-                flat_theta = theta.reshape(-1, theta.shape[-1])[flat_mask] if theta is not None else None
-
-                # --- Compute log-likelihood ---
-                log_probs_tensor = seq_set.log_probs
-                ll_val = float(log_probs_tensor.sum(dim=(0, 1)) if B > 1 else log_probs_tensor.detach().sum())
-                self._convergence.update(ll_val, it, run_idx)
-
-                if verbose and it > 0:
-                    delta_ll = ll_val - prev_ll if prev_ll is not None else float("nan")
-                    print(f"[Iter {it:02d}] LL={ll_val:.6f} Δ={delta_ll:.3e}")
+                if verbose:
+                    delta = ll_val.item() - prev_ll if prev_ll is not None else float("nan")
+                    print(f"[Iter {it:02d}] LL={ll_val.item():.6f} Δ={delta:.3e}")
 
                 adaptive_lr = (
-                    min(update_rate_max, max(update_rate_min, adapt_factor * abs(ll_val - prev_ll)))
+                    min(update_rate_max,
+                        max(update_rate_min, adapt_factor * abs(ll_val.item() - (prev_ll or 0))))
                     if prev_ll is not None else update_rate_max
                 )
-                prev_ll = ll_val
+                prev_ll = ll_val.item()
+
+                if self._optimizer is not None:
+                    for pg in self._optimizer.param_groups:
+                        pg["lr"] = adaptive_lr
 
                 if it == max_iter or self._convergence.converged_flags[run_idx]:
                     if verbose and self._convergence.converged_flags[run_idx]:
@@ -730,42 +730,101 @@ class HSMM(nn.Module):
                     break
 
                 if neural_update:
-                    for p in self.emission_module.parameters():
-                        p.requires_grad_(True)
+                    self._optimizer.zero_grad()
+                    # Use emission log-probs from current params
+                    dist = params["emission_dist"]
+                    B, T, F = seq_set.sequences.shape
+                    K = self.n_states
+                    X_exp = seq_set.sequences.unsqueeze(2).expand(B, T, K, F)
+                    log_probs = dist.log_prob(X_exp)
 
-                    if not hasattr(self, "_emission_optimizer") or self._emission_optimizer is None:
-                        self._emission_optimizer = torch.optim.SGD(self.emission_module.parameters(), lr=adaptive_lr)
-                    else:
-                        for pg in self._emission_optimizer.param_groups: pg["lr"] = adaptive_lr
-
-                    self._emission_optimizer.zero_grad()
-                    log_probs = self.emission_module.log_prob(flat_X)
-                    loss = -(flat_gamma.detach() * log_probs).sum() / flat_gamma.detach().sum().clamp_min(EPS)
+                    # Weighted loss (approximate posterior by uniform for fully diff)
+                    gamma_approx = torch.ones(B, T, K, device=X.device, dtype=X.dtype) / K
+                    loss = -(gamma_approx * log_probs).sum() / gamma_approx.sum().clamp_min(EPS)
                     loss.backward()
-                    self._emission_optimizer.step()
-                else:
-                    self.emission_module.update(
-                        posterior=flat_gamma, context=flat_theta, update_rate=adaptive_lr
-                    )
+                    self._optimizer.step()
 
-                self.initial_module.update(new_logits=gamma[:, 0].sum(0), from_probs=True)
-                self.duration_module.update(new_logits=eta.sum(dim=0), from_probs=True)
-                self.transition_module.update(new_logits=xi.sum(dim=(0, 1)), from_probs=True)
+                self.initial_module.update(new_logits=params["initial_dist"].logits, from_probs=True)
+                self.duration_module.update(new_logits=params["duration_dist"].logits, from_probs=True)
+                self.transition_module.update(new_logits=params["transition_dist"].logits, from_probs=True)
 
-                if ll_val > best_score:
-                    best_score = ll_val
-                    self._params.update({
-                        "initial_dist": self.initial_module.forward(return_dist=True),
-                        "duration_dist": self.duration_module.forward(return_dist=True),
-                        "transition_dist": self.transition_module.forward(return_dist=True),
-                        "emission_dist": self.emission_module.forward(return_dist=True),
-                    })
+                if ll_val.item() > best_score:
+                    best_score = ll_val.item()
                     self._snapshot_best_params()
 
         if n_init > 1:
             self._restore_best_params()
 
         return self
+
+    def score(self,
+        X: torch.Tensor | list[torch.Tensor],
+        theta: Optional[torch.Tensor | list[torch.Tensor]] = None,
+        reduce: bool = False) -> torch.Tensor:
+        """
+        Compute differentiable log-likelihoods of sequences under the HSMM.
+        Fully vectorized, handles optional context, batching, and padding.
+        """
+        # Determine device
+        device = X[0].device if isinstance(X, list) else X.device
+
+        # --- normalize X into list[Tensor[T,F]] ---
+        if torch.is_tensor(X):
+            if X.ndim == 2:
+                sequences = [X.to(dtype=DTYPE, device=device)]
+            elif X.ndim == 3:
+                sequences = [X[i].to(dtype=DTYPE, device=device) for i in range(X.shape[0])]
+            else:
+                raise ValueError(f"Unsupported X shape {X.shape}")
+        elif isinstance(X, list):
+            sequences = [torch.as_tensor(x, dtype=DTYPE, device=device) if not torch.is_tensor(x) else x.to(dtype=DTYPE, device=device) for x in X]
+        else:
+            raise TypeError(f"Unsupported X type: {type(X)}")
+
+        B = len(sequences)
+        if B == 0:
+            return torch.empty(0, dtype=DTYPE, device=device)
+
+        # --- normalize theta into list[Tensor[T,H]] or None ---
+        context_list: Optional[list[torch.Tensor]] = None
+        if theta is not None:
+            if torch.is_tensor(theta):
+                if theta.ndim == 3:
+                    if theta.shape[0] != B:
+                        raise ValueError("theta batch dimension mismatch")
+                    context_list = [theta[i].to(dtype=DTYPE, device=device) for i in range(B)]
+                elif theta.ndim == 2:
+                    context_list = [theta.to(dtype=DTYPE, device=device) for _ in range(B)]
+                else:
+                    raise ValueError(f"Unsupported theta shape {theta.shape}")
+            elif isinstance(theta, list):
+                if len(theta) != B:
+                    raise ValueError("theta list length mismatch")
+                context_list = [torch.as_tensor(t, dtype=DTYPE, device=device) if not torch.is_tensor(t) else t.to(dtype=DTYPE, device=device) for t in theta]
+            else:
+                raise TypeError(f"Unsupported theta type: {type(theta)}")
+
+        # --- prepare padded SequenceSet ---
+        seq_set = self._prepare(sequences, theta=context_list)
+        alpha = self._forward(seq_set)  # [B, T, K, D] fully vectorized
+
+        lengths = seq_set.lengths.to(dtype=torch.long, device=device) if torch.is_tensor(seq_set.lengths) else torch.tensor(seq_set.lengths, dtype=torch.long, device=device)
+
+        # --- compute log-likelihoods ---
+        log_likelihoods = torch.full((B,), NEG_INF, dtype=DTYPE, device=device)
+        valid = lengths > 0
+        if valid.any():
+            # [N_valid, K, D] -> flatten state/duration dims
+            last_alpha = alpha[valid, lengths[valid] - 1]  # [N_valid, K, D]
+            log_likelihoods[valid] = torch.logsumexp(last_alpha.flatten(1), dim=1)
+
+        log_likelihoods = torch.nan_to_num(
+            log_likelihoods,
+            nan=NEG_INF,
+            neginf=NEG_INF,
+            posinf=MAX_LOGITS
+        )
+        return log_likelihoods.sum() if reduce else log_likelihoods
 
     def _reset_parameters(self, run_idx: int, preserve_best: bool = True) -> None:
         for module_name in ["initial_module", "transition_module", "duration_module", "emission_module"]:
@@ -791,6 +850,12 @@ class HSMM(nn.Module):
             self._convergence.converged_flags[run_idx] = False
 
     def _snapshot_best_params(self):
+        self._params.update({
+            "initial_dist": self.initial_module.forward(return_dist=True),
+            "duration_dist": self.duration_module.forward(return_dist=True),
+            "transition_dist": self.transition_module.forward(return_dist=True),
+            "emission_dist": self.emission_module.forward(return_dist=True),
+        })
         self._best_state = {
             "initial": self.initial_module.state_dict(),
             "duration": self.duration_module.state_dict(),
@@ -823,27 +888,14 @@ class HSMM(nn.Module):
 
     def predict(self,
         X: torch.Tensor | list[torch.Tensor],
-        algorithm: Literal["map", "viterbi"] = "viterbi",
+        algorithm: Literal["viterbi"] = "viterbi",
         context: Optional[torch.Tensor | list[torch.Tensor]] = None,
-        transition_temp: float = 1.0,
         duration_temp: float = 1.0,
+        transition_temp: float = 1.0,
         duration_weight: float = 0.0,
         verbose: bool = True) -> list[torch.Tensor]:
-        """
-        Decode most likely state sequence for given input sequences.
 
-        Args:
-            X: [T,F] tensor or list of tensors [Ti,F]
-            algorithm: "viterbi" (HSMM) or "map" (state-wise MAP)
-            context: optional context tensor or list
-            transition_temp: temperature for transition logits
-            duration_temp: temperature for duration logits
-            duration_weight: weight for duration bias in viterbi
-            verbose: enable debug prints
-
-        Returns:
-            List of tensors [Ti] with predicted states
-        """
+        # Prepare padded SequenceSet
         seq_set = self._prepare(X, theta=context)
         B = len(seq_set.sequences)
         if B == 0 or seq_set.total_timesteps == 0:
@@ -854,9 +906,10 @@ class HSMM(nn.Module):
         if verbose:
             print(f"[Predict] Sequences: {B}, max_len: {max_len}, device: {device}")
 
+        # Build router
         router = ContextRouter.from_tensor(seq_set, theta=context)
 
-        # Handle sequences with non-zero length
+        # Select sequences with non-zero length
         nonzero_indices = [i for i, L in enumerate(seq_set.lengths) if L > 0]
         if len(nonzero_indices) < B:
             seq_set_nz = seq_set.index_select(torch.tensor(nonzero_indices, device=device))
@@ -867,8 +920,7 @@ class HSMM(nn.Module):
 
         results: list[torch.Tensor] = [torch.empty(0, dtype=torch.long, device=device) for _ in range(B)]
 
-        if algorithm.lower() == "viterbi":
-            # HSMM Viterbi decoding
+        if algorithm == "viterbi":
             decoded_paths = self._viterbi(
                 seq_set_nz,
                 theta=router_nz,
@@ -878,154 +930,22 @@ class HSMM(nn.Module):
             )
             for idx, path in zip(nonzero_indices, decoded_paths):
                 results[idx] = path.detach().to(dtype=torch.long)
-            return results
-
-        elif algorithm.lower() == "map":
-            # Compute posteriors
-            gamma, _, _ = self._compute_posteriors(seq_set_nz, theta=router_nz)
-            for i, b in enumerate(nonzero_indices):
-                L = seq_set.lengths[b]
-                gamma_b = gamma[i, :L]
-                gamma_b = torch.nan_to_num(gamma_b, nan=-1e9, posinf=-1e9, neginf=-1e9)
-
-                # Initial / transition / duration logits for MAP decoding
-                init_logits = self.initial_module.log_matrix(context=router_nz.canonical[i:i+1, :1]).view(-1)
-                trans_logits = self.transition_module.log_matrix(context=router_nz.context[i:i+1, :L])
-                dur_logits = self.duration_module.log_matrix(context=router_nz.context[i:i+1, :L])
-
-                # Safely reduce time dimension if needed
-                if trans_logits.ndim > 2 and trans_logits.shape[1] > 1:
-                    trans_logits = trans_logits.mean(dim=1)
-                elif trans_logits.ndim > 2:
-                    trans_logits = trans_logits[0]
-
-                if dur_logits.ndim > 2 and dur_logits.shape[1] > 1:
-                    dur_logits = dur_logits.mean(dim=1)
-                elif dur_logits.ndim > 2:
-                    dur_logits = dur_logits[0]
-
-                log_probs_seq = seq_set.log_probs[b, :L]
-                decoded_seq = self._map(
-                    log_probs_seq,
-                    init_logits,
-                    trans_logits,
-                    dur_logits
-                )
-                results[b] = decoded_seq.detach().to(dtype=torch.long)
-            return results
 
         else:
-            raise ValueError(f"Unknown decoding algorithm '{algorithm}'")
+            raise ValueError(f"Unsupported decoding algorithm '{algorithm}' for fully differentiable mode")
+        return results
 
     def decode(self,
         X: torch.Tensor | list[torch.Tensor],
-        algorithm: Literal["viterbi", "map"] = "viterbi",
+        algorithm: Literal["viterbi"] = "viterbi",
         context: Optional[torch.Tensor | list[torch.Tensor]] = None,
         first_only: bool = True,
         verbose: bool = True) -> torch.Tensor | list[torch.Tensor]:
 
-        if torch.is_tensor(X):
-            if X.ndim == 2:
-                X_list = [X]
-            elif X.ndim == 3:
-                X_list = [X[i] for i in range(X.shape[0])]
-            else:
-                raise ValueError(f"Unexpected tensor shape {X.shape} for X")
-        elif isinstance(X, list):
-            X_list = [torch.as_tensor(x, dtype=DTYPE) if not torch.is_tensor(x) else x.to(dtype=DTYPE)
-                      for x in X]
-        else:
-            raise TypeError(f"Unsupported X type: {type(X)}")
-
-        # --- Normalize context into list ---
-        context_list: Optional[list[torch.Tensor]] = None
-        if context is not None:
-            if torch.is_tensor(context):
-                if context.ndim == 2:
-                    context_list = [context]
-                elif context.ndim == 3:
-                    context_list = [context[i] for i in range(context.shape[0])]
-                else:
-                    raise ValueError(f"Unexpected context tensor shape {context.shape}")
-            elif isinstance(context, list):
-                context_list = [torch.as_tensor(c, dtype=DTYPE) if not torch.is_tensor(c) else c.to(dtype=DTYPE)
-                                for c in context]
-            else:
-                raise TypeError(f"Unsupported context type: {type(context)}")
-
         if verbose:
-            print(f"[decode] algorithm={algorithm}, batch_size={len(X_list)}")
+            B = len(X) if isinstance(X, list) else X.shape[0] if X.ndim == 3 else 1
+            print(f"[decode] algorithm={algorithm}, batch_size={B}")
 
-        # --- Predict sequences ---
-        preds = self.predict(
-            X_list,
-            algorithm=algorithm,
-            context=context_list,
-            verbose=verbose
-        )
-
-        # --- Return first sequence if requested ---
+        preds = self.predict(X, algorithm=algorithm, context=context, verbose=verbose)
         return preds[0] if first_only and preds else preds
-
-    @torch.no_grad()
-    def score(self,
-        X: torch.Tensor | list[torch.Tensor],
-        theta: Optional[torch.Tensor | list[torch.Tensor]] = None,
-        verbose: bool = True) -> torch.Tensor:
-
-        if torch.is_tensor(X):
-            sequences = [X]
-        elif isinstance(X, list):
-            sequences = [torch.as_tensor(x, dtype=DTYPE) if not torch.is_tensor(x) else x.to(dtype=DTYPE) for x in X]
-        else:
-            raise TypeError(f"Unsupported X type: {type(X)}")
-
-        B = len(sequences)
-        if B == 0:
-            return torch.empty(0, dtype=DTYPE, device=self.device)
-
-        # --- normalize context ---
-        context_list: Optional[list[torch.Tensor]] = None
-        if theta is not None:
-            if torch.is_tensor(theta):
-                if theta.ndim == 2 and B > 1:
-                    lengths = [seq.shape[0] for seq in sequences]
-                    cum_lengths = torch.cat([torch.zeros(1, dtype=torch.long), torch.tensor(lengths, dtype=torch.long).cumsum(0)])
-                    context_list = [theta[cum_lengths[b]:cum_lengths[b+1]] for b in range(B)]
-                else:
-                    context_list = [theta] * B
-            elif isinstance(theta, list):
-                context_list = [torch.as_tensor(t, dtype=DTYPE) if t is not None else None for t in theta]
-                if len(context_list) != B:
-                    raise ValueError(f"Length of theta list ({len(context_list)}) != number of sequences ({B})")
-            else:
-                raise TypeError(f"Unsupported theta type: {type(theta)}")
-
-        # --- prepare SequenceSet (padding, mask, canonical context, log_probs) ---
-        seq_set = self._prepare(sequences, theta=context_list)
-
-        if verbose:
-            print(f"[score] Prepared SequenceSet with {B} sequences, max_len={max(seq_set.lengths)}")
-
-        # --- forward pass (vectorized alpha) ---
-        alpha = self._forward(seq_set, theta=None)  # [B,T,K,Dmax]
-
-        # --- compute per-sequence log-likelihood ---
-        if isinstance(seq_set.lengths, torch.Tensor):
-            lengths_tensor = seq_set.lengths.detach().clone().to(dtype=torch.long, device=self.device)
-        else:
-            lengths_tensor = torch.tensor(seq_set.lengths, dtype=torch.long, device=self.device)
-
-        max_len = alpha.shape[1]
-        log_likelihoods = torch.full((B,), NEG_INF, dtype=DTYPE, device=self.device)
-
-        if B > 0:
-            idx = lengths_tensor > 0
-            last_alpha = alpha[idx, lengths_tensor[idx]-1]  # [N_valid, K, Dmax]
-            log_likelihoods[idx] = torch.logsumexp(last_alpha.reshape(last_alpha.size(0), -1), dim=1)
-
-        if verbose:
-            logger.info(f"[score] batch={B}, min={log_likelihoods.min():.4f}, max={log_likelihoods.max():.4f}, mean={log_likelihoods.mean():.4f}")
-
-        return log_likelihoods
 

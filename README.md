@@ -9,8 +9,8 @@
 
 ---
 
-> ⚠️ **NHSMM is currently in alpha** (v0.0.3-alpha) and provided as a **proof-of-concept**.  
-> It **will be enhanced for production**, and the public API is **subject to change** prior to the first stable `1.0.0` release.
+> ⚠️ **NHSMM is currently in alpha stage** and provided as a **proof-of-concept** first.  
+> It **is being enhanced for production**, and the public API is **subject to change** prior to the first stable `1.0.0` release.
 
 This document provides a **self-contained guide** to **NHSMM**, a modular PyTorch library that underpins the **State Aware Engine (SAE)**. It is designed for **developers, data scientists, and system integrators**, enabling them to quickly understand, deploy, and extend the library across diverse application domains.
 
@@ -60,7 +60,7 @@ Key deployment modes enabled by SAE & NHSMM (planned):
 
 | Stage                  | Status  | Notes                                                |
 |------------------------|---------|----------------------------------------------------- |
-| Proof of Concept       | ✅ Done | Alpha release (0.0.2-alpha)                          |
+| Proof of Concept       | ✅ Done | Alpha release (0.0.1-alpha)                          |
 | Enhancement            | ⚠️ Todo | Improve performance, stability, and extend API       |
 | Testing                | ⚠️ Todo | Rigorous validation, benchmarking, and QA            |
 | Production Release     | ⚠️ Todo | Full 1.0.0 release with documentation and stable API |
