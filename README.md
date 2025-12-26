@@ -3,10 +3,8 @@
 
 - *Repository: [NHSMM on GitHub](https://github.com/awa-si/NHSMM)*
 - *Documentation: [wiki](https://github.com/awa-si/NHSMM/wiki)*
-- *Version: 0.0.3-alpha*
-
-[![PyPI](https://img.shields.io/pypi/v/nhsmm.svg)](https://pypi.org/project/nhsmm/) [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0) [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
-
+- *Article on Medium: [Unlocking Hidden Patterns in Time – Meet NHSMM](https://medium.com/@awa-si/unlocking-hidden-patterns-in-time-meet-nhsmm-the-neural-hidden-semi-markov-model-cd3f1e2428c2)
+- *Current Version: 0.0.3-alpha*
 ---
 
 > ⚠️ **NHSMM is currently in alpha stage** and provided as a **proof-of-concept** first.  
@@ -18,19 +16,21 @@ This document provides a **self-contained guide** to **NHSMM**, a modular PyTorc
 - Combines **Hidden Semi-Markov Models (HSMMs)** with **neural parameterization**  
 - Supports **contextual modulation** of initial, transition, duration, and emission distributions  
 - Enables **hierarchical and flexible model architectures** for sequential data  
-- Fully **PyTorch-compatible**, GPU-ready, and extensible for multi-domain use
+- Built with **PyTorch**, GPU-ready, and extensible for multi-domain use
+
+[![PyPI](https://img.shields.io/pypi/v/nhsmm.svg)](https://pypi.org/project/nhsmm/) [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0) [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 
 ---
 
 ## Overview
 
-**NHSMM** provides a **modular, time-aware framework** for **temporal sequence modeling** and **hidden-state inference** using **Hidden Semi-Markov Models (HSMMs)**. It explicitly models **state durations** and **context-dependent transitions**, making it suitable for **non-stationary, real-world sequences**.
+**NHSMM** provides a **modular, time-aware framework** for **temporal sequence modeling** and **hidden-state inference** using **Hidden Semi-Markov Models (HSMMs)**. It explicitly models **context-dependent state durations** and **context-dependent transitions**, making it suitable for **non-stationary, real-world sequences, fully time-aware**.
 
 NHSMM underpins the **State Aware Engine (SAE)** — a cross-domain platform for detecting **hidden regimes** and **temporal patterns** across finance, IoT, health, cybersecurity, robotics, and related domains.
 
 The library is suitable both as a **research framework** and as a **foundation for production-oriented systems**, with a strong emphasis on modularity, extensibility, and accelerator-friendly execution.
 
-Key deployment modes enabled by SAE & NHSMM (planned):
+Key deployment modes enabled by SAE & NHSMM (planned with Beta release):
 
 - **Cloud-first SaaS** — scalable, multi-tenant sequence analytics
 - **On-prem / Edge** — low-latency, privacy-sensitive inference
@@ -59,20 +59,10 @@ Key deployment modes enabled by SAE & NHSMM (planned):
 ## 📌 Milestones
 
 | Stage                  | Status  | Notes                                                |
-|------------------------|---------|----------------------------------------------------- |
+|------------------------|---------|------------------------------------------------------|
 | Proof of Concept       | ✅ Done | Alpha release (0.0.1-alpha)                          |
-| Enhancement            | ⚠️ Todo | Improve performance, stability, and extend API       |
-| Testing                | ⚠️ Todo | Rigorous validation, benchmarking, and QA            |
+| Tresting/Enhancement   | ⚠️ Todo | Improve performance, stability, and extend API       |
 | Production Release     | ⚠️ Todo | Full 1.0.0 release with documentation and stable API |
-
----
-
-## Support This Project
-
-Development and research around **NHSMM** are supported via
-**GitHub Sponsors**, **Patreon**, **Medium**, and **Open Collective**.
-
-See [FUNDING.md](./FUNDING.md) for details on how to contribute and what support enables.
 
 ---
 
@@ -235,15 +225,10 @@ print("Sequence log-likelihood:", log_likelihood.item())
 │       Emission Module       │  ← context-modulated observation likelihoods
 │  (Gaussian / Student-t / …) │
 └─────────────┬───────────────┘
-              │
-              ▼
-┌─────────────┴───────────────┐
-│         Posterior           │  ← gamma, xi, eta (inference)
-└─────────────┬───────────────┘
               ▲
               │
 ┌─────────────┴───────────────┐
-│     Backprop / EM Update    │
+│          Backprop           │
 └─────────────────────────────┘
 ```
 
@@ -286,9 +271,16 @@ The **State Aware Engine (SAE)**, powered by **NHSMM**, is designed for **flexib
 * **Telecommunications & Network Analytics** — Monitor network traffic patterns, detect **latent congestion states**, and predict **temporal anomalies** for automated response.  
 * **Energy & Smart Grids** — Track operational states of energy systems, detect **load or failure regimes**, and optimize resource allocation over time.  
 * **Cross-Domain Research & AI Applications** — Serve as a foundation for **temporal sequence modeling**, hybrid HSMM-HMM experiments, or **research in neural probabilistic models**.  
-
 ---
 
+## Support This Project
+
+Development and research around **NHSMM** are supported via
+**GitHub Sponsors**, **Patreon**, **Medium**.
+
+See [FUNDING.md](./FUNDING.md) for details on how to contribute and what support enables.
+
+---
 
 ## 🧾 License
 
