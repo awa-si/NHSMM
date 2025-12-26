@@ -1,8 +1,8 @@
 
 # NHSMM — (Neural) Hidden Semi-Markov Models
 
-- *Repository: [NHSMM on GitHub](https://github.com/awa-si/nhsmm)*
-- *Documentation: [wiki](https://github.com/awa-si/nhsmm/wiki)*
+- *Repository: [NHSMM on GitHub](https://github.com/awa-si/NHSMM)*
+- *Documentation: [wiki](https://github.com/awa-si/NHSMM/wiki)*
 - *Version: 0.0.3-alpha*
 
 [![PyPI](https://img.shields.io/pypi/v/nhsmm.svg)](https://pypi.org/project/nhsmm/) [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0) [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
@@ -134,7 +134,7 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler
 
 from nhsmm.models import HSMM
-from nhsmm.context import CNN_LSTM_Encoder
+from nhsmm.context import DefaultEncoder
 from nhsmm.constants import DTYPE
 
 # Synthetic example: [T, F] = time × features
@@ -151,7 +151,7 @@ X = torch.tensor(X, dtype=DTYPE)
 Context enables non-stationary transitions and durations.
 
 ```python
-encoder = CNN_LSTM_Encoder(
+encoder = DefaultEncoder(
     n_features=F,
     cnn_channels=4,
     hidden_dim=64,
@@ -177,7 +177,7 @@ model = HSMM(
 model.fit(
     X,
     n_init=3,
-    max_iter=10,
+    max_iter=3,
     tol=1e-4,
     verbose=True,
 )
@@ -212,40 +212,39 @@ print("Sequence log-likelihood:", log_likelihood.item())
 
 ```
 ┌─────────────────────────────┐
-│      External Input         │  ← covariates, features, embeddings
+│       External Input        │  ← covariates, features, embeddings
 └─────────────┬───────────────┘
               │
               ▼
-┌─────────────────────────────┐
+┌─────────────┴───────────────┐
 │  Neural Initial State Module│  ← context-modulated initial probabilities π
 └─────────────┬───────────────┘
               │
               ▼
-┌─────────────────────────────┐
-│  Neural Transition Module   │  ← context-gated, temperature-scaled transitions A
+┌─────────────┴───────────────┐
+│   Neural Transition Module  │  ← context-gated, temperature-scaled transitions A
+└────────────┬─┬──────────────┘
+             │ ▲
+             ▼ │
+┌────────────┴─┴──────────────┐
+│   Neural Duration Module    │  ← context-aware duration probabilities D
 └─────────────┬───────────────┘
               │
               ▼
-┌─────────────────────────────┐
-│  Neural Duration Module     │  ← context-aware duration probabilities D
+┌─────────────┴───────────────┐
+│       Emission Module       │  ← context-modulated observation likelihoods
+│  (Gaussian / Student-t / …) │
 └─────────────┬───────────────┘
               │
               ▼
-┌─────────────────────────────┐
-│      Emission Module        │  ← context-modulated observation likelihoods
-│   (Gaussian / Student-t / …)│
+┌─────────────┴───────────────┐
+│         Posterior           │  ← gamma, xi, eta (inference)
 └─────────────┬───────────────┘
-              │
-              ▼
-      ┌─────────────┐
-      │ Posterior   │  ← gamma, xi, eta (inference)
-      └─────────────┘
               ▲
               │
-   ┌──────────┴──────────┐
-   │ Backprop / EM Update │
-   └─────────────────────┘
-
+┌─────────────┴───────────────┐
+│     Backprop / EM Update    │
+└─────────────────────────────┘
 ```
 
 ---
@@ -259,7 +258,7 @@ For planned features and research directions, see the project roadmap in the Git
 
 ```bash
 # Fork or clone the repository
-git clone https://github.com/awa-si/nhsmm.git
+git clone https://github.com/awa-si/NHSMM.git
 cd nhsmm
 
 # Install in development mode with optional dev dependencies
