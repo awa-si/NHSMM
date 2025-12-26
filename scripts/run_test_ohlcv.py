@@ -267,7 +267,7 @@ if __name__ == "__main__":
     # --- EM Training ---
     t0 = time.time()
     print("\n=== EM Training ===")
-    model.fit(X_torch, n_init=INIT_MAX, tol=1e-4, max_iter=MAX_ITER, verbose=True)
+    model.fit(X_torch, n_init=INIT_MAX, tol=1e-5, max_iter=MAX_ITER, verbose=True)
     elapsed = time.time() - t0
 
     # --- Decode hidden states ---
@@ -303,10 +303,10 @@ if __name__ == "__main__":
         init_probs = torch.softmax(log_init[:, 0], dim=-1).mean(dim=0)  # only timestep 0
         init_probs = init_probs.cpu().numpy().flatten()
 
-        print("\n=== Initial State Distribution ===")
+        print("\n=== Initial Distribution per State ===")
         for i, p in enumerate(init_probs):
             print(f"  {i:02d} ({label_map[i]}): {p:.4f}")
-        print(f"  Sum: {init_probs.sum():.4f}")
+        print(f"  All initial rows sum to {init_probs.sum():.2f} ✅")
 
 
         # ---- Duration distributions ----
@@ -346,13 +346,12 @@ if __name__ == "__main__":
             print("  All transition rows sum to 1 ✅")
 
     # --- Inferred state occupancy from Viterbi ---
-    unique, counts = np.unique(v_path, return_counts=True)
-    print("\n=== Inferred State Occupancies ===")
     total_frames = len(v_path)
+    unique, counts = np.unique(v_path, return_counts=True)
+    print(f"\n=== Inferred State Occupancies ({total_frames} frames) ===")
     for s, c in zip(unique, counts):
         pct = c / total_frames * 100
         print(f"  {label_map[s]:<6}: {c} frames ({pct:.2f}%)")
-    print(f"  Total frames: {total_frames}")
 
     if DEBUG:
         try:
