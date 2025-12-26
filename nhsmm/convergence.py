@@ -26,13 +26,6 @@ class CallbackFn(Protocol):
 
 class ConvergenceTracker:
 
-    __slots__ = (
-        "n_init", "max_iter", "tol", "rel_tol", "patience", "early_stop",
-        "callbacks", "verbose", "device", "scores", "deltas", "rel_deltas",
-        "converged_flags", "_rolling_abs", "_rolling_rel", "best_scores",
-        "best_iters", "_lock", "stop_training", "history"
-    )
-
     def __init__(
         self,
         n_init: int,
@@ -235,3 +228,4 @@ class ConvergenceTracker:
     def _tensor_to_list(t: torch.Tensor):
         arr = t.cpu().numpy()
         return [[float(x) if np.isfinite(x) else None for x in row] for row in arr]
+

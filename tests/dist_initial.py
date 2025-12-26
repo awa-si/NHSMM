@@ -3,7 +3,7 @@
 import torch
 from nhsmm.distributions import Initial
 from nhsmm.constants import EPS
-from nhsmm.context import CNN_LSTM_Encoder, ContextEncoder
+from nhsmm.context import DefaultEncoder, ContextEncoder
 
 def test_context_encoder():
     B, T, F_in = 4, 8, 6
@@ -13,7 +13,7 @@ def test_context_encoder():
     x = torch.randn(B, T, F_in)
 
     # --- CNN_LSTM Encoder ---
-    encoder = CNN_LSTM_Encoder(
+    encoder = DefaultEncoder(
         n_features=F_in,
         hidden_dim=context_dim,
         cnn_channels=8,

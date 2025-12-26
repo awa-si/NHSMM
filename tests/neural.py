@@ -45,7 +45,7 @@ def best_permutation_accuracy(true, pred, n_classes):
 # -------------------------
 # CNN+LSTM Encoder
 # -------------------------
-class CNN_LSTM_Encoder(nn.Module):
+class DefaultEncoder(nn.Module):
     def __init__(self, n_features, hidden_dim=16, cnn_channels=8, kernel_size=3, dropout=0.1, bidirectional=True):
         super().__init__()
         padding = kernel_size // 2
@@ -102,7 +102,7 @@ if __name__ == "__main__":
     C_torch = C.to(device) if C is not None else None
 
     # Build encoder and NHSMM
-    encoder = CNN_LSTM_Encoder(n_features, hidden_dim=16)
+    encoder = DefaultEncoder(n_features, hidden_dim=16)
     encoder.to(device)
 
     config = NHSMMConfig(

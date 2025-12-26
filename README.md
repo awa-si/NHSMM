@@ -104,7 +104,6 @@ nhsmm/
 ├── constraints.py
 ├── convergence.py
 ├── data.py
-├── seed.py
 ├── models/
 │   ├── base.py
 │   └── __init__.py

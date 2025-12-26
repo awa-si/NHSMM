@@ -4,13 +4,13 @@ import torch
 import torch.nn.functional as F
 from nhsmm.distributions import Transition
 from nhsmm.constants import DTYPE, EPS
-from nhsmm.context import CNN_LSTM_Encoder, ContextEncoder
+from nhsmm.context import DefaultEncoder, ContextEncoder
 
 def set_seed(seed: int = 42):
     torch.manual_seed(seed)
 
 def test_context_encoder():
-    print("\n=== TEST: ContextEncoder + CNN_LSTM_Encoder with Transition ===")
+    print("\n=== TEST: ContextEncoder + DefaultEncoder with Transition ===")
     B, T, F_in = 4, 8, 6
     n_states = 5
     context_dim = 16
@@ -18,7 +18,7 @@ def test_context_encoder():
     x = torch.randn(B, T, F_in)
 
     # --- CNN_LSTM Encoder ---
-    encoder = CNN_LSTM_Encoder(
+    encoder = DefaultEncoder(
         n_features=F_in,
         hidden_dim=context_dim,
         cnn_channels=8,
@@ -48,7 +48,7 @@ def test_context_encoder():
         assert torch.allclose(probs.sum(dim=-1), torch.ones(B, n_states), atol=1e-5)
 
 def test_context_encoder_sequence():
-    print("\n=== TEST: Sequence Context + ContextEncoder + CNN_LSTM_Encoder with Transition ===")
+    print("\n=== TEST: Sequence Context + ContextEncoder + DefaultEncoder with Transition ===")
     S, B, T, F_in = 2, 3, 5, 6
     n_states = 4
     context_dim = 16
@@ -56,7 +56,7 @@ def test_context_encoder_sequence():
     x_seq = torch.randn(S, B, T, F_in)
 
     # --- CNN_LSTM Encoder ---
-    encoder = CNN_LSTM_Encoder(
+    encoder = DefaultEncoder(
         n_features=F_in,
         hidden_dim=context_dim,
         cnn_channels=8,

@@ -30,7 +30,7 @@ from scipy.optimize import linear_sum_assignment
 import matplotlib.pyplot as plt
 
 from nhsmm.constants import DEBUG, DTYPE, EPS, logger
-from nhsmm.context import CNN_LSTM_Encoder
+from nhsmm import DefaultEncoder
 from nhsmm.models import HSMM
 
 
@@ -155,34 +155,6 @@ def best_permutation_accuracy(
 
 
 # -----------------------------
-# Duration inspection
-# -----------------------------
-def print_duration_summary(model: HSMM):
-    """
-    Prints mean, mode, and optional variance for learned durations per state.
-    """
-    with torch.no_grad():
-        log_D = model.duration_module.log_matrix()
-        if log_D.ndim > 2:
-            log_D = log_D.squeeze(0).squeeze(0)
-        D = torch.exp(log_D).cpu().numpy()
-
-        V = getattr(model.duration_module, "log_var", None)
-        if V is not None:
-            V = torch.exp(V).cpu().numpy()
-
-    print("Learned duration statistics:")
-    for i, row in enumerate(D):
-        mode = int(np.argmax(row)) + 1
-        mean_dur = float((np.arange(1, len(row) + 1) * row).sum())
-        if V is not None:
-            var_dur = float((np.arange(1, len(row) + 1) ** 2 * V[i]).sum())
-            print(f" state {i}: mode={mode}, mean={mean_dur:.2f}, var={var_dur:.2f}")
-        else:
-            print(f" state {i}: mode={mode}, mean={mean_dur:.2f}")
-
-
-# -----------------------------
 # Visual Diagnostics
 # -----------------------------
 def plot_hsmm_results(X: torch.Tensor, v_path: np.ndarray, model: HSMM, label_map: Dict[int, str]):
@@ -278,7 +250,7 @@ if __name__ == "__main__":
 
     # --- Build context encoder ---
     hidden_dim = max(32, min(64, n_features * 2))
-    encoder = CNN_LSTM_Encoder(n_features=n_features, cnn_channels=5, hidden_dim=hidden_dim)
+    encoder = DefaultEncoder(n_features=n_features, cnn_channels=5, hidden_dim=hidden_dim)
 
     # --- Initialize HSMM ---
     model = HSMM(
@@ -289,10 +261,8 @@ if __name__ == "__main__":
         max_duration=MAX_DURATION,
         seed=DEFAULT_RNG_SEED,
         modulate_var=True,
-        min_covar=1e-6,
-        alpha=1.0,
-    )
-    print("[Init] Duration logits differentiated per state.")
+        min_covar=1e-6
+    ).to(device)
 
     # --- EM Training ---
     t0 = time.time()
@@ -313,8 +283,7 @@ if __name__ == "__main__":
         print("Confusion matrix (permuted):")
         print(confusion_matrix(true_states, mapped_pred))
         print("Mapping (model→true):")
-        for k, v in readable.items():
-            print(f"  {k} → {v}")
+        for k, v in readable.items(): print(f"  {k} → {v}")
 
         f1 = f1_score(true_states, mapped_pred, average="macro", zero_division=0)
         prec = precision_score(true_states, mapped_pred, average="macro", zero_division=0)
@@ -327,10 +296,6 @@ if __name__ == "__main__":
     else:
         print("⚠ No true state labels found — skipping accuracy evaluation.")
 
-    # --- Duration summary ---
-    print("\n===== Duration summary =====")
-    print_duration_summary(model)
-
     # --- State occupancy & transition diagnostics ---
     with torch.no_grad():
         # ---- Initial state distribution (t=0 only) ----
@@ -342,6 +307,26 @@ if __name__ == "__main__":
         for i, p in enumerate(init_probs):
             print(f"  {i:02d} ({label_map[i]}): {p:.4f}")
         print(f"  Sum: {init_probs.sum():.4f}")
+
+
+        # ---- Duration distributions ----
+        dur_logits = model.duration_module.log_matrix()  # [B,T,K,Dmax] or [K,Dmax]
+        if dur_logits.ndim > 2:
+            dur_logits = dur_logits.mean(dim=(0, 1))
+        dur_probs = torch.exp(dur_logits).cpu().numpy()
+
+        print("\n=== Duration Distributions per State ===")
+        for i, row in enumerate(dur_probs):
+            mode_dur = int(np.argmax(row)) + 1
+            mean_dur = float((np.arange(1, len(row)+1) * row).sum())
+            print(f"  {label_map[i]:<6} | mode={mode_dur}, mean={mean_dur:.2f}, total_prob={row.sum():.4f}")
+        row_sums = dur_probs.sum(axis=1)
+        if not np.allclose(row_sums, 1.0, atol=1e-6):
+            print("\n[WARN] Duration rows not normalized:")
+            for i, s in enumerate(row_sums):
+                print(f"  {i:02d} ({label_map[i]}): sum={s:.6f}")
+        else:
+            print("  All durations rows sum to 1 ✅")
 
         # ---- Transition matrix ----
         log_trans = model.transition_module.log_matrix()  # [B,T,K,K]
@@ -360,18 +345,6 @@ if __name__ == "__main__":
         else:
             print("  All transition rows sum to 1 ✅")
 
-        # ---- Duration distributions ----
-        dur_logits = model.duration_module.log_matrix()  # [B,T,K,Dmax] or [K,Dmax]
-        if dur_logits.ndim > 2:
-            dur_logits = dur_logits.mean(dim=(0, 1))
-        dur_probs = torch.exp(dur_logits).cpu().numpy()
-
-        print("\n=== Duration Distributions per State ===")
-        for i, row in enumerate(dur_probs):
-            mode_dur = int(np.argmax(row)) + 1
-            mean_dur = float((np.arange(1, len(row)+1) * row).sum())
-            print(f"  {label_map[i]:<6} | mode={mode_dur}, mean={mean_dur:.2f}, total_prob={row.sum():.4f}")
-
     # --- Inferred state occupancy from Viterbi ---
     unique, counts = np.unique(v_path, return_counts=True)
     print("\n=== Inferred State Occupancies ===")
@@ -380,7 +353,6 @@ if __name__ == "__main__":
         pct = c / total_frames * 100
         print(f"  {label_map[s]:<6}: {c} frames ({pct:.2f}%)")
     print(f"  Total frames: {total_frames}")
-
 
     if DEBUG:
         try:

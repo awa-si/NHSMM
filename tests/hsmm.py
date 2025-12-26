@@ -3,7 +3,7 @@ import numpy as np
 
 from nhsmm import utils
 from nhsmm.models import HSMM
-from nhsmm.context import CNN_LSTM_Encoder, ContextRouter, SequenceSet
+from nhsmm.context import DefaultEncoder, ContextRouter, SequenceSet
 
 
 def make_model(enc: bool = False, n_features: int = 5):
@@ -13,7 +13,7 @@ def make_model(enc: bool = False, n_features: int = 5):
     context_dim = 32
     hidden_dim = max(context_dim, min(64, n_features * 2))  # → 32 if n_features=5
 
-    encoder = CNN_LSTM_Encoder(
+    encoder = DefaultEncoder(
         n_features=n_features,
         cnn_channels=5,
         hidden_dim=hidden_dim,

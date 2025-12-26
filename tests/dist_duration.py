@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 from nhsmm.distributions import Duration
 from nhsmm.constants import DTYPE, EPS
-from nhsmm.context import CNN_LSTM_Encoder, ContextEncoder
+from nhsmm.context import DefaultEncoder, ContextEncoder
 
 def set_seed(seed: int = 42):
     torch.manual_seed(seed)
@@ -184,11 +184,11 @@ def test_batch_timestep_modulation():
     print("Single batch modulated logits shape:", single_mod.shape)
 
 def test_context_encoder():
-    print("\n=== TEST: ContextEncoder + CNN_LSTM_Encoder with Duration ===")
+    print("\n=== TEST: ContextEncoder + DefaultEncoder with Duration ===")
     B, T, F_in = 4, 8, 6
     n_states, context_dim = 5, 16
     x = torch.randn(B, T, F_in)
-    encoder = CNN_LSTM_Encoder(n_features=F_in, hidden_dim=context_dim, cnn_channels=8,
+    encoder = DefaultEncoder(n_features=F_in, hidden_dim=context_dim, cnn_channels=8,
                                kernel_size=3, bidirectional=True, return_sequence=True)
     for pool in ["mean", "last", "max", "attn", "mha"]:
         print(f"\n=== Testing pool={pool} ===")

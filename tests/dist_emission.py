@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 from nhsmm.constants import DTYPE, EPS
 from nhsmm.distributions import Emission
-from nhsmm.context import CNN_LSTM_Encoder, ContextEncoder
+from nhsmm.context import DefaultEncoder, ContextEncoder
 
 def set_seed(seed: int = 42):
     torch.manual_seed(seed)

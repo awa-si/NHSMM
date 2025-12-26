@@ -1,7 +1,7 @@
 # tests/test_context_encoder.py
 
 import torch
-from nhsmm.context import CNN_LSTM_Encoder, ContextEncoder
+from nhsmm import DefaultEncoder, ContextEncoder
 
 def test_context_encoder():
     torch.manual_seed(42)
@@ -23,7 +23,7 @@ def test_context_encoder():
     ], dtype=torch.bool)
 
     # --- Initialize CNN+LSTM encoder ---
-    cnn_lstm = CNN_LSTM_Encoder(
+    cnn_lstm = DefaultEncoder(
         n_features=F,
         hidden_dim=hidden_dim,
         cnn_channels=cnn_channels,
