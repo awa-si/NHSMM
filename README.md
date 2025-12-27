@@ -22,19 +22,33 @@ This document provides a **self-contained guide** to **NHSMM**, a modular PyTorc
 
 ---
 
-## Overview
+## 🧩 Overview
 
-**NHSMM** provides a **modular, time-aware framework** for **temporal sequence modeling** and **hidden-state inference** using **Hidden Semi-Markov Models (HSMMs)**. It explicitly models **context-dependent state durations** and **context-dependent transitions**, making it suitable for **non-stationary, real-world sequences, fully time-aware**.
+**NHSMM** is a **modular, context-aware framework** for **temporal sequence modeling** and **latent state inference** using **Hidden Semi-Markov Models (HSMMs)**.  
 
-NHSMM underpins the **State Aware Engine (SAE)** — a cross-domain platform for detecting **hidden regimes** and **temporal patterns** across finance, IoT, health, cybersecurity, robotics, and related domains.
+It explicitly captures:
 
-The library is suitable both as a **research framework** and as a **foundation for production-oriented systems**, with a strong emphasis on modularity, extensibility, and accelerator-friendly execution.
+* **Context-Dependent State Durations** — each hidden state can persist for variable durations influenced by external covariates, enabling accurate modeling of **state dwell-times**.  
+* **Context-Dependent Transitions** — transition probabilities between states adapt dynamically to **time-varying covariates**, allowing **non-stationary and evolving sequences** to be modeled faithfully.  
 
-Key deployment modes enabled by SAE & NHSMM (planned with Beta release):
+This design makes NHSMM particularly suitable for **real-world, time-sensitive applications**, where sequences are **non-stationary**, **heterogeneous**, and **fully time-aware**.
 
-- **Cloud-first SaaS** — scalable, multi-tenant sequence analytics
-- **On-prem / Edge** — low-latency, privacy-sensitive inference
-- **Accelerator-ready** — GPU, TPU, and future hardware backends for high-throughput temporal modeling
+---
+
+## 🌐 NHSMM & the State Aware Engine (SAE)
+
+**NHSMM** powers the **State Aware Engine (SAE)** — a **cross-domain platform** for uncovering **hidden regimes** and **temporal patterns** in sequential data across **finance, IoT, health, cybersecurity, robotics**, and related applications.  
+
+The framework is designed for dual usage:
+
+* **Research-Ready** — flexible, modular, and extensible for experimentation with **context-aware HSMMs** and novel sequence modeling approaches.  
+* **Production-Ready** — optimized for robust, high-throughput deployment in real-world systems, emphasizing **scalability**, **modularity**, and **accelerator-friendly execution**.  
+
+### 🚀 Key Deployment Modes (Beta)
+
+- **Cloud-First SaaS** — scalable, multi-tenant sequence analytics for enterprise applications.  
+- **On-Prem / Edge** — low-latency, privacy-preserving inference on local or edge devices.  
+- **Accelerator-Ready** — GPU, TPU, and future hardware backends for **high-throughput temporal modeling**.
 
 ---
 
@@ -46,13 +60,23 @@ Key deployment modes enabled by SAE & NHSMM (planned with Beta release):
 * **Transition Models** — learnable, **covariate-aware transitions** with gating and **temperature scaling** to control stochasticity and enforce smooth or sharp transitions. Supports low-rank factorization for large state spaces.  
 * **Hybrid HSMM-HMM Inference** — forward-backward and Viterbi algorithms adapted for **neural-parameterized latent states**, providing exact or approximate **sequence likelihoods and most probable paths**.  
 * **Subclassable Distributions** — Initial, Duration, Transition, and Emission modules inherit from PyTorch `Distribution`, allowing **custom probabilistic modules** or integration of specialized neural layers.  
-* **EM-style Updates & Initialization** — supports **maximum likelihood**, differentiable updates, and **temperature annealing** for stable and adaptive training of neural-HSMM parameters.  
+* **Differentiable Training** — supports **gradient-based optimization**, **temperature annealing**, and **neural modulation** for stable training of HSMM parameters.  
 * **Neural Context Encoders** — optional CNN, LSTM, or hybrid encoders to inject **time-varying covariates** into emission, duration, and transition probabilities.  
 * **GPU-Ready Implementation** — fully batched operations for **fast training and inference** on modern accelerators (CUDA-ready).  
 * **Multi-Domain Usage** — flexible for **finance (market regime detection), IoT (predictive maintenance), robotics (behavior monitoring), wearable health (activity and state detection), cybersecurity (anomaly detection)**, and other sequential applications.  
 * **Extensible Architecture** — modular foundation for SAE adapters, API integration, multi-domain extensions, and **future research projects** in sequence modeling.  
 * **Robust Initialization & Adaptivity** — supports **spread or random initialization**, learning rate adaptation, and state-wise parameter modulation for stable convergence across domains.  
-* **Hybrid Update Modes** — allows **neural gradient-based updates** and **closed-form EM-style updates**, optionally combined in alternating schemes for best performance.  
+* **Hybrid Update Modes** — allows **neural gradient-based updates**, optionally combined with alternative schemes for best performance.  
+
+---
+
+## ⚡ Performance & Scalability
+
+* **Vectorized Forward-Backward** — fully batched operations across sequences, states, and durations for **efficient likelihood computation**.  
+* **Low-Rank Transitions** — optional low-rank factorization reduces memory and compute costs for **large state spaces**.  
+* **Long-Sequence Support** — cumulative emission sums and duration masks enable **efficient handling of long sequences** without redundant computation.  
+* **Memory-Efficient Viterbi** — dynamic programming optimized for **GPU execution**, supporting batched decoding with minimal overhead.  
+* **Flexible Batch Sizes** — seamlessly handles variable-length sequences with **padding and masking**, ensuring **stable performance across heterogeneous datasets**.  
 
 ---
 
@@ -68,20 +92,29 @@ Key deployment modes enabled by SAE & NHSMM (planned with Beta release):
 
 ## 📦 Installation
 
-### From PyPI (now also available)
+NHSMM can be installed quickly via **PyPI** for standard usage or built from source for **development and customization**.
+
+### 🔹 Install from PyPI
+
+The easiest way to install NHSMM is through PyPI:
 
 ```bash
-pip install nhsmm;
+pip install nhsmm
 ```
 
-### From Source (Recommended for Development)
+This provides the latest stable release with all core dependencies, suitable for research or production environments.
+
+### 🔹 Install from Source (Recommended for Development)
+
+To contribute, customize, or use the latest development version:
 
 ```bash
-git clone https://github.com/awa-si/NHSMM.git;
-
-cd NHSMM;
-pip install -e .;
+git clone https://github.com/awa-si/NHSMM.git
+cd NHSMM
+pip install -e .
 ```
+
+This installs NHSMM in editable mode, allowing you to modify the source code and immediately test changes without reinstalling. Ideal for experimenting with new models, encoders, or distributions.
 
 ---
 
@@ -103,6 +136,7 @@ nhsmm/
 └── __init__.py
 
 ```
+
 ---
 
 ## 🧠 Usage Example — Market Regime Detection (HSMM)
