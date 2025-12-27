@@ -5,18 +5,21 @@
 - *Documentation: [Wiki on GitHub](https://github.com/awa-si/NHSMM/wiki)*
 - *Article on Medium: [Unlocking Hidden Patterns in Time – Meet NHSMM ](https://medium.com/@awa-si/unlocking-hidden-patterns-in-time-meet-nhsmm-the-neural-hidden-semi-markov-model-cd3f1e2428c2)*
 - *Current Version: 0.0.3-alpha*
+
 ---
 
-> ⚠️ **NHSMM is currently in alpha stage** and provided as a **proof-of-concept** first.  
-> It **is being enhanced for production**, and the public API is **subject to change** prior to the first stable `1.0.0` release.
+> ⚠️ **NHSMM is currently in alpha** and provided as a **proof-of-concept**.  
+> The library **is actively evolving** for production readiness, and the public API **may change** before the first stable `1.0.0` release.
 
-This document provides a **self-contained guide** to **NHSMM**, a modular PyTorch library that underpins the **State Aware Engine (SAE)**. It is designed for **developers, data scientists, and system integrators**, enabling them to quickly understand, deploy, and extend the library across diverse application domains.
+This guide provides a **self-contained overview** of **NHSMM**, a **modular PyTorch library** forming the foundation of the **State Aware Engine (SAE)**. It is tailored for **developers, data scientists, and system integrators**, enabling rapid understanding, deployment, and extension across **diverse sequential data domains**.
 
-**Highlights**  
-- Combines **Hidden Semi-Markov Models (HSMMs)** with **neural parameterization**  
-- Supports **contextual modulation** of initial, transition, duration, and emission distributions  
-- Enables **hierarchical and flexible model architectures** for sequential data  
-- Built with **PyTorch**, GPU-ready, and extensible for multi-domain use
+### 🌟 Highlights
+
+- Integrates **Hidden Semi-Markov Models (HSMMs)** with **neural parameterization** for expressive latent dynamics.  
+- Supports **context-aware modulation** of **initial, transition, duration, and emission distributions**, capturing **non-stationary temporal patterns**.  
+- Enables **flexible, hierarchical model architectures** for complex sequential data.  
+- Built on **PyTorch**, fully GPU-ready, and designed for **scalable multi-domain applications**.  
+- Provides a **modular foundation** for experimentation, research, and production deployment in domains such as **finance, IoT, robotics, health, and cybersecurity**.
 
 [![PyPI](https://img.shields.io/pypi/v/nhsmm.svg)](https://pypi.org/project/nhsmm/) [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0) [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 
@@ -134,7 +137,6 @@ nhsmm/
 │   └── __init__.py
 ├── __version__.py
 └── __init__.py
-
 ```
 
 ---
@@ -303,7 +305,8 @@ The **State Aware Engine (SAE)**, powered by **NHSMM**, is designed for **flexib
 * **Robotics & Motion Analytics** — Observe robotic behaviors, detect **unexpected transitions**, optimize task performance, and ensure **safe human-robot interaction**.  
 * **Telecommunications & Network Analytics** — Monitor network traffic patterns, detect **latent congestion states**, and predict **temporal anomalies** for automated response.  
 * **Energy & Smart Grids** — Track operational states of energy systems, detect **load or failure regimes**, and optimize resource allocation over time.  
-* **Cross-Domain Research & AI Applications** — Serve as a foundation for **temporal sequence modeling**, hybrid HSMM-HMM experiments, or **research in neural probabilistic models**.  
+* **Cross-Domain Research & AI Applications** — Serve as a foundation for **temporal sequence modeling**, hybrid HSMM-HMM experiments, or **research in neural probabilistic models**.
+  
 ---
 
 ## Support This Project
