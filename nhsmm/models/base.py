@@ -1,160 +1,175 @@
 # nhsmm/models/base.py
 
 from __future__ import annotations
-from abc import ABC, abstractmethod
 from typing import Optional, List, Tuple, Any, Literal, Dict, Union
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as nnF
 
 from nhsmm.constants import DEBUG, DTYPE, EPS, logger, MAX_LOGITS, NEG_INF
 from nhsmm.distributions import Initial, Duration, Transition, Emission
 from nhsmm.context import ContextEncoder, ContextRouter, SequenceSet
-from nhsmm import Convergence
+from nhsmm import Convergence, DefaultEncoder
 
-# torch.autograd.set_detect_anomaly(True)
 
-class HSMM(nn.Module, ABC):
+@dataclass
+class HSMMConfig:
+    n_states: int
+    n_features: int
+    max_duration: int
+    n_heads: int = 4
+    dropout: float = 0.0
+    min_covar: float = 1e-6
+    cnn_channels: float = 5
+    temperature: float = 1.0
+    modulate_var: bool = False
+    emission_type: str = "gaussian"
+    hidden_dim: Optional[int] = None
+    context_dim: Optional[int] = None
+    pool: Literal["mean", "last", "max", "attn", "mha"] = "mean"
+    transition_type: Literal["ergodic", "semi", "left-to-right"] = "ergodic"
+    seed: Optional[int] = None
+    debug: bool = False
+
+
+class DefaultDistribution(nn.Module):
+    """Container for HSMM distribution modules."""
 
     def __init__(
         self,
-        n_states: int,
-        n_features: int,
-        max_duration: int,
-        n_heads: int = 4,
-        dropout: float = 0.0,
-        min_covar: float = 1e-6,
-        temperature: float = 1.0,
-        modulate_var: bool = False,
-        emission_type: str = "gaussian",
-        hidden_dim: Optional[int] = None,
-        context_dim: Optional[int] = None,
-        encoder: Optional[nn.Module] = None,
-        pool: Literal["mean", "last", "max", "attn", "mha"] = "mean",
-        transition_type: Literal["ergodic", "semi", "left-to-right"] = "ergodic",
-        seed: Optional[int] = None, debug: bool = False):
-
+        initial: Optional[nn.Module] = None,
+        duration: Optional[nn.Module] = None,
+        transition: Optional[nn.Module] = None,
+        emission: Optional[nn.Module] = None,
+    ):
         super().__init__()
+        self.initial = initial
+        self.duration = duration
+        self.transition = transition
+        self.emission = emission
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def initialize(self) -> Dict[str, Any]:
+        return {
+            "initial_dist": self.initial.initialize(),
+            "duration_dist": self.duration.initialize(),
+            "transition_dist": self.transition.initialize(),
+            "emission_dist": self.emission.initialize(),
+        }
+
+
+class HSMM(nn.Module):
+
+    def __init__(
+        self,
+        config: HSMMConfig,
+        encoder: Optional[nn.Module] = None,
+        dist: Optional[DefaultDistribution] = None
+    ):
+        super().__init__()
+        self.config = config
         self._params: Dict[str, Any] = {}
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.seed = seed
-        if self.seed is not None:
-            torch.manual_seed(self.seed)
+        if config.seed is not None:
+            torch.manual_seed(config.seed)
             if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(self.seed)
+                torch.cuda.manual_seed_all(config.seed)
 
-        self.debug = debug
-        self.n_states = n_states
-        self.n_features = n_features
-        self.temperature = temperature
-        self.max_duration = max_duration
-        self.emission_type = emission_type
+        self.debug = config.debug
+        self.n_states = config.n_states
+        self.n_features = config.n_features
 
-        self.context_dim = context_dim
-        if hidden_dim is None:
-            hidden_dim = context_dim
-        elif hidden_dim != context_dim:
-            raise ValueError(
-                f"hidden_dim ({hidden_dim}) must equal context_dim ({context_dim}) "
-                "unless all modules explicitly define projection layers."
-            )
-        self.hidden_dim = hidden_dim
-
-        self.encoder: Optional[ContextEncoder] = None
-        if encoder is not None:
-            self.encoder = (
-                encoder if isinstance(encoder, ContextEncoder)
-                else ContextEncoder(
-                    encoder=encoder,
-                    pool=pool,
-                    n_heads=n_heads,
-                    dropout=dropout,
-                    debug=debug
-                ).to(device=self.device, dtype=DTYPE)
-            )
-
-            # --- Infer context dimension safely ---
-            self.encoder.eval()
-            try:
-                dummy = torch.zeros(1, 16, n_features, device=self.device, dtype=DTYPE)
-                try:
-                    _, ctx, _ = self.encoder(dummy, return_context=True, return_sequence=True)
-                except TypeError:
-                    ctx = None
-                self.context_dim = ctx.shape[-1] if ctx is not None else self.encoder(dummy).shape[-1]
-                self.hidden_dim = self.context_dim if hidden_dim is None else hidden_dim
-            finally:
-                self.encoder.train()
-
-        self._init_dist(
-            transition_type=transition_type,
-            emission_type=emission_type,
-            modulate_var=modulate_var,
-            max_duration=max_duration,
-            temperature=temperature,
-            min_covar=min_covar,
-        )
+        self._init_enc(config=config, encoder=encoder)
+        self._init_dist(config=config, dist=dist)
         self.to(device=self.device, dtype=DTYPE)
 
         try:
-            self._params.update({
-                "initial_dist": self.initial_module.initialize(),
-                "duration_dist": self.duration_module.initialize(),
-                "transition_dist": self.transition_module.initialize(),
-                "emission_dist": self.emission_module.initialize(),
-            })
+            self._params.update(self.dist.initialize())
         except Exception as err:
             raise RuntimeError(f"Failed to initialize HSMM PDFs: {err}") from err
 
-        if self.debug:
-            logger.debug(
-                f"HSMM initialized on {device}: n_states={self.n_states}, "
-                f"n_features={self.n_features}, context_dim={self.context_dim}, "
-                f"emission={self.emission_type}, max_duration={self.max_duration}"
+    def _init_enc(self, config: HSMMConfig, encoder: Optional[nn.Module]) -> None:
+
+        self.context_dim = config.context_dim
+        self.hidden_dim = config.hidden_dim
+
+        if encoder is None:
+            hidden_dim = max(32, min(64, self.n_features * 2))
+            encoder = DefaultEncoder(
+                n_features=self.n_features,
+                cnn_channels=config.cnn_channels,
+                hidden_dim=hidden_dim,
             )
+        self.encoder = encoder if isinstance(encoder, ContextEncoder) else ContextEncoder(
+            encoder=encoder,
+            pool=config.pool,
+            n_heads=config.n_heads,
+            dropout=config.dropout,
+            debug=self.debug
+        )
+        self.encoder.eval()
 
-    def _init_dist(self, # ToDo init externaly like encoder then pass
-        transition_type: str,
-        emission_type: str,
-        modulate_var: bool,
-        max_duration: int,
-        temperature: float,
-        min_covar: float):
+        try:
+            dummy = torch.zeros(1, 16, self.n_features, device=self.device, dtype=DTYPE)
+            try:
+                _, ctx, _ = self.encoder(dummy, return_context=True, return_sequence=True)
+                inferred_dim = ctx.shape[-1]
+            except TypeError:
+                inferred_dim = self.encoder(dummy).shape[-1]
 
-        self.initial_module = Initial(
-            n_states=self.n_states,
-            context_dim=self.context_dim,
-            hidden_dim=self.hidden_dim
-        )
-        self.duration_module = Duration(
-            n_states=self.n_states,
-            max_duration=max_duration,
-            context_dim=self.context_dim,
-            hidden_dim=self.hidden_dim,
-            temperature=temperature
-        )
-        self.transition_module = Transition(
-            n_states=self.n_states,
-            n_features=self.n_features,
-            transition_type=transition_type,
-            context_dim=self.context_dim,
-            hidden_dim=self.hidden_dim,
-            temperature=temperature
-        )
-        self.emission_module = Emission(
-            n_states=self.n_states,
-            n_features=self.n_features,
-            emission_type=emission_type,
-            context_dim=self.context_dim,
-            hidden_dim=self.hidden_dim,
-            modulate_var=modulate_var,
-            temperature=temperature,
-            min_covar=min_covar
-        )
+            if self.context_dim is None:
+                self.context_dim = inferred_dim
+            if self.hidden_dim is None:
+                self.hidden_dim = self.context_dim
+            elif self.hidden_dim != self.context_dim:
+                raise ValueError(
+                    f"hidden_dim ({self.hidden_dim}) must equal context_dim "
+                    f"({self.context_dim}) unless projections are explicitly defined."
+                )
+        finally:
+            self.encoder.train()
 
+    def _init_dist(self, config: HSMMConfig, dist: Optional[DefaultDistribution] = None) -> None:
+
+        self.temperature = config.temperature
+        self.max_duration = config.max_duration
+        self.emission_type = config.emission_type
+
+        self.dist = dist or DefaultDistribution(
+            initial=Initial(
+                n_states=self.n_states,
+                context_dim=self.context_dim,
+                hidden_dim=self.hidden_dim
+            ),
+            duration=Duration(
+                n_states=self.n_states,
+                max_duration=config.max_duration,
+                context_dim=self.context_dim,
+                hidden_dim=self.hidden_dim,
+                temperature=config.temperature
+            ),
+            transition=Transition(
+                n_states=self.n_states,
+                n_features=self.n_features,
+                transition_type=config.transition_type,
+                context_dim=self.context_dim,
+                hidden_dim=self.hidden_dim,
+                temperature=config.temperature
+            ),
+            emission=Emission(
+                n_states=self.n_states,
+                n_features=self.n_features,
+                emission_type=config.emission_type,
+                context_dim=self.context_dim,
+                hidden_dim=self.hidden_dim,
+                modulate_var=config.modulate_var,
+                temperature=config.temperature,
+                min_covar=config.min_covar
+            )
+        )
 
     def _prepare(self,
         X: torch.Tensor | list,
@@ -174,7 +189,6 @@ class HSMM(nn.Module, ABC):
                 batch_first=True
             )
 
-        # --- ensure batch dimension ---
         if X.ndim == 2: X = X.unsqueeze(0)
         B, T, F = X.shape
         K = self.n_states
@@ -206,7 +220,7 @@ class HSMM(nn.Module, ABC):
         if T == 0:
             log_probs = torch.empty(B, 0, K, device=device, dtype=DTYPE)
         else:
-            dist = self.emission_module.forward(context=context, return_dist=True)
+            dist = self.dist.emission.forward(context=context, return_dist=True)
             X_exp = X.unsqueeze(2).expand(B, T, K, F) # expand X for broadcasting
             log_probs = dist.log_prob(X_exp)
             log_probs = log_probs.masked_fill(~mask, float("-inf"))
@@ -215,9 +229,9 @@ class HSMM(nn.Module, ABC):
             print(f"[Prepare] X={X.shape}, context={context.shape}, canonical={canonical.shape}, log_probs={log_probs.shape}")
 
         return SequenceSet(
+            masks=mask,
             sequences=X,
             lengths=lengths,
-            masks=mask,
             contexts=context,
             canonical=canonical,
             log_probs=log_probs
@@ -231,9 +245,9 @@ class HSMM(nn.Module, ABC):
         dtype = router.context.dtype
 
         # --- Module logits ---
-        initial_logits = self.initial_module.log_matrix(context=router.canonical)  # [B,1,K]
-        duration_logits = self.duration_module.log_matrix(context=router.context)  # [B,T,K,Dmax]
-        transition_logits = self.transition_module.log_matrix(context=router.context)  # [B,T,K,K]
+        initial_logits = self.dist.initial.log_matrix(context=router.canonical)  # [B,1,K]
+        duration_logits = self.dist.duration.log_matrix(context=router.context)  # [B,T,K,Dmax]
+        transition_logits = self.dist.transition.log_matrix(context=router.context)  # [B,T,K,K]
 
         # --- Cumulative emission sums for all durations ---
         cumsum_emit = torch.zeros((B, T + 1, K), device=device, dtype=dtype)
@@ -302,9 +316,9 @@ class HSMM(nn.Module, ABC):
         B, T, K = router.log_probs.shape
         device = router.context.device
 
-        initial_logits = self.initial_module.log_matrix(context=router.canonical)  # [B,1,K]
-        duration_logits = self.duration_module.log_matrix(context=router.context)  # [B,T,K,Dmax]
-        transition_logits = self.transition_module.log_matrix(context=router.context)  # [B,T,K,K]
+        initial_logits = self.dist.initial.log_matrix(context=router.canonical)  # [B,1,K]
+        duration_logits = self.dist.duration.log_matrix(context=router.context)  # [B,T,K,Dmax]
+        transition_logits = self.dist.transition.log_matrix(context=router.context)  # [B,T,K,K]
 
         cumsum_emit = torch.zeros((B, T + 1, K), device=device, dtype=DTYPE) # cumsum_emit: [B, T+1, K]
         cumsum_emit[:, 1:, :] = torch.cumsum(router.log_probs, dim=1)
@@ -360,24 +374,23 @@ class HSMM(nn.Module, ABC):
         canonical = router.canonical.detach() if detach else router.canonical
         context = router.context.detach() if detach else router.context
         params = {
-            "initial_dist": self.initial_module.forward(
+            "initial_dist": self.dist.initial.forward(
                 context=canonical,
                 return_dist=True
             ),
-            "duration_dist": self.duration_module.forward(
+            "duration_dist": self.dist.duration.forward(
                 context=canonical,
                 return_dist=True
             ),
-            "transition_dist": self.transition_module.forward(
+            "transition_dist": self.dist.transition.forward(
                 context=canonical,
                 return_dist=True
             ),
-            "emission_dist": self.emission_module.forward(
+            "emission_dist": self.dist.emission.forward(
                 context=context,
                 return_dist=True
             ),
         }
-        self._params.update(params)
         return params
 
     def _viterbi(self,
@@ -405,9 +418,9 @@ class HSMM(nn.Module, ABC):
             ctx = router.context[b:b+1, :L]       # [1, L, H]
             canon = router.canonical[b:b+1]       # [1, 1, H]
 
-            init_logits = self.initial_module.log_matrix(context=canon)[0, 0]       # [K]
-            dur_logits = self.duration_module.log_matrix(context=ctx)[0]            # [L, K, Dmax]
-            trans_logits = self.transition_module.log_matrix(context=ctx)[0]        # [L, K, K]
+            init_logits = self.dist.initial.log_matrix(context=canon)[0, 0]       # [K]
+            dur_logits = self.dist.duration.log_matrix(context=ctx)[0]            # [L, K, Dmax]
+            trans_logits = self.dist.transition.log_matrix(context=ctx)[0]        # [L, K, K]
 
             if duration_weight != 0.0:
                 dur_logits = dur_logits * (1.0 - duration_weight)
@@ -496,6 +509,7 @@ class HSMM(nn.Module, ABC):
             patience=1,
             verbose=verbose,
         )
+
         best_score = -float("inf")
         for run_idx in range(n_init):
             if verbose:
@@ -503,29 +517,25 @@ class HSMM(nn.Module, ABC):
 
             prev_ll = self._reset_parameters(run_idx, context=theta)
 
-            # Collect all trainable parameters
+            # Collect all trainable parameters maybe _model_params?
             params = []
-            for module in (
-                self.initial_module,
-                self.transition_module,
-                self.duration_module,
-                self.emission_module,
-            ):
+            for name in ["initial", "transition", "duration", "emission"]:
+                module = getattr(self.dist, name)
                 if module is not None:
                     params += [p for p in module.parameters() if p.requires_grad]
 
-            optimizer = torch.optim.Adam(params, lr=lr)
+            if not getattr(self, "_optimizer", None):
+                self._optimizer = torch.optim.Adam(params, lr=lr)
 
             for it in range(max_iter):
-                optimizer.zero_grad()
+                self. _optimizer.zero_grad()
 
-                # Differentiable HSMM log-likelihood
                 ll = self.score(X, theta=theta, reduce=True)
                 loss = -ll
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(params, max_norm=5.0)
-                optimizer.step()
+                self._optimizer.step()
 
                 ll_val = ll.item()
                 self._convergence.update(ll_val, it, run_idx)
@@ -598,16 +608,11 @@ class HSMM(nn.Module, ABC):
             else:
                 raise TypeError(f"Unsupported theta type: {type(theta)}")
 
-        # --- prepare padded SequenceSet ---
         seq_set = self._prepare(sequences, theta=context_list)
-        
-        # --- forward algorithm (vectorized) ---
         alpha = self._forward(seq_set)  # [B, T, K, D]
-
         lengths = seq_set.lengths.to(dtype=torch.long, device=device)
-        
-        # --- compute log-likelihoods ---
         log_likelihoods = torch.full((B,), NEG_INF, dtype=DTYPE, device=device)
+
         valid = lengths > 0
         if valid.any():
             last_alpha = alpha[valid, lengths[valid] - 1]  # [N_valid, K, D]
@@ -624,7 +629,7 @@ class HSMM(nn.Module, ABC):
     def _reset_parameters(self, run_idx: int, context: Optional[torch.Tensor] = None, preserve_best: bool = True) -> None:
         modules = ["initial", "transition", "duration", "emission"]
         for name in modules:
-            module = getattr(self, f"{name}_module")
+            module = getattr(self.dist, name)
             if preserve_best and getattr(self, "_best_state", None) and name in self._best_state:
                 module.load_state_dict(self._best_state[name])
             else:
@@ -648,14 +653,14 @@ class HSMM(nn.Module, ABC):
 
     def _snapshot_best_params(self, context: Optional[torch.Tensor] = None):
         self._params.update({
-            "initial_dist": self.initial_module.forward(context=context, return_dist=True),
-            "duration_dist": self.duration_module.forward(context=context, return_dist=True),
-            "transition_dist": self.transition_module.forward(context=context, return_dist=True),
-            "emission_dist": self.emission_module.forward(context=context, return_dist=True),
+            "initial_dist": self.dist.initial.forward(context=context, return_dist=True),
+            "duration_dist": self.dist.duration.forward(context=context, return_dist=True),
+            "transition_dist": self.dist.transition.forward(context=context, return_dist=True),
+            "emission_dist": self.dist.emission.forward(context=context, return_dist=True),
         })
 
         self._best_state = {
-            name: getattr(self, f"{name}_module").state_dict()
+            name: getattr(self.dist, name).state_dict()
             for name in ["initial", "duration", "transition", "emission"]
         }
         if self.encoder is not None:
@@ -666,13 +671,13 @@ class HSMM(nn.Module, ABC):
             raise RuntimeError("No best parameters have been snapshotted")
 
         for name in ["initial", "transition", "duration", "emission"]:
-            getattr(self, f"{name}_module").load_state_dict(self._best_state[name])
+            getattr(self.dist, name).load_state_dict(self._best_state[name])
 
         if self.encoder is not None and "encoder" in self._best_state:
             self.encoder.load_state_dict(self._best_state["encoder"])
 
         for name in ["initial", "transition", "duration", "emission"]:
-            module = getattr(self, f"{name}_module")
+            module = getattr(self.dist, name)
             module._reset_buffers()
             module._invalidate_cache()
 
@@ -716,9 +721,7 @@ class HSMM(nn.Module, ABC):
             return results
 
         elif algorithm == "score":
-            # --- compute differentiable log-likelihoods ---
             return self.score(X, theta=context, reduce=False)
-
         else:
             raise ValueError(f"Unsupported decoding algorithm '{algorithm}'")
 

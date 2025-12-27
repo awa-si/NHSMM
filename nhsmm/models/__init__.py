@@ -1,5 +1,6 @@
-from .base import HSMM
+from .base import HSMM, HSMMConfig
 
 __all__ = [
-    'HSMM'
+    'HSMM',
+    'HSMMConfig',
 ]

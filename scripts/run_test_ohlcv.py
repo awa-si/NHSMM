@@ -12,7 +12,7 @@ This script demonstrates:
 
 Dependencies:
 - torch, numpy, polars, sklearn, matplotlib
-- NHSMM library (https://github.com/awa-si/nhsmm)
+- NHSMM library (https://github.com/awa-si/NHSMM)
 """
 
 import os
@@ -22,7 +22,7 @@ import polars as pl
 from typing import Optional, Dict, Tuple
 
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as nnF
 
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
@@ -30,8 +30,7 @@ from scipy.optimize import linear_sum_assignment
 import matplotlib.pyplot as plt
 
 from nhsmm.constants import DEBUG, DTYPE, EPS, logger
-from nhsmm import DefaultEncoder
-from nhsmm.models import HSMM
+from nhsmm.models import HSMM, HSMMConfig
 
 
 DEFAULT_RNG_SEED = 0
@@ -248,21 +247,20 @@ if __name__ == "__main__":
     X_scaled = scaler.fit_transform(X)
     X_torch = torch.tensor(X_scaled, dtype=DTYPE)
 
-    # --- Build context encoder ---
-    hidden_dim = max(32, min(64, n_features * 2))
-    encoder = DefaultEncoder(n_features=n_features, cnn_channels=5, hidden_dim=hidden_dim)
-
-    # --- Initialize HSMM ---
-    model = HSMM(
-        encoder=encoder,
+    # --- Create HSMM configuration ---
+    config = HSMMConfig(
         n_states=n_states,
         n_features=n_features,
-        emission_type="gaussian",
         max_duration=MAX_DURATION,
-        seed=DEFAULT_RNG_SEED,
+        emission_type="gaussian",
         modulate_var=True,
-        min_covar=1e-6
-    ).to(device)
+        min_covar=1e-6,
+        seed=DEFAULT_RNG_SEED
+    )
+    # --- Optionally create a custom distribution (or leave None to use defaults) ---
+    dist = None  # or pass a pre-built DefaultDistribution()
+    # --- Initialize HSMM ---
+    model = HSMM(config=config, encoder=None, dist=dist).to(device)
 
     # --- EM Training ---
     t0 = time.time()
@@ -299,7 +297,7 @@ if __name__ == "__main__":
     # --- State occupancy & transition diagnostics ---
     with torch.no_grad():
         # ---- Initial state distribution (t=0 only) ----
-        log_init = model.initial_module.log_matrix()  # [B,T,K]
+        log_init = model.dist.initial.log_matrix()  # [B,T,K]
         init_probs = torch.softmax(log_init[:, 0], dim=-1).mean(dim=0)  # only timestep 0
         init_probs = init_probs.cpu().numpy().flatten()
 
@@ -310,7 +308,7 @@ if __name__ == "__main__":
 
 
         # ---- Duration distributions ----
-        dur_logits = model.duration_module.log_matrix()  # [B,T,K,Dmax] or [K,Dmax]
+        dur_logits = model.dist.duration.log_matrix()  # [B,T,K,Dmax] or [K,Dmax]
         if dur_logits.ndim > 2:
             dur_logits = dur_logits.mean(dim=(0, 1))
         dur_probs = torch.exp(dur_logits).cpu().numpy()
@@ -329,7 +327,7 @@ if __name__ == "__main__":
             print("  All durations rows sum to 1 ✅")
 
         # ---- Transition matrix ----
-        log_trans = model.transition_module.log_matrix()  # [B,T,K,K]
+        log_trans = model.dist.transition.log_matrix()  # [B,T,K,K]
         log_trans_mean = log_trans.mean(dim=(0, 1))       # [K,K]
         trans_probs = torch.softmax(log_trans_mean, dim=-1).cpu().numpy()
 

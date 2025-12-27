@@ -1,5 +1,5 @@
 from .convergence import Convergence
-from .context import DefaultEncoder
+from .encoder import DefaultEncoder
 
 __all__ = [
     'Convergence',

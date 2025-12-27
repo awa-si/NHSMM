@@ -23,6 +23,7 @@ class CallbackFn(Protocol):
 
 
 class Convergence:
+    """Monitor convergence of multiple inits with optional callbacks."""
 
     def __init__(
         self,
@@ -33,35 +34,30 @@ class Convergence:
         rel_tol: float = 1e-5,
         early_stop: bool = True,
         callbacks: Optional[List[CallbackFn]] = None,
-        device: Optional[torch.device] = None,
         verbose: bool = True,
     ):
-        self.tol = tol
         self.n_init = n_init
-        self.rel_tol = rel_tol
         self.max_iter = max_iter
         self.patience = patience
+        self.tol = tol
+        self.rel_tol = rel_tol
         self.early_stop = early_stop
-        self.device = device or torch.device("cpu")
         self.callbacks = callbacks or []
         self.verbose = verbose
 
         shape = (max_iter + 1, n_init)
-        self.scores = torch.full(shape, float("nan"), dtype=DTYPE, device=self.device)
+        self.scores = torch.full(shape, float("nan"), dtype=DTYPE)
         self.deltas = torch.full_like(self.scores, float("nan"))
         self.rel_deltas = torch.full_like(self.scores, float("nan"))
 
-        self.best_scores = torch.full((n_init,), float("-inf"), dtype=DTYPE, device=self.device)
-        self.best_iters = torch.full((n_init,), -1, dtype=torch.int32, device=self.device)
-
-        self.converged_flags = torch.zeros(n_init, dtype=torch.bool, device=self.device)
+        self.best_scores = torch.full((n_init,), float("-inf"), dtype=DTYPE)
+        self.best_iters = torch.full((n_init,), -1, dtype=torch.int32)
+        self.converged_flags = torch.zeros(n_init, dtype=torch.bool)
         self.stop_training = False
-
         self._lock = Lock()
 
-    # ---------------- core API ----------------
-
     def update(self, score: float | torch.Tensor, iteration: int, init_idx: int) -> bool:
+        """Record score and check convergence."""
         self._record(score, iteration, init_idx)
         return self._check_convergence(iteration, init_idx)
 
@@ -74,14 +70,11 @@ class Convergence:
         self.converged_flags.zero_()
         self.stop_training = False
 
-    # ---------------- internals ----------------
-
     def _record(self, score, iteration: int, init_idx: int):
-        val = score.detach().to(self.device, dtype=DTYPE) if torch.is_tensor(score) \
-            else torch.tensor(score, dtype=DTYPE, device=self.device)
-
+        val = score.item() if torch.is_tensor(score) else float(score)
         self.scores[iteration, init_idx] = val
 
+        # Update best
         if val > self.best_scores[init_idx]:
             self.best_scores[init_idx] = val
             self.best_iters[init_idx] = iteration
@@ -90,11 +83,11 @@ class Convergence:
             return
 
         prev = self.scores[iteration - 1, init_idx]
-        if not torch.isfinite(prev):
+        if not np.isfinite(prev):
             return
 
         delta = val - prev
-        rel_delta = delta / (prev.abs() + EPS)
+        rel_delta = delta / (abs(prev) + EPS)
 
         self.deltas[iteration, init_idx] = delta
         self.rel_deltas[iteration, init_idx] = rel_delta
@@ -111,7 +104,7 @@ class Convergence:
             self.converged_flags[init_idx] = False
             return False
 
-        converged = bool((da < self.tol).all() and (dr < self.rel_tol).all())
+        converged = (da < self.tol).all() and (dr < self.rel_tol).all()
         self.converged_flags[init_idx] = converged
 
         self._run_callbacks(iteration, init_idx, converged)
@@ -119,33 +112,27 @@ class Convergence:
         if self.verbose:
             logger.info(
                 f"[Init {init_idx+1:02d}] Iter {iteration:03d} | "
-                f"Score {float(self.scores[iteration, init_idx]):.6f} | "
-                f"Δ {float(self.deltas[iteration, init_idx]):.3e} | "
-                f"Δ% {float(self.rel_deltas[iteration, init_idx]):.3e}"
+                f"Score {self.scores[iteration, init_idx]:.6f} | "
+                f"Δ {self.deltas[iteration, init_idx]:.3e} | "
+                f"Δ% {self.rel_deltas[iteration, init_idx]:.3e}"
                 + (" ✓" if converged else "")
             )
 
         if self.early_stop and self.converged_flags.all():
             self.stop_training = True
 
-        return converged
+        return bool(converged)
 
     def _run_callbacks(self, iteration: int, init_idx: int, converged: bool):
         with self._lock:
             s = float(self.scores[iteration, init_idx])
-            da = self.deltas[iteration, init_idx]
-            dr = self.rel_deltas[iteration, init_idx]
-
-            da = float(da) if torch.isfinite(da) else float("nan")
-            dr = float(dr) if torch.isfinite(dr) else float("nan")
-
+            da = float(self.deltas[iteration, init_idx]) if torch.isfinite(self.deltas[iteration, init_idx]) else float("nan")
+            dr = float(self.rel_deltas[iteration, init_idx]) if torch.isfinite(self.rel_deltas[iteration, init_idx]) else float("nan")
             for fn in self.callbacks:
                 try:
                     fn(self, iteration, init_idx, s, da, dr, converged)
                 except Exception as e:
                     logger.warning(f"[Callback Error] {fn}: {e}")
-
-    # ---------------- plotting ----------------
 
     def plot(self, show: bool = True, savepath: Optional[str] = None, title: str = "Convergence Progress", log_scale: bool = False):
         fig, ax = plt.subplots(figsize=(9, 5))
@@ -157,8 +144,8 @@ class Convergence:
                 continue
 
             ax.plot(
-                iters[mask].cpu(),
-                self.scores[mask, i].cpu(),
+                iters[mask].numpy(),
+                self.scores[mask, i].numpy(),
                 lw=1.5,
                 marker="o",
                 label=f"Init {i+1}"
@@ -166,7 +153,7 @@ class Convergence:
 
             bi = self.best_iters[i].item()
             if bi >= 0:
-                ax.scatter(bi, self.best_scores[i].cpu(), marker="x", s=60)
+                ax.scatter(bi, self.best_scores[i].item(), marker="x", s=60)
 
         ax.set(title=title, xlabel="Iteration", ylabel="Score")
         if log_scale:
@@ -190,15 +177,15 @@ class Convergence:
             "scores": self._tensor_to_list(self.scores),
             "deltas": self._tensor_to_list(self.deltas),
             "rel_deltas": self._tensor_to_list(self.rel_deltas),
-            "converged": self.converged_flags.cpu().tolist(),
-            "best_scores": self.best_scores.cpu().tolist(),
-            "best_iters": self.best_iters.cpu().tolist(),
+            "converged": self.converged_flags.numpy().tolist(),
+            "best_scores": self.best_scores.numpy().tolist(),
+            "best_iters": self.best_iters.numpy().tolist(),
         }
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
 
     @staticmethod
     def _tensor_to_list(t: torch.Tensor):
-        arr = t.cpu().numpy()
+        arr = t.numpy()
         return [[float(x) if np.isfinite(x) else None for x in row] for row in arr]
 

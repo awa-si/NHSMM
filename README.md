@@ -4,7 +4,7 @@
 - *Repository: [NHSMM on GitHub](https://github.com/awa-si/NHSMM)*
 - *Documentation: [Wiki on GitHub](https://github.com/awa-si/NHSMM/wiki)*
 - *Article on Medium: [Unlocking Hidden Patterns in Time – Meet NHSMM ](https://medium.com/@awa-si/unlocking-hidden-patterns-in-time-meet-nhsmm-the-neural-hidden-semi-markov-model-cd3f1e2428c2)*
-- *Current Version: 0.0.3-alpha*
+- *Current Version (PyPI): 0.0.3-alpha*
 
 ---
 
@@ -128,6 +128,7 @@ nhsmm/
 ├── context.py
 ├── constants.py
 ├── convergence.py
+├── encoder.py
 ├── data.py
 ├── models/
 │   ├── base.py
@@ -143,93 +144,11 @@ nhsmm/
 
 ## 🧠 Usage Example — Market Regime Detection (HSMM)
 
-Please also see:
+Please see:
 [State Occupancy & Duration/Transition Diagnostics](docs/test.md)
 
 This example demonstrates **Hidden Semi-Markov regime detection** on OHLCV-style time-series data using **NHSMM**.  
 The same pattern applies to **IoT signals, health data, robotics telemetry, or cybersecurity logs**.
-
----
-
-### 1. Prepare Data
-
-```python
-import torch
-import numpy as np
-from sklearn.preprocessing import StandardScaler
-
-from nhsmm.models import HSMM
-from nhsmm.context import DefaultEncoder
-from nhsmm.constants import DTYPE
-
-# Synthetic example: [T, F] = time × features
-T, F = 512, 5
-X = np.random.randn(T, F)
-
-# Scale features
-X = StandardScaler().fit_transform(X)
-X = torch.tensor(X, dtype=DTYPE)
-```
-
-### 2. Build Context Encoder (Optional but Recommended)
-
-Context enables non-stationary transitions and durations.
-
-```python
-encoder = DefaultEncoder(
-    n_features=F,
-    cnn_channels=4,
-    hidden_dim=64,
-)
-```
-
-### 3. Initialize Neural HSMM
-
-```python
-model = HSMM(
-    encoder=encoder,
-    n_states=3,              # e.g. range / bull / bear
-    n_features=F,
-    emission_type="gaussian",
-    max_duration=30,
-    seed=0,
-)
-```
-
-### 4. Train with EM-Style Optimization
-
-```python
-model.fit(
-    X,
-    n_init=3,
-    max_iter=3,
-    tol=1e-4,
-    verbose=True,
-)
-```
-
-### 5. Decode Hidden States (Viterbi) / Inspect
-
-```python
-states = model.decode(X, algorithm="viterbi")
-
-print("Decoded states shape:", states.shape)
-print("Unique states:", torch.unique(states))
-
-# Inspect Learned Durations
-with torch.no_grad():
-    durations = torch.exp(model.duration_module.log_matrix())
-    durations = durations.mean(dim=(0, 1))  # [K, D]
-
-for i, row in enumerate(durations):
-    mean_dur = (torch.arange(1, len(row) + 1) * row).sum()
-    print(f"State {i}: mean duration ≈ {mean_dur:.2f}")
-
-# Log-Likelihood Scoring
-log_likelihood = model.score(X)
-print("Sequence log-likelihood:", log_likelihood.item())
-
-```
 
 ---
 

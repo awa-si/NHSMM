@@ -10,7 +10,7 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as nnF
 from torch.distributions import (
     Distribution, Bernoulli, Laplace, MultivariateNormal,
     Normal, Independent, Poisson, StudentT
@@ -27,13 +27,7 @@ class Categorical(Distribution):
         "probs": torch.distributions.constraints.simplex,
     }
 
-    def __init__(
-        self,
-        logits: Optional[torch.Tensor] = None,
-        probs: Optional[torch.Tensor] = None,
-        validate_args: bool = False,
-        dim: int = -1,
-    ):
+    def __init__(self, logits=None, probs=None, validate_args=False, dim=-1):
         super().__init__(validate_args=validate_args)
         if (logits is None) == (probs is None):
             raise ValueError("Specify exactly one of logits or probs.")
@@ -43,78 +37,46 @@ class Categorical(Distribution):
         if logits is not None:
             logits = logits.clamp(min=-MAX_LOGITS, max=MAX_LOGITS).to(dtype=DTYPE)
             self._logits = logits
-            self._log_probs = F.log_softmax(logits, dim=self.dim)
+            self._log_probs = nnF.log_softmax(logits, dim=self.dim)
             self._probs = self._log_probs.exp()
         else:
             probs = probs / probs.sum(dim=dim, keepdim=True).clamp_min(EPS)
             self._probs = probs.to(dtype=DTYPE)
-            self._log_probs = probs.clamp_min(EPS).log()
-            self._logits = self._log_probs.clone()
+            self._log_probs = self._probs.clamp_min(EPS).log()
+            self._logits = torch.log(self._probs)
 
     @property
-    def logits(self) -> torch.Tensor:
-        return self._logits
-
+    def logits(self): return self._logits
     @property
-    def probs(self) -> torch.Tensor:
-        return self._probs
-
+    def probs(self): return self._probs
     @property
-    def log_probs(self) -> torch.Tensor:
-        return self._log_probs
-
+    def log_probs(self): return self._log_probs
     @property
-    def mean(self) -> torch.Tensor:
-        return self._probs
-
+    def mean(self): return self._probs
     @property
-    def batch_shape(self):
-        return self._logits.shape[:-1]
-
+    def batch_shape(self): return self._logits.shape[:-1]
     @property
-    def event_shape(self):
-        return torch.Size()
+    def event_shape(self): return torch.Size()
 
     def sample(self, sample_shape=torch.Size()):
-        """
-        Draw samples [sample_shape, batch_shape].
-        """
-        sample_shape = torch.Size(sample_shape)
+        # Flatten batch for multinomial
         batch_flat = self._probs.reshape(-1, self._probs.shape[-1])
         n_samples = int(torch.prod(torch.tensor(sample_shape, dtype=torch.int64)))
         idx = torch.multinomial(batch_flat, n_samples, replacement=True)
-        # Reshape to [sample_shape, batch_shape]
-        idx = idx.view(*sample_shape, *self.batch_shape)
-        return idx.long()
+        return idx.view(*sample_shape, *self.batch_shape).long()
 
     def rsample(self, sample_shape=torch.Size(), temperature: float = 1.0, hard: bool = False):
-        """
-        Differentiable Gumbel-Softmax sampling.
-        """
-        sample_shape = torch.Size(sample_shape)
         temperature = max(float(temperature), EPS)
-
-        logits = self._logits
-        expand_shape = tuple(sample_shape) + logits.shape
-        logits_exp = logits.expand(*expand_shape)
+        # Broadcasting works natively
+        logits_exp = self._logits.unsqueeze(0).expand(*sample_shape, *self.batch_shape, self._logits.shape[-1])
         return F.gumbel_softmax(logits_exp, tau=temperature, hard=hard, dim=-1)
 
     def log_prob(self, value: torch.Tensor):
-        """
-        Compute log-probabilities of indices (integers).
-        """
-        value = torch.as_tensor(value, device=self._logits.device)
-        if not torch.is_integral(value):
-            raise ValueError("Categorical indices must be integers.")
-
+        value = value.long()
         gather_dim = self.dim if self.dim >= 0 else self._log_probs.ndim + self.dim
-        value_exp = value.unsqueeze(gather_dim)
-        return self._log_probs.gather(gather_dim, value_exp).squeeze(gather_dim)
+        return self._log_probs.gather(gather_dim, value.unsqueeze(gather_dim)).squeeze(gather_dim)
 
     def entropy(self):
-        """
-        Shannon entropy of the categorical distribution.
-        """
         p = self._probs.clamp_min(EPS)
         return -(p * p.log()).sum(dim=self.dim)
 
@@ -124,7 +86,7 @@ class Categorical(Distribution):
 
 class Neural(nn.Module, ABC):
 
-    _dist_factory: Distribution = None
+    _dist_factory: type[Distribution] = None
 
     def __init__(
         self,
@@ -215,17 +177,10 @@ class Neural(nn.Module, ABC):
                     nn.init.zeros_(m.bias)
 
     def _apply_temperature(self, logits: torch.Tensor, temperature: Optional[Union[float, torch.Tensor]] = None) -> torch.Tensor:
-        if temperature is None:
-            tau = self.log_temperature.exp()
-        else:
-            tau = torch.tensor(float(temperature), dtype=DTYPE)
-        tau = tau.clamp_min(EPS)
-
-        if isinstance(tau, torch.Tensor):
-            if tau.ndim > len(self._shape):
-                raise ValueError("temperature tensor ndim incompatible with parameter shape")
-            if tau.ndim == len(self._shape):
-                tau = tau.view(*([1] * (logits.ndim - tau.ndim)), *tau.shape)
+        tau = temperature if isinstance(temperature, (float, torch.Tensor)) else self.log_temperature.exp()
+        tau = torch.as_tensor(tau, dtype=DTYPE, device=logits.device).clamp_min(EPS)
+        if tau.ndim == len(self._shape):
+            tau = tau.view(*([1] * (logits.ndim - tau.ndim)), *tau.shape)
         return logits / tau
 
     def _prepare_context(self, context: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -247,7 +202,6 @@ class Neural(nn.Module, ABC):
         context: Optional[torch.Tensor] = None,
         timestep: Optional[int] = None, grad_scale: Optional[float] = None) -> torch.Tensor:
 
-        base = self._tensor_shape(base)
         if context is None or context.numel() == 0 or self.context_net is None:
             return base * 0
 
@@ -289,47 +243,23 @@ class Neural(nn.Module, ABC):
         return delta
 
     def _tensor_shape(self, tensor: torch.Tensor) -> torch.Tensor:
-        if tensor is None: return None
         k = len(self._shape)
         if tensor.ndim < k:
             raise ValueError(f"Tensor ndim={tensor.ndim} < required trailing dims={k}")
         if tensor.shape[-k:] != self._shape:
-            tensor = tensor.reshape(*tensor.shape[:-k], *self._shape)
+            tensor = tensor.view(*tensor.shape[:-k], *self._shape)
         return tensor
 
     def _ensure_leading_dims(self, tensor: torch.Tensor, min_leading: int = 3) -> torch.Tensor:
-        # HSMM canonical form: (S, B, T?, ..., *shape)
         target_ndim = min_leading + len(self._shape)
         while tensor.ndim < target_ndim:
             tensor = tensor.unsqueeze(0)
         return tensor
 
-    def _modulate(self,
-        context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        timestep: Optional[int] = None,
-        grad_safe: bool = False, **kwargs) -> torch.Tensor:
-
-        context_key = self._context_hash(context)
-        timestep_key = f"T{timestep}" if timestep is not None else "TNone"
-        temp_key = f"{float(temperature):.6g}" if temperature is not None else "None"
-        key = f"{context_key}-{timestep_key}-Temp{temp_key}"
-
-        if self.cache_enabled:
-            cached = self._cache_get(key)
-            if cached is not None:
-                return cached.clone() if not grad_safe else cached.clone().detach()
-
-        delta = self._apply_context(self.base, context=context, timestep=timestep)
-        mod = self._validate_base(self.base + delta)
-        mod = self._apply_temperature(mod, temperature)
-        mod = self._tensor_shape(mod)  # ensures trailing shape matches self._shape
-        mod = self._ensure_leading_dims(mod)
-
-        if self.cache_enabled:
-            self._cache_set(key, mod.clone(), grad_safe=grad_safe)
-        return mod.detach() if grad_safe else mod
-
+    @abstractmethod
+    def _modulate(self, *args, **kwargs) -> torch.Tensor:
+        pass
+        
     @abstractmethod
     def _init_params(self, *args, **kwargs) -> torch.Tensor:
         pass
@@ -449,8 +379,7 @@ class Neural(nn.Module, ABC):
         base = torch.clamp(base, -MAX_LOGITS, MAX_LOGITS)
         if not torch.isfinite(base).all():
             bad_idx = (~torch.isfinite(base)).nonzero(as_tuple=True)
-            bad_vals = base[bad_idx]
-            raise ValueError(f"Non-finite base at {bad_idx}: {bad_vals}")
+            raise ValueError(f"Non-finite base at {bad_idx}")
         return base
 
     @property
@@ -459,12 +388,9 @@ class Neural(nn.Module, ABC):
 
     @base.setter
     def base(self, value: torch.Tensor) -> None:
-        if not isinstance(value, torch.Tensor):
-            raise TypeError("base must be a torch.Tensor")
         if value.shape != self._shape:
             raise ValueError(f"base shape {value.shape} does not match expected {self._shape}")
-        base = self._validate_base(value)
-        self.logits.copy_(base)
+        self.logits.copy_(self._validate_base(value))
         self._invalidate_cache()
 
     @property
@@ -476,18 +402,14 @@ class Neural(nn.Module, ABC):
     @_dist.setter
     def _dist(self, value: type) -> None:
         if not isinstance(value, type):
-            raise TypeError("_dist must be a distribution *class*, not an instance.")
+            raise TypeError("_dist must be a distribution *class*")
         self._dist_factory = value
 
     def _context_hash(self, context: Optional[torch.Tensor]) -> str:
         if context is None:
             return f"none-v{int(self._param_version.item())}"
-
-        c = context.detach().float()
-        sample = c.flatten()[::max(1, c.numel() // 1024)]  # take at most 1024 elements
-        sample_bytes = sample.cpu().numpy().tobytes()
-        ctx_hash = hashlib.sha256(sample_bytes).hexdigest()[:12]  # short hash
-        return f"{ctx_hash}-v{int(self._param_version.item())}"
+        sample = context.detach().float().flatten()[::max(1, context.numel() // 1024)]
+        return f"{hashlib.sha256(sample.cpu().numpy().tobytes()).hexdigest()[:12]}-v{int(self._param_version.item())}"
 
     def _cache_set(self, key: str, value: torch.Tensor, grad_safe: bool = True) -> None:
         self._cache[key] = value.detach() if grad_safe else value
@@ -499,8 +421,7 @@ class Neural(nn.Module, ABC):
         value = self._cache.get(key, None)
         if value is not None:
             self._cache.move_to_end(key)
-            return value
-        return None
+        return value
 
     def _invalidate_cache(self) -> None:
         self._param_version += 1
@@ -579,9 +500,7 @@ class Initial(Neural):
         return self._get_dist(context=context, temperature=temperature, timestep=None, **dist_kwargs)
 
     def _apply_constraints(self, logits: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        logits = logits.clamp(min=NEG_INF, max=-NEG_INF)
         if mask is None: return logits
-        mask = mask.to(device=logits.device, dtype=torch.bool)
         mask = mask.view((1,) * (logits.ndim - 1) + mask.shape)
         return logits.masked_fill(~mask, NEG_INF)
 
@@ -590,8 +509,23 @@ class Initial(Neural):
         temperature: Optional[float] = None,
         timestep: Optional[int] = None,
         grad_safe: bool = False, **kwargs) -> torch.Tensor:
-        mod = super()._modulate(context=context, temperature=temperature, timestep=timestep, grad_safe=grad_safe, **kwargs)
-        return mod
+
+        key = f"{self._context_hash(context)}-T{timestep}-Temp{float(temperature) if temperature is not None else 'None'}"
+        if self.cache_enabled:
+            cached = self._cache_get(key)
+            if cached is not None:
+                return cached.detach() if grad_safe else cached
+
+        base = self._tensor_shape(self.base)
+        delta = self._apply_context(base, context, timestep)
+        mod = self._apply_constraints(base + delta, mask=kwargs.get("mask", None))
+        mod = self._apply_temperature(mod, temperature)
+        mod = self._ensure_leading_dims(mod)
+        mod = self._validate_base(mod)
+
+        if self.cache_enabled:
+            self._cache_set(key, mod, grad_safe=grad_safe)
+        return mod.detach() if grad_safe else mod
 
     def log_matrix(self,
         context: Optional[torch.Tensor] = None,
@@ -697,30 +631,35 @@ class Duration(Neural):
         temperature: Optional[float] = None,
         timestep: Optional[int] = None,
         grad_safe: bool = False, **kwargs) -> torch.Tensor:
+
         base = self._tensor_shape(self.base)
-        tau = float(self.temperature if temperature is None else max(temperature, EPS))
         delta = self._apply_context(base, context=context, timestep=timestep)
-        mod = self._apply_constraints(base + delta)
+        mod = self._apply_constraints(base + delta, mask=kwargs.get("mask", None))
+        tau = float(self.temperature if temperature is None else max(temperature, EPS))
         mod = self._apply_temperature(mod, tau)
         mod = self._validate_base(mod)
         return mod
 
-    def log_matrix(self, context=None, temperature=None, timestep=None, T=None, **kwargs):
+    def log_matrix(self,
+        context: Optional[torch.Tensor] = None,
+        temperature: Optional[float] = None,
+        timestep: Optional[int] = None, T: Optional[int] = None, **kwargs) -> torch.Tensor:
+
         mod = self._modulate(context=context, temperature=temperature, timestep=timestep, **kwargs)
-        logp = F.log_softmax(mod, dim=-1)  # [B, K, Dmax] or [K, Dmax]
-        if logp.ndim == 2:  # [K, Dmax]
-            logp = logp.unsqueeze(0)  # [1, K, Dmax]
-        logp = logp.unsqueeze(1) if logp.ndim == 3 else logp  # [B, 1, K, Dmax]
+        logp = nnF.log_softmax(mod, dim=-1)
+        # Ensure leading dims: [B, T, K, Dmax]
+        while logp.ndim < 4:
+            logp = logp.unsqueeze(0)
         if T is not None and logp.shape[1] == 1:
-            logp = logp.expand(-1, T, -1, -1)  # [B, T, K, Dmax]
-        return logp  # [B, T, K, Dmax]
+            logp = logp.expand(-1, T, -1, -1)
+        return logp
 
     def expected_probs(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
         timestep: Optional[int] = None, **kwargs) -> torch.Tensor:
         mod = self._modulate(context=context, temperature=temperature, timestep=timestep, **kwargs)
-        probs = F.softmax(mod, dim=-1)
+        probs = nnF.softmax(mod, dim=-1)
         return probs
 
     def sample(self,
@@ -826,10 +765,11 @@ class Transition(Neural):
         temperature: Optional[float] = None,
         timestep: Optional[int] = None,
         grad_safe: bool = False, **kwargs) -> torch.Tensor:
-        tau = float(self.temperature if temperature is None else max(temperature, EPS))
+
         base = self._tensor_shape(self.base)
         delta = self._apply_context(base, context=context, timestep=timestep)
-        mod = self._apply_constraints(base + delta)
+        mod = self._apply_constraints(base + delta, mask=kwargs.get("mask", None))
+        tau = float(self.temperature if temperature is None else max(temperature, EPS))
         mod = self._apply_temperature(mod, tau)
         mod = self._validate_base(mod)
         return mod
@@ -842,17 +782,19 @@ class Transition(Neural):
         probs = F.softmax(mod, dim=-1)
         return probs
 
-    def log_matrix(self, context=None, temperature=None, timestep=None, T=None, **kwargs):
-        mod = self._modulate(context=context, temperature=temperature, timestep=timestep, **kwargs)
-        logp = F.log_softmax(mod, dim=-1)
-        if logp.ndim == 2:       # [K, K]
-            logp = logp.unsqueeze(0).unsqueeze(0)  # [1, 1, K, K]
-        elif logp.ndim == 3:     # [B, K, K]
-            logp = logp.unsqueeze(1)               # [B, 1, K, K]
+    def log_matrix(self,
+        context: Optional[torch.Tensor] = None,
+        temperature: Optional[float] = None,
+        timestep: Optional[int] = None, T: Optional[int] = None, **kwargs) -> torch.Tensor:
 
+        mod = self._modulate(context=context, temperature=temperature, timestep=timestep, **kwargs)
+        logp = nnF.log_softmax(mod, dim=-1)
+        # Ensure leading dims: [B, T, K, K]
+        while logp.ndim < 4:
+            logp = logp.unsqueeze(0)
         if T is not None and logp.shape[1] == 1:
-            logp = logp.expand(-1, T, -1, -1)      # [B, T, K, K]
-        return logp  # [B, T, K, K]
+            logp = logp.expand(-1, T, -1, -1)
+        return logp
 
     def sample(self,
         context: Optional[torch.Tensor] = None,
@@ -860,7 +802,7 @@ class Transition(Neural):
         timestep: Optional[int] = None, **dist_kwargs) -> torch.Tensor:
         dist = self._get_dist(context, temperature, timestep, **dist_kwargs)
         s = dist.sample()
-        return F.one_hot(s.long(), num_classes=self.n_states).to(dtype=DTYPE)
+        return nnF.one_hot(s.long(), num_classes=self.n_states).to(dtype=DTYPE)
 
 
 class Emission(Neural):
@@ -921,31 +863,43 @@ class Emission(Neural):
         base = self._validate_base(base)
         return base
 
-    @torch.no_grad()
     def _init_params(self, mode: str = None, context: Optional[torch.Tensor] = None, jitter: float = 1e-5) -> torch.Tensor:
         mode = self.init_mode if mode is None else mode
+
         if mode == "random":
             init_mean = torch.randn(self.n_states, self.n_features, dtype=DTYPE) * 0.1
+
         elif mode == "spread":
+            # Generate a base linspace and permute along feature dimension efficiently
             linspace = torch.linspace(-1.0, 1.0, steps=self.n_states, dtype=DTYPE)
-            init_mean = torch.stack([linspace[torch.randperm(self.n_states)] for _ in range(self.n_features)], dim=1)
-            init_mean += torch.randn_like(init_mean) * 0.05
+            perm_idx = torch.stack([torch.randperm(self.n_states) for _ in range(self.n_features)], dim=0)  # [F, K]
+            init_mean = linspace[perm_idx].T  # [K, F]
+            init_mean += torch.randn_like(init_mean) * 0.05  # jitter
+
         else:
             raise ValueError(f"Unsupported mode: {mode}")
 
-        if context is not None and hasattr(self, "context_net") and self.context_net is not None:
-            ctx = context.mean(dim=0) if context.ndim in (2, 3) else context
-            delta = self.context_net(ctx).view(init_mean.shape)
+        # Apply context modulation if provided
+        if context is not None and getattr(self, "context_net", None) is not None:
+            if context.ndim in (2, 3):
+                ctx = context.mean(dim=0)
+            else:
+                ctx = context
+            delta = self.context_net(ctx)
+            if delta.numel() == self.n_states * self.n_features:
+                delta = delta.view(self.n_states, self.n_features)
             init_mean = init_mean + delta
+
             if self.emission_type == "studentt":
                 df_delta = self.context_net(ctx)
                 df = F.softplus(self.dof + df_delta) + 2.0
                 self.dof.copy_(df)
 
-        # Initialize variance/scale
+        # Variance initialization (feature-wise spread)
         mean_spread = init_mean.std(dim=0, keepdim=True).clamp_min(self.min_covar)
         init_var = mean_spread**2 + torch.rand(self.n_states, self.n_features, dtype=DTYPE) * jitter
 
+        # Assign parameters efficiently
         if self.emission_type == "gaussian":
             self.mu.copy_(init_mean)
             self.log_var.copy_(torch.log(init_var))
@@ -953,8 +907,10 @@ class Emission(Neural):
             self.loc.copy_(init_mean)
             self.scale_param.copy_(init_var.sqrt())
 
+        # Reset buffers and invalidate cache
         self._reset_buffers()
         self._invalidate_cache()
+
         return self.base
 
     @torch.no_grad()
@@ -967,15 +923,17 @@ class Emission(Neural):
 
     def _reset_buffers(self) -> None:
         if self.emission_type == "gaussian":
-            var = F.softplus(self.log_var).clamp_min(self.min_covar)
-            self._emission_covs.copy_(torch.diag_embed(var))
+            var = nnF.softplus(self.log_var).clamp_min(self.min_covar)
+            cov = torch.diag_embed(var)  # [K, F, F]
+            self._emission_covs.copy_(cov)
             self._emission_means.copy_(self.mu)
-        elif self.emission_type == "studentt":  # student-t
-            scale = F.softplus(self.scale_param).clamp_min(self.min_covar)
-            self._emission_covs.copy_(torch.diag_embed(scale ** 2))
+        elif self.emission_type == "studentt":
+            scale = nnF.softplus(self.scale_param).clamp_min(self.min_covar)
+            cov = torch.diag_embed(scale ** 2)  # [K, F, F]
+            self._emission_covs.copy_(cov)
             self._emission_means.copy_(self.loc)
         else:
-            raise ValueError(f"Emission type {self.emission_type} is not implemented")
+            raise ValueError(f"Emission type '{self.emission_type}' is not implemented")
         super()._reset_buffers()
 
     def _tensor_shape(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -1017,51 +975,39 @@ class Emission(Neural):
         timestep: Optional[int] = None,
         grad_safe: bool = False, **kwargs) -> torch.Tensor:
 
-        if context is None or not self.modulate_var:
-            return self.base.detach() if grad_safe else self.base
-        if context.ndim == 3 and context.shape[1] == 1:
-            context = context.squeeze(1)
-
-        delta = self._apply_context(base=self.base, context=context, timestep=timestep)
+        base = self._tensor_shape(self.base)
+        delta = self._apply_context(base, context=context, timestep=timestep)
         tau = float(self.temperature if temperature is None else max(temperature, EPS))
         mod = self._apply_constraints(self.base + delta)
         mod = self._apply_temperature(mod, tau)
-        mod = self._tensor_shape(mod) # Ensure canonical tensor shape [B, T, K, F]
         return mod.detach() if grad_safe else mod
 
     def _dist_params(self, loc: torch.Tensor, **dist_kwargs) -> dict:
-        """
-        Return distribution parameters for emissions.
-        Handles both [K, F] and canonical [B, T, K, F] shapes.
-        """
-        if loc.ndim == 2:  # [K, F] -> add batch/time dims
-            loc = loc.unsqueeze(0).unsqueeze(0)  # [1, 1, K, F]
+        if loc.ndim == 2:  # [K, F] -> [1, 1, K, F]
+            loc = loc.unsqueeze(0).unsqueeze(0)
 
-        B, T, K, F = loc.shape
+        B, T, K, n_feat = loc.shape
         if self.emission_type == "gaussian":
-            var = torch.nn.functional.softplus(self.log_var).clamp_min(self.min_covar)  # [K, F]
-            cov = torch.diag_embed(var).expand(B, T, K, F, F)         # [B, T, K, F, F]
+            var = nnF.softplus(self.log_var).clamp_min(self.min_covar)  # [K, F]
+            cov = torch.diag_embed(var)                                                  # [K, F, F]
+            cov = cov[None, None, :, :, :].expand(B, T, K, n_feat, n_feat)              # [B, T, K, F, F]
             return {"loc": loc, "covariance_matrix": cov, **dist_kwargs}
+
         elif self.emission_type == "studentt":
-            scale = F.softplus(self.scale_param).clamp_min(self.min_covar)  # [K, F]
-            df = F.softplus(self.dof) + 2.0                                 # [K]
-            scale = scale.unsqueeze(0).unsqueeze(0).expand(B, T, K, F)
-            df = df.view(1, 1, K, 1).expand(B, T, K, F)
+            scale = nnF.softplus(self.scale_param).clamp_min(self.min_covar)  # [K, F]
+            df = nnF.softplus(self.dof) + 2.0                                 # [K]
+            scale = scale[None, None, :, :].expand(B, T, K, n_feat)                            # [B, T, K, F]
+            df = df[None, None, :, None].expand(B, T, K, n_feat)                                # [B, T, K, F]
             return {"loc": loc, "scale": scale, "df": df, **dist_kwargs}
+
         else:
             raise ValueError(f"Unsupported emission_type: {self.emission_type}")
-
-    def _get_dist(self,
-        context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        timestep: Optional[int] = None, **dist_kwargs):
-        base = self._modulate(context=context, temperature=temperature, timestep=timestep)
-        return self._dist(**self._dist_params(base, **dist_kwargs))
 
     def forward(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
         return_dist: bool = False, **dist_kwargs) -> Tuple:
+
         dist = self._get_dist(context=context, temperature=temperature, **dist_kwargs)
         if return_dist: return dist
         if self.emission_type == "gaussian":
@@ -1072,23 +1018,25 @@ class Emission(Neural):
         x: torch.Tensor,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None, **dist_kwargs) -> torch.Tensor:
-        """
-        Compute log-probabilities in canonical shape [B, T, K].
-        """
-        if x.ndim == 1:      # [F] -> [1, 1, F]
-            x = x.view(1, 1, -1)
-        elif x.ndim == 2:    # [T, F] -> [1, T, F]
-            x = x.unsqueeze(0)
+        # Ensure canonical shape [B, T, F]
+        if x.ndim == 1: x = x.view(1, 1, -1)
+        elif x.ndim == 2: x = x.unsqueeze(0)
+
         B, T, F = x.shape
         K = self.n_states
 
         dist = self._get_dist(context=context, temperature=temperature, **dist_kwargs)
+        if F != self.n_features:
+            raise ValueError(f"Feature mismatch: input F={F}, expected {self.n_features}")
 
-        # Broadcast x to [B, T, K, F] if needed
-        if x.shape[2] != K: x = x.unsqueeze(2).expand(-1, -1, K, -1)
-        logp = dist.log_prob(x)  # [B, T, K] for Gaussian/StudentT
-        if logp.ndim == 4:       # sum over features if needed
-            logp = logp.sum(-1)
+        # Generate [B, T, K, F] tensor for log_prob evaluation
+        if x.shape[-1] == self.n_features:
+            x_exp = x[..., None, :]           # [B, T, 1, F]
+            x_exp = x_exp.expand(-1, -1, K, -1)  # [B, T, K, F]
+        else:
+            x_exp = x
+
+        logp = dist.log_prob(x_exp)          # [B, T, K] or [B, T, K, F]
+        if logp.ndim == 4: logp = logp.sum(-1)              # [B, T, K]
         return logp
-
 

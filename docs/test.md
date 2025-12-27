@@ -1,6 +1,6 @@
 ## 🧪 State Occupancy & Duration/Transition Diagnostics
 
-This test demonstrates **how to inspect and validate the internal states of an NHSMM model** after training. It provides insights into the **initial distribution, transition probabilities, state durations, and inferred state occupancy**.
+This test (scripts/run_test_ohlcv.py) demonstrates **how to inspect and validate the internal states of an NHSMM model** after training. It provides insights into the **initial distribution, transition probabilities, state durations, and inferred state occupancy**.
 
 ```python
     python3 NHSMM/scripts/run_test_ohlcv.py
@@ -31,71 +31,83 @@ This test demonstrates **how to inspect and validate the internal states of an N
 
 ```text
 user@XXX:~# sudo -u 'user' bash -c 'cd /opt/; pipenv run python NHSMM/scripts/run_test_ohlcv.py'
-[INFO] nhsmm - No data file found — using synthetic data with label map: {0: 'range', 1: 'bull', 2: 'bear'}
-[INFO] nhsmm - [Config] n_states=3, n_features=5, max_duration=35
+
+[INFO] NHSMM - No data file found — using synthetic data with label map: {0: 'range', 1: 'bull', 2: 'bear'}
+[INFO] NHSMM - [Config] n_states=3, n_features=5, max_duration=35
 
 === EM Training ===
 
 === Run 1/3 ===
-[Iter 000] LL=-2509.411377 Δ=nan
-[INFO] nhsmm - [Init 01] Iter 001 | Score -2393.112793 | Δ 1.163e+02 | Δ% 4.634e-02
-[Iter 001] LL=-2393.112793 Δ=1.163e+02
-[INFO] nhsmm - [Init 01] Iter 002 | Score -2340.115234 | Δ 5.300e+01 | Δ% 2.215e-02
-[Iter 002] LL=-2340.115234 Δ=5.300e+01
+[Iter 000] LL=-2074.291504 Δ=nan
+[INFO] NHSMM - [Init 01] Iter 001 | Score -1927.847656 | Δ 1.464e+02 | Δ% 7.060e-02
+[Iter 001] LL=-1927.847656 Δ=1.464e+02
+[INFO] NHSMM - [Init 01] Iter 002 | Score -1886.070679 | Δ 4.178e+01 | Δ% 2.167e-02
+[Iter 002] LL=-1886.070679 Δ=4.178e+01
+[INFO] NHSMM - [Init 01] Iter 003 | Score -1849.430664 | Δ 3.664e+01 | Δ% 1.943e-02
+[Iter 003] LL=-1849.430664 Δ=3.664e+01
+[INFO] NHSMM - [Init 01] Iter 004 | Score -1817.873169 | Δ 3.156e+01 | Δ% 1.706e-02
+[Iter 004] LL=-1817.873169 Δ=3.156e+01
 
 === Run 2/3 ===
-[Iter 000] LL=-2305.989502 Δ=nan
-[INFO] nhsmm - [Init 02] Iter 001 | Score -2254.996338 | Δ 5.099e+01 | Δ% 2.211e-02
-[Iter 001] LL=-2254.996338 Δ=5.099e+01
-[INFO] nhsmm - [Init 02] Iter 002 | Score -2207.835449 | Δ 4.716e+01 | Δ% 2.091e-02
-[Iter 002] LL=-2207.835449 Δ=4.716e+01
+[Iter 000] LL=-1787.672729 Δ=nan
+[INFO] NHSMM - [Init 02] Iter 001 | Score -1787.573486 | Δ 9.924e-02 | Δ% 5.552e-05
+[Iter 001] LL=-1787.573486 Δ=9.924e-02
+[INFO] NHSMM - [Init 02] Iter 002 | Score -1787.666504 | Δ -9.302e-02 | Δ% -5.204e-05
+[Iter 002] LL=-1787.666504 Δ=-9.302e-02
+[INFO] NHSMM - [Init 02] Iter 003 | Score -1787.620728 | Δ 4.578e-02 | Δ% 2.561e-05
+[Iter 003] LL=-1787.620728 Δ=4.578e-02
+[INFO] NHSMM - [Init 02] Iter 004 | Score -1787.655029 | Δ -3.430e-02 | Δ% -1.919e-05
+[Iter 004] LL=-1787.655029 Δ=-3.430e-02
 
 === Run 3/3 ===
-[Iter 000] LL=-2167.392822 Δ=nan
-[INFO] nhsmm - [Init 03] Iter 001 | Score -2129.604004 | Δ 3.779e+01 | Δ% 1.744e-02
-[Iter 001] LL=-2129.604004 Δ=3.779e+01
-[INFO] nhsmm - [Init 03] Iter 002 | Score -2095.892578 | Δ 3.371e+01 | Δ% 1.583e-02
-[Iter 002] LL=-2095.892578 Δ=3.371e+01
+[Iter 000] LL=-1787.645264 Δ=nan
+[INFO] NHSMM - [Init 03] Iter 001 | Score -1787.784546 | Δ -1.393e-01 | Δ% -7.791e-05
+[Iter 001] LL=-1787.784546 Δ=-1.393e-01
+[INFO] NHSMM - [Init 03] Iter 002 | Score -1787.718384 | Δ 6.616e-02 | Δ% 3.701e-05
+[Iter 002] LL=-1787.718384 Δ=6.616e-02
+[INFO] NHSMM - [Init 03] Iter 003 | Score -1787.722778 | Δ -4.395e-03 | Δ% -2.458e-06
+[Iter 003] LL=-1787.722778 Δ=-4.395e-03
+[INFO] NHSMM - [Init 03] Iter 004 | Score -1787.697021 | Δ 2.576e-02 | Δ% 1.441e-05
+[Iter 004] LL=-1787.697021 Δ=2.576e-02
 
 === Decoding ===
 [decode] algorithm=viterbi, batch_size=1
 [Predict] Sequences: 1, max_len: 310, device: cpu
 
-Best-permutation accuracy: 0.9903
+Best-permutation accuracy: 1.0000
 Confusion matrix (permuted):
 [[163   0   0]
  [  0  58   0]
- [  3   0  86]]
+ [  0   0  89]]
 Mapping (model→true):
   model_2 (bear) → true_0 (range)
-  model_0 (range) → true_1 (bull)
-  model_1 (bull) → true_2 (bear)
+  model_1 (bull) → true_1 (bull)
+  model_0 (range) → true_2 (bear)
 
 Metrics:
- F1: 0.9912 | Precision: 0.9940 | Recall: 0.9888
- Log-likelihood: -2063.62 | EM time: 16.00s
+ F1: 1.0000 | Precision: 1.0000 | Recall: 1.0000
+ Log-likelihood: -1787.96 | EM time: 4.03s
 
 === Initial Distribution per State ===
-  00 (range): 0.3313
-  01 (bull): 0.3325
-  02 (bear): 0.3363
-  All initial rows sum to 1 ✅
+  00 (range): 0.3308
+  01 (bull): 0.3115
+  02 (bear): 0.3577
+  All initial rows sum to 1.00 ✅
 
 === Duration Distributions per State ===
-  range  | mode=2, mean=13.45, total_prob=1.0000
-  bull   | mode=3, mean=13.20, total_prob=1.0000
-  bear   | mode=2, mean=13.30, total_prob=1.0000
+  range  | mode=1, mean=13.20, total_prob=1.0000
+  bull   | mode=6, mean=13.09, total_prob=1.0000
+  bear   | mode=1, mean=13.67, total_prob=1.0000
   All durations rows sum to 1 ✅
 
 === Transition Matrix (row = from, col = to) ===
-  00 ( range)    0.3081   0.3566   0.3353
-  01 (  bull)    0.2933   0.3526   0.3541
-  02 (  bear)    0.2989   0.3327   0.3685
+  00 ( range)    0.3793   0.3363   0.2844
+  01 (  bull)    0.3287   0.3597   0.3116
+  02 (  bear)    0.2879   0.3195   0.3927
   All transition rows sum to 1 ✅
 
-=== Inferred State Occupancies ===
-  range : 58 frames (18.71%)
-  bull  : 86 frames (27.74%)
-  bear  : 166 frames (53.55%)
-  Total frames: 310
+=== Inferred State Occupancies (310 frames) ===
+  range : 89 frames (28.71%)
+  bull  : 58 frames (18.71%)
+  bear  : 163 frames (52.58%)
 ```
