@@ -1,1 +1,3 @@
-"0.0.2-alpha"
+from importlib.metadata import version
+
+__version__ = version("nhsmm")

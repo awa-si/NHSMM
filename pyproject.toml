@@ -1,38 +1,92 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = [
+    "setuptools>=68",
+    "wheel>=0.43",
+    "setuptools_scm[toml]>=8.1"
+]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "nhsmm"
-readme = "README.md"
-version = "0.0.3-alpha"
-requires-python = ">=3.9"
+dynamic = ["version"]  # enable when switching to setuptools_scm
+
 description = "Neural Hidden Semi-Markov Model (HSMM) implementation in PyTorch"
-keywords = ["HSMM", "Neural HSMM", "PyTorch", "sequence modeling", "temporal modeling"]
+readme = "README.md"
+requires-python = ">=3.9"
+
 authors = [
     { name = "AWA", email = "dev@awa.si" }
 ]
+
 license = { file = "LICENSE" }
+
+keywords = [
+    "hsmm",
+    "hidden semi-markov model",
+    "neural hsmm",
+    "pytorch",
+    "sequence modeling",
+    "temporal modeling",
+    "regime detection"
+]
+
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
-    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Information Analysis"
 ]
 
 dependencies = [
-    "torch>=2.0",
-    "numpy>=1.24",
-    "scipy>=1.10",
-    "scikit-learn>=1.2",
-    "optuna>=3.0",
-    "matplotlib>=3.9",
-    "polars>=1.36",
-    "typing_extensions>=4.11"
+    "torch>=2.2",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "scikit-learn>=1.4",
+    "typing_extensions>=4.12"
+]
+
+[project.optional-dependencies]
+viz = [
+    "matplotlib>=3.9"
+]
+
+opt = [
+    "optuna>=3.6"
+]
+
+data = [
+    "polars>=1.36"
+]
+
+dev = [
+    "pytest>=8.2",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "black>=24.4",
+    "mypy>=1.11",
+    "pre-commit>=3.7",
+    "build>=1.2",
+    "twine>=5.1"
 ]
 
 [project.urls]
 Homepage = "https://github.com/awa-si/NHSMM"
 Repository = "https://github.com/awa-si/NHSMM"
+Issues = "https://github.com/awa-si/NHSMM/issues"
+Documentation = "https://github.com/awa-si/NHSMM/wiki"
+
+[tool.setuptools_scm]
+version_scheme = "guess-next-dev"
+local_scheme = "no-local-version"
+tag_regex = "^v(?P<version>\\d+\\.\\d+\\.\\d+(?:[-a-z0-9\\.]+)?)$"
