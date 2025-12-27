@@ -227,7 +227,7 @@ if __name__ == "__main__":
     np.random.seed(DEFAULT_RNG_SEED)
 
     INIT_MAX = 3
-    MAX_ITER = 3
+    MAX_ITER = 5
     MAX_DURATION = 35
     SYMBOL = "BTC/USDT:USDT"
     DATA_DIR = "/opt/trader/user_data/data/bybit/futures_"

@@ -91,7 +91,6 @@ pip install -e .;
 nhsmm/
 ├── context.py
 ├── constants.py
-├── constraints.py
 ├── convergence.py
 ├── data.py
 ├── models/

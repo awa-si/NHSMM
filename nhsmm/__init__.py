@@ -1,9 +1,7 @@
-from .convergence import ConvergenceTracker
+from .convergence import Convergence
 from .context import DefaultEncoder
-from . import constraints
 
 __all__ = [
-    'ConvergenceTracker'
-    'DefaultEncoder'
-    'constraints',
+    'Convergence',
+    'DefaultEncoder',
 ]
