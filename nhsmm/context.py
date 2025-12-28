@@ -7,6 +7,7 @@ import contextlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as nnF
+from torch.nn.utils.rnn import pad_sequence
 
 from nhsmm.constants import DTYPE, EPS, logger
 
@@ -33,7 +34,6 @@ class SequenceSet:
         if not sequences:
             raise ValueError("`sequences` must be a non-empty list of tensors.")
 
-        from torch.nn.utils.rnn import pad_sequence
         device, dtype = sequences[0].device, sequences[0].dtype
         B = len(sequences)
         lengths = torch.tensor([s.shape[0] for s in sequences], dtype=torch.long, device=device)
@@ -214,61 +214,56 @@ class ContextRouter:
     @classmethod
     def from_tensor(cls,
         X: "SequenceSet",
-        theta: Optional[Union[torch.Tensor, "ContextRouter"]] = None,
+        context: Optional[Union[torch.Tensor, "ContextRouter"]] = None,
         mode: str = "additive") -> "ContextRouter":
         """
-        Build ContextRouter from a SequenceSet and optional theta.
+        Build ContextRouter from a SequenceSet and optional context.
         Canonical is pooled from context unless replaced.
-
-        Uses modern PyTorch broadcasting for theta alignment.
         """
         if not isinstance(X, SequenceSet):
             raise TypeError("X must be a SequenceSet")
 
         B, T, H = X.n_sequences, X.sequences.shape[1], X.context_dim
         canonical = X.canonical.clone()
-        context = X.contexts.clone()
+        ctx = X.contexts.clone()
         mask = X.masks.clone()
         log_probs = X.log_probs.clone() if X.log_probs is not None else None
         names = [f"context{i}" for i in range(H)]
 
-        # Process theta
-        theta_ctx: Optional[torch.Tensor] = None
-        if isinstance(theta, ContextRouter):
-            theta_ctx = theta.context
-        elif isinstance(theta, torch.Tensor):
-            theta_ctx = theta
+        # Process context override
+        ctx_override: Optional[torch.Tensor] = None
+        if isinstance(context, ContextRouter):
+            ctx_override = context.context
+        elif isinstance(context, torch.Tensor):
+            ctx_override = context
 
-        if theta_ctx is not None:
-            # Align theta to [B, T, H] using broadcasting
-            if theta_ctx.ndim == 1:
-                theta_ctx = theta_ctx.reshape(1, 1, H).expand(B, T, H)
-            elif theta_ctx.ndim == 2:
-                # Try broadcasting first; fallback if incompatible
-                if theta_ctx.shape[0] == B and theta_ctx.shape[1] == H:
-                    theta_ctx = theta_ctx.unsqueeze(1).expand(B, T, H)
-                elif theta_ctx.shape[0] == T and theta_ctx.shape[1] == H:
-                    theta_ctx = theta_ctx.unsqueeze(0).expand(B, T, H)
+        if ctx_override is not None:
+            if ctx_override.ndim == 1:
+                ctx_override = ctx_override.reshape(1, 1, H).expand(B, T, H)
+            elif ctx_override.ndim == 2:
+                if ctx_override.shape[0] == B and ctx_override.shape[1] == H:
+                    ctx_override = ctx_override.unsqueeze(1).expand(B, T, H)
+                elif ctx_override.shape[0] == T and ctx_override.shape[1] == H:
+                    ctx_override = ctx_override.unsqueeze(0).expand(B, T, H)
                 else:
-                    raise ValueError(f"Cannot align 2D theta {theta_ctx.shape} with context {context.shape}")
-            elif theta_ctx.ndim == 3:
-                if theta_ctx.shape != (B, T, H):
-                    raise ValueError(f"3D theta {theta_ctx.shape} incompatible with context {context.shape}")
+                    raise ValueError(f"Cannot align 2D context {ctx_override.shape} with context {ctx.shape}")
+            elif ctx_override.ndim == 3:
+                if ctx_override.shape != (B, T, H):
+                    raise ValueError(f"3D context {ctx_override.shape} incompatible with context {ctx.shape}")
             else:
-                raise ValueError(f"Unsupported theta ndim {theta_ctx.ndim}")
+                raise ValueError(f"Unsupported context ndim {ctx_override.ndim}")
 
-            # Apply mode
             if mode == "additive":
-                context = context + theta_ctx
+                ctx = ctx + ctx_override
             elif mode == "replace":
-                context = theta_ctx
-                canonical = theta_ctx[:, :1, :]
+                ctx = ctx_override
+                canonical = ctx_override[:, :1, :]
             else:
                 raise ValueError(f"Unsupported mode {mode}")
 
         return cls(
             canonical=canonical,
-            context=context,
+            context=ctx,
             mask=mask,
             log_probs=log_probs,
             names=names
@@ -479,7 +474,11 @@ class ContextEncoder(nn.Module):
         self._attn_vector = None
         self._mha = None
 
-    def encode(self, sequences: torch.Tensor, mask: Optional[torch.BoolTensor] = None, pool: Optional[str] = None, detach: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    def encode(self,
+        sequences: torch.Tensor,
+        mask: Optional[torch.BoolTensor] = None,
+        pool: Optional[str] = None, detach: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+
         if pool is not None:
             old_pool = self.pool
             self.pool = pool

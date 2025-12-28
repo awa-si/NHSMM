@@ -250,26 +250,26 @@ if __name__ == "__main__":
     config = HSMMConfig(
         n_states=n_states,
         n_features=n_features,
-        max_duration=MAX_DURATION,
-        emission_type="gaussian",
-        seed=DEFAULT_RNG_SEED,
-        modulate_var=True,
-        min_covar=1e-6,
+        # max_duration=MAX_DURATION,
+        # emission_type="gaussian",
+        # seed=DEFAULT_RNG_SEED,
+        # modulate_var=True,
+        # min_covar=1e-6,
     )
     # --- Optionally create a custom distribution (or leave None to use defaults) ---
     dist = None  # or pass a pre-built DefaultDistribution()
     # --- Initialize HSMM ---
-    model = HSMM(config=config, encoder=None)
-    model._init_dist()
+    model = HSMM(config=config)
+    model._init_dist(dist=dist)
 
-    # --- EM Training ---
+    # --- Training ---
     t0 = time.time()
-    print("\n=== EM Training ===")
+    print("\n=== Model Training ===")
     model.fit(X_torch, n_init=INIT_MAX, tol=1e-5, max_iter=MAX_ITER, verbose=True)
     elapsed = time.time() - t0
 
     # --- Decode hidden states ---
-    print("\n=== Decoding ===")
+    print("\n=== Decoding (viterbi) ===")
     v_path = model.decode(X_torch, algorithm="viterbi")
 
     # --- Evaluate accuracy if labels available ---

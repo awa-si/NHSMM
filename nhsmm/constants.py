@@ -25,17 +25,17 @@ if not logger.hasHandlers():
 class HSMMConfig:
     n_states: int
     n_features: int
-    max_duration: int
     n_heads: int = 4
     dropout: float = 0.0
+    max_duration: int = 35
     min_covar: float = 1e-6
     cnn_channels: float = 5
     temperature: float = 1.0
     modulate_var: bool = False
-    emission_type: str = "gaussian"
     hidden_dim: Optional[int] = None
     context_dim: Optional[int] = None
     pool: Literal["mean", "last", "max", "attn", "mha"] = "mean"
     transition_type: Literal["ergodic", "semi", "left-to-right"] = "ergodic"
+    emission_type: str = "gaussian"
     seed: Optional[int] = None
     debug: bool = False
