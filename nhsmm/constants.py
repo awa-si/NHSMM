@@ -3,7 +3,9 @@
 from typing import Optional, List, Tuple, Any, Literal, Dict, Union
 from dataclasses import dataclass
 import logging
+
 import torch
+import torch.nn as nn
 
 logger = logging.getLogger("NHSMM")
 
@@ -36,6 +38,35 @@ class HSMMConfig:
     context_dim: Optional[int] = None
     pool: Literal["mean", "last", "max", "attn", "mha"] = "mean"
     transition_type: Literal["ergodic", "semi", "left-to-right"] = "ergodic"
-    emission_type: str = "gaussian"
+    init_mode: Literal["normal", "biased", "dirichlet", "uniform"] = "normal"
+    emission_type: Literal["gaussian", "studentt"] = "gaussian"
     seed: Optional[int] = None
     debug: bool = False
+
+class DefaultDistribution(nn.Module):
+
+    def __init__(
+        self,
+        initial: Optional[nn.Module] = None,
+        duration: Optional[nn.Module] = None,
+        transition: Optional[nn.Module] = None,
+        emission: Optional[nn.Module] = None,
+    ):
+        super().__init__()
+
+        self.initial = initial
+        self.duration = duration
+        self.emission = emission
+        self.transition = transition
+
+    def initialize(self,
+        context: Optional[torch.Tensor] = None,
+        temperature: Optional[float] = None,
+        jitter: float = 1e-5, **dist_kwargs) -> Dict[str, Any]:
+        return {
+            "initial_dist": self.initial.initialize(context=context, temperature=temperature, jitter=jitter, **dist_kwargs),
+            "duration_dist": self.duration.initialize(context=context, temperature=temperature, jitter=jitter, **dist_kwargs),
+            "transition_dist": self.transition.initialize(context=context, temperature=temperature, jitter=jitter, **dist_kwargs),
+            "emission_dist": self.emission.initialize(context=context, temperature=temperature, jitter=jitter, **dist_kwargs),
+        }
+

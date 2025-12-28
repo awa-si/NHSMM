@@ -36,6 +36,7 @@ from nhsmm.models import HSMM
 DEFAULT_RNG_SEED = 0
 DEFAULT_LABELS = ["range", "bull", "bear"]
 
+
 # -----------------------------
 # Synthetic OHLCV generator
 # -----------------------------
@@ -80,20 +81,45 @@ def generate_ohlcv(
 # -----------------------------
 # Load OHLCV tensor from feather / IPC
 # -----------------------------
+def generate_pseudo_states(X: np.ndarray, bull_thresh: float = 0.001, bear_thresh: float = -0.001, window: int = 5):
+    """
+    Generate heuristic pseudo-states from OHLCV data.
+    
+    Args:
+        X: [T, F] array, columns = [open, high, low, close, ...]
+        bull_thresh: min normalized gain to call 'bull'
+        bear_thresh: max normalized loss to call 'bear'
+        window: look-back window for rolling returns
+    
+    Returns:
+        true_states: np.ndarray of shape [T], int-coded states
+                     0 = range, 1 = bull, 2 = bear
+    """
+    close = X[:, 3]  # close price
+    returns = (close[window:] - close[:-window]) / close[:-window]  # simple N-bar returns
+
+    true_states = np.zeros(len(close), dtype=int)  # default = range
+    # pad first `window` entries with range (0)
+    true_states[window:] = np.where(returns > bull_thresh, 1, np.where(returns < bear_thresh, 2, 0))
+    
+    return true_states
+
 def load_ohlcv_tensor(
     data_dir: str,
     symbol: str,
     max_rows: int = 3000,
     timeframe: str = "5m",
-    feature_cols: list[str] = ["open", "high", "low", "close"],
     state_col: str = "state",
     default_labels: list[str] = DEFAULT_LABELS,
+    feature_cols: list[str] = ["open", "high", "low", "close", "volume"],
     rng_seed: int = DEFAULT_RNG_SEED) -> Tuple[torch.Tensor, Optional[np.ndarray], Dict[int, str]]:
     """
     Load OHLCV data or generate synthetic if not found.
+    Generates pseudo-states if no true states column exists.
+    
     Returns:
         X: Torch tensor [T, F]
-        true_states: Optional ground-truth states array
+        true_states: np.ndarray of shape [T] (heuristic if real states missing)
         label_map: mapping state indices -> labels
     """
     symbol_sanitized = symbol.replace("/", "_").replace(":", "_")
@@ -110,9 +136,10 @@ def load_ohlcv_tensor(
             label_map = {i: lbl for i, lbl in enumerate(encoder.classes_)}
             logger.info(f"Loaded {len(df)} rows with provided state column.")
         else:
-            true_states = None
-            label_map = {i: lbl for i, lbl in enumerate(default_labels)}
-            logger.info(f"No state column found — using default label map: {label_map}")
+            X_np = X.cpu().numpy()
+            true_states = generate_pseudo_states(X_np)
+            label_map = {0: "range", 1: "bull", 2: "bear"}
+            logger.info(f"No state column found — generated pseudo-states with label map: {label_map}")
     else:
         true_states, X_np, label_map = generate_ohlcv(rng_seed=rng_seed)
         X = torch.tensor(X_np, dtype=DTYPE)

@@ -1,9 +1,8 @@
-from .default import Initial, Emission, Duration, Transition, DefaultDistribution
+from .default import Initial, Duration, Transition, Emission
 
 __all__ = [
     'Initial',
     'Emission',
     'Duration',
     'Transition',
-    'DefaultDistribution',
 ]

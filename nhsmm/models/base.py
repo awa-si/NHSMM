@@ -8,15 +8,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as nnF
 
-from nhsmm.constants import DEBUG, DTYPE, EPS, logger, MAX_LOGITS, NEG_INF, HSMMConfig
-from nhsmm.distributions import Initial, Duration, Transition, Emission, DefaultDistribution
+from nhsmm.constants import (
+    DEBUG, DTYPE, EPS, logger, MAX_LOGITS, NEG_INF, HSMMConfig
+)
+from nhsmm.distributions import Initial, Duration, Transition, Emission
 from nhsmm.context import ContextEncoder, ContextRouter, SequenceSet
-from nhsmm import Convergence, DefaultEncoder
+from nhsmm import Convergence, DefaultEncoder, DefaultDistribution
 
 
 class HSMM(nn.Module):
 
     def __init__(self, config: HSMMConfig, encoder: Optional[nn.Module] = None):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         super().__init__()
 
         self.config = config
@@ -33,8 +36,6 @@ class HSMM(nn.Module):
         self.dist: Optional[DefaultDistribution] = None
 
         self._init_enc(encoder=encoder)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.encoder.to(device=self.device, dtype=DTYPE)
         self.to(device=self.device, dtype=DTYPE)
 
     def _init_enc(self, encoder: Optional[nn.Module] = None) -> None:
@@ -55,7 +56,7 @@ class HSMM(nn.Module):
             n_heads=self.config.n_heads,
             dropout=self.config.dropout,
             debug=self.debug
-        )
+        ).to(device=self.device, dtype=DTYPE)
         self.encoder.eval()
 
         try:
@@ -80,7 +81,7 @@ class HSMM(nn.Module):
 
     def _init_dist(self, context: Optional[torch.Tensor] = None, dist: Optional[DefaultDistribution] = None) -> None:
 
-        if dist is not None:
+        if dist is not None and isinstance(dist, DefaultDistribution):
             self.dist = dist
 
         elif self.dist is None:
@@ -89,12 +90,14 @@ class HSMM(nn.Module):
                     n_states=self.n_states,
                     hidden_dim=self.hidden_dim,
                     context_dim=self.context_dim,
+                    init_mode=self.config.init_mode,
                 ),
                 duration=Duration(
                     n_states=self.n_states,
                     hidden_dim=self.hidden_dim,
                     context_dim=self.context_dim,
                     max_duration=self.config.max_duration,
+                    init_mode=self.config.init_mode,
                 ),
                 transition=Transition(
                     n_states=self.n_states,
@@ -102,6 +105,7 @@ class HSMM(nn.Module):
                     hidden_dim=self.hidden_dim,
                     context_dim=self.context_dim,
                     transition_type=self.config.transition_type,
+                    init_mode=self.config.init_mode,
                 ),
                 emission=Emission(
                     n_states=self.n_states,
@@ -109,8 +113,8 @@ class HSMM(nn.Module):
                     hidden_dim=self.hidden_dim,
                     context_dim=self.context_dim,
                     min_covar=self.config.min_covar,
-                    modulate_var=self.config.modulate_var,
                     emission_type=self.config.emission_type,
+                    init_mode=self.config.init_mode,
                 )
             )
 
