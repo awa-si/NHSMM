@@ -19,6 +19,30 @@ from torch.distributions import (
 from nhsmm.constants import DEBUG, DTYPE, EPS, logger, MAX_LOGITS, NEG_INF
 
 
+class DefaultDistribution(nn.Module):
+
+    def __init__(
+        self,
+        initial: Optional[nn.Module] = None,
+        duration: Optional[nn.Module] = None,
+        transition: Optional[nn.Module] = None,
+        emission: Optional[nn.Module] = None,
+    ):
+        super().__init__()
+        self.initial = initial
+        self.duration = duration
+        self.transition = transition
+        self.emission = emission
+
+    def initialize(self) -> Dict[str, Any]:
+        return {
+            "initial_dist": self.initial.initialize(),
+            "duration_dist": self.duration.initialize(),
+            "transition_dist": self.transition.initialize(),
+            "emission_dist": self.emission.initialize(),
+        }
+
+
 class Categorical(Distribution):
 
     has_rsample = True

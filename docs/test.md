@@ -50,29 +50,29 @@ user@XXX:~# sudo -u 'user' bash -c 'cd /opt/; pipenv run python NHSMM/scripts/ru
 
 === Run 2/3 ===
 [Iter 000] LL=-1787.672729 Δ=nan
-[INFO] NHSMM - [Init 02] Iter 001 | Score -1787.573486 | Δ 9.924e-02 | Δ% 5.552e-05
-[Iter 001] LL=-1787.573486 Δ=9.924e-02
-[INFO] NHSMM - [Init 02] Iter 002 | Score -1787.666504 | Δ -9.302e-02 | Δ% -5.204e-05
-[Iter 002] LL=-1787.666504 Δ=-9.302e-02
-[INFO] NHSMM - [Init 02] Iter 003 | Score -1787.620728 | Δ 4.578e-02 | Δ% 2.561e-05
-[Iter 003] LL=-1787.620728 Δ=4.578e-02
-[INFO] NHSMM - [Init 02] Iter 004 | Score -1787.655029 | Δ -3.430e-02 | Δ% -1.919e-05
-[Iter 004] LL=-1787.655029 Δ=-3.430e-02
+[INFO] NHSMM - [Init 02] Iter 001 | Score -1751.006836 | Δ 3.667e+01 | Δ% 2.051e-02
+[Iter 001] LL=-1751.006836 Δ=3.667e+01
+[INFO] NHSMM - [Init 02] Iter 002 | Score -1725.172729 | Δ 2.583e+01 | Δ% 1.475e-02
+[Iter 002] LL=-1725.172729 Δ=2.583e+01
+[INFO] NHSMM - [Init 02] Iter 003 | Score -1694.677490 | Δ 3.050e+01 | Δ% 1.768e-02
+[Iter 003] LL=-1694.677490 Δ=3.050e+01
+[INFO] NHSMM - [Init 02] Iter 004 | Score -1668.380981 | Δ 2.630e+01 | Δ% 1.552e-02
+[Iter 004] LL=-1668.380981 Δ=2.630e+01
 
 === Run 3/3 ===
-[Iter 000] LL=-1787.645264 Δ=nan
-[INFO] NHSMM - [Init 03] Iter 001 | Score -1787.784546 | Δ -1.393e-01 | Δ% -7.791e-05
-[Iter 001] LL=-1787.784546 Δ=-1.393e-01
-[INFO] NHSMM - [Init 03] Iter 002 | Score -1787.718384 | Δ 6.616e-02 | Δ% 3.701e-05
-[Iter 002] LL=-1787.718384 Δ=6.616e-02
-[INFO] NHSMM - [Init 03] Iter 003 | Score -1787.722778 | Δ -4.395e-03 | Δ% -2.458e-06
-[Iter 003] LL=-1787.722778 Δ=-4.395e-03
-[INFO] NHSMM - [Init 03] Iter 004 | Score -1787.697021 | Δ 2.576e-02 | Δ% 1.441e-05
-[Iter 004] LL=-1787.697021 Δ=2.576e-02
+[Iter 000] LL=-1642.683960 Δ=nan
+[INFO] NHSMM - [Init 03] Iter 001 | Score -1617.818726 | Δ 2.487e+01 | Δ% 1.514e-02
+[Iter 001] LL=-1617.818726 Δ=2.487e+01
+[INFO] NHSMM - [Init 03] Iter 002 | Score -1600.059326 | Δ 1.776e+01 | Δ% 1.098e-02
+[Iter 002] LL=-1600.059326 Δ=1.776e+01
+[INFO] NHSMM - [Init 03] Iter 003 | Score -1569.176270 | Δ 3.088e+01 | Δ% 1.930e-02
+[Iter 003] LL=-1569.176270 Δ=3.088e+01
+[INFO] NHSMM - [Init 03] Iter 004 | Score -1547.858032 | Δ 2.132e+01 | Δ% 1.359e-02
+[Iter 004] LL=-1547.858032 Δ=2.132e+01
 
 === Decoding ===
 [decode] algorithm=viterbi, batch_size=1
-[Predict] Sequences: 1, max_len: 310, device: cpu
+[Predict] Sequences: 1, max_len: 310
 
 Best-permutation accuracy: 1.0000
 Confusion matrix (permuted):
@@ -86,24 +86,24 @@ Mapping (model→true):
 
 Metrics:
  F1: 1.0000 | Precision: 1.0000 | Recall: 1.0000
- Log-likelihood: -1787.96 | EM time: 4.03s
+ Log-likelihood: -1526.22 | EM time: 3.48s
 
 === Initial Distribution per State ===
-  00 (range): 0.3308
-  01 (bull): 0.3115
-  02 (bear): 0.3577
+  00 (range): 0.3421
+  01 (bull): 0.2882
+  02 (bear): 0.3697
   All initial rows sum to 1.00 ✅
 
 === Duration Distributions per State ===
-  range  | mode=1, mean=13.20, total_prob=1.0000
-  bull   | mode=6, mean=13.09, total_prob=1.0000
-  bear   | mode=1, mean=13.67, total_prob=1.0000
+  range  | mode=1, mean=13.14, total_prob=1.0000
+  bull   | mode=6, mean=13.18, total_prob=1.0000
+  bear   | mode=1, mean=13.95, total_prob=1.0000
   All durations rows sum to 1 ✅
 
 === Transition Matrix (row = from, col = to) ===
-  00 ( range)    0.3793   0.3363   0.2844
-  01 (  bull)    0.3287   0.3597   0.3116
-  02 (  bear)    0.2879   0.3195   0.3927
+  00 ( range)    0.4274   0.3102   0.2624
+  01 (  bull)    0.3075   0.3364   0.3561
+  02 (  bear)    0.2651   0.2939   0.4410
   All transition rows sum to 1 ✅
 
 === Inferred State Occupancies (310 frames) ===

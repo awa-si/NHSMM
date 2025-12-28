@@ -29,8 +29,8 @@ from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_
 from scipy.optimize import linear_sum_assignment
 import matplotlib.pyplot as plt
 
-from nhsmm.constants import DEBUG, DTYPE, EPS, logger
-from nhsmm.models import HSMM, HSMMConfig
+from nhsmm.constants import DEBUG, DTYPE, EPS, logger, HSMMConfig
+from nhsmm.models import HSMM
 
 
 DEFAULT_RNG_SEED = 0
@@ -230,7 +230,6 @@ if __name__ == "__main__":
     MAX_DURATION = 35
     SYMBOL = "BTC/USDT:USDT"
     DATA_DIR = "/opt/trader/user_data/data/bybit/futures_"
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- Load or generate data ---
     X, true_states, label_map = load_ohlcv_tensor(DATA_DIR, SYMBOL)
@@ -253,14 +252,15 @@ if __name__ == "__main__":
         n_features=n_features,
         max_duration=MAX_DURATION,
         emission_type="gaussian",
+        seed=DEFAULT_RNG_SEED,
         modulate_var=True,
         min_covar=1e-6,
-        seed=DEFAULT_RNG_SEED
     )
     # --- Optionally create a custom distribution (or leave None to use defaults) ---
     dist = None  # or pass a pre-built DefaultDistribution()
     # --- Initialize HSMM ---
-    model = HSMM(config=config, encoder=None, dist=dist).to(device)
+    model = HSMM(config=config, encoder=None)
+    model._init_dist()
 
     # --- EM Training ---
     t0 = time.time()

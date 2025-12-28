@@ -4,7 +4,6 @@
 - *Repository: [NHSMM on GitHub](https://github.com/awa-si/NHSMM)*
 - *Documentation: [Wiki on GitHub](https://github.com/awa-si/NHSMM/wiki)*
 - *Article on Medium: [Unlocking Hidden Patterns in Time – Meet NHSMM ](https://medium.com/@awa-si/unlocking-hidden-patterns-in-time-meet-nhsmm-the-neural-hidden-semi-markov-model-cd3f1e2428c2)*
-- *Current Version (PyPI): 0.0.3-alpha*
 
 ---
 
@@ -239,8 +238,9 @@ See [FUNDING.md](./FUNDING.md) for details on how to contribute and what support
 
 ## 🧾 License
 
-This project is released under the **Apache License 2.0** © 2024 **AWA.SI**.  
-For full license terms and conditions, please see the [LICENSE](https://github.com/awa-si/NHSMM/blob/develop/LICENSE) file.
-If you use NHSMM in academic work, please cite the repository.
+This project is released under the **Apache License 2.0** © 2024 **AWA.SI**
+For full license terms and conditions, please see the [LICENSE](https://github.com/awa-si/NHSMM/blob/develop/LICENSE) file
+
+If you use NHSMM in academic work, please cite the repository
 
 ---
