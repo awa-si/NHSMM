@@ -671,21 +671,29 @@ class Transition(Neural):
         allow_projection: bool = True,
         hidden_dim: Optional[int] = None,
         context_dim: Optional[int] = None,
+        max_duration: Optional[int] = None,
     ):
-        self._shape = (n_states, n_states)
+        self.max_duration = max_duration
+        self.n_states = n_states
+
+        if max_duration is None:
+            self._shape = (n_states, n_states)
+            self.target_dim = n_states * n_states
+        else:
+            self._shape = (n_states, max_duration, n_states)
+            self.target_dim = n_states * max_duration * n_states
 
         super().__init__(
             allow_projection=allow_projection,
-            target_dim=n_states * n_states,
+            target_dim=self.target_dim,
             context_dim=context_dim,
             hidden_dim=hidden_dim,
             final_activation="tanh",
             activation="tanh",
         )
-        self.init_mode = init_mode
-        self.n_states = int(n_states)
-        self.transition_type = transition_type
 
+        self.init_mode = init_mode
+        self.transition_type = transition_type
         init_logits = self._init_params(init_mode)
         self.logits = nn.Parameter(init_logits)
 
@@ -695,33 +703,58 @@ class Transition(Neural):
     def _init_params(self,
         mode: Optional[str] = None,
         context: Optional[torch.Tensor] = None,
-        jitter: float = 1e-5, dirichlet_alpha: Optional[float] = 1.0) -> torch.Tensor:
+        jitter: float = 1e-5, dirichlet_alpha: float = 1.0) -> torch.Tensor:
 
+        K = self.n_states
         mode = mode or self.init_mode
+        D = self.max_duration if getattr(self, "max_duration", None) is not None else 1
+        shape = (K, D, K) if D > 1 else (K, K)
 
         if mode == "uniform":
-            logits = torch.full(self._shape, -math.log(self.n_states))
+            logits = torch.full(shape, -math.log(K))
         elif mode == "biased":
-            diag_val, off_diag_val = 0.7, 0.1
-            m = torch.full(self._shape, off_diag_val)
-            m.fill_diagonal_(diag_val)
-            m /= m.sum(dim=-1, keepdim=True)
-            logits = m.log()
+            if D == 1:
+                m = torch.full((K, K), 0.1)
+                m.fill_diagonal_(0.7)
+                m /= m.sum(dim=-1, keepdim=True)
+                logits = m.log()
+            else:  # duration-dependent: shape (K, D, K)
+                m = torch.full(shape, 0.1)
+                for k in range(K):
+                    m[k, :, k] = 0.7  # bias self-transitions across durations
+                    m[k] /= m[k].sum(dim=-1, keepdim=True)
+                logits = m.log()
         elif mode == "normal":
-            logits = torch.randn(*self._shape) * 0.1
+            logits = torch.randn(*shape) * 0.1
+            if D > 1:
+                decay = torch.arange(D) * 0.05  # decay over duration
+                logits = logits - decay.view(1, D, 1)
         elif mode == "dirichlet":
-            logits_list = []
-            for i in range(self.n_states):
-                probs = torch.distributions.Dirichlet(torch.full((self.n_states,), dirichlet_alpha)).sample()
-                logits_list.append(torch.log(probs.clamp_min(EPS)))
-            logits = torch.stack(logits_list, dim=0)
+            if D == 1:
+                logits_list = []
+                for k in range(K):
+                    probs = torch.distributions.Dirichlet(torch.full((K,), dirichlet_alpha)).sample()
+                    logits_list.append(torch.log(probs.clamp_min(EPS)))
+                logits = torch.stack(logits_list, dim=0)
+            else:
+                logits_list = []
+                for k in range(K):
+                    probs_list = []
+                    for d in range(D):
+                        probs = torch.distributions.Dirichlet(torch.full((K,), dirichlet_alpha)).sample()
+                        probs_list.append(torch.log(probs.clamp_min(EPS)))
+                    logits_list.append(torch.stack(probs_list, dim=0))
+                logits = torch.stack(logits_list, dim=0)  # shape (K, D, K)
         else:
             raise ValueError(f"Unknown init_mode '{mode}'")
 
+        # Apply context modulation if available
         if context is not None and self.context_net is not None:
             ctx_delta = self.context_net(context.mean(dim=0))
-            logits = logits + ctx_delta.view_as(logits)
+            # ensure ctx_delta can broadcast to logits shape
+            logits = logits + ctx_delta.view(*([1]*(logits.ndim - ctx_delta.ndim)), *ctx_delta.shape)
 
+        # Add jitter for stochasticity
         if jitter > 0.0:
             logits = logits + torch.randn_like(logits) * jitter
 
@@ -738,26 +771,39 @@ class Transition(Neural):
         self.logits = nn.Parameter(init_logits)
         return self._get_dist(context=context, temperature=temperature, timestep=None, **dist_kwargs)
 
-    def _apply_constraints(self, logits: torch.Tensor, mask: Optional[torch.Tensor] = None,) -> torch.Tensor:
+    def _apply_constraints(self, logits: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         n = self.n_states
+        D = getattr(self, "max_duration", None)
         device = logits.device
 
         if self.transition_type == "ergodic":
-            constraint = None
+            constraint = None  # no restriction
         elif self.transition_type == "semi":
-            constraint = torch.eye(n, device=device, dtype=torch.bool)
+            if D is None:
+                constraint = torch.eye(n, device=device, dtype=torch.bool)  # [K,K]
+            else:
+                constraint = torch.zeros(n, D, n, device=device, dtype=torch.bool)
+                for k in range(n):
+                    constraint[k, :, k] = True  # allow self-transitions across all durations
         elif self.transition_type == "left-to-right":
-            constraint = torch.tril(torch.ones(n, n, device=device, dtype=torch.bool), diagonal=-1)
+            if D is None:
+                constraint = torch.tril(torch.ones(n, n, device=device, dtype=torch.bool), diagonal=0)
+            else:
+                constraint = torch.zeros(n, D, n, device=device, dtype=torch.bool)
+                for k in range(n):
+                    for to_state in range(k+1):
+                        constraint[k, :, to_state] = True
         else:
             raise ValueError(f"Unsupported transition_type: {self.transition_type}")
 
         if mask is not None:
             mask = mask.to(device=device, dtype=torch.bool)
-            constraint = mask if constraint is None else (constraint | mask)
+            while mask.ndim < logits.ndim:
+                mask = mask.unsqueeze(0)
+            constraint = mask if constraint is None else (constraint & mask)
 
         if constraint is None: return logits
-
-        constraint = constraint.view((1,) * (logits.ndim - 2) + constraint.shape)
+        constraint = constraint.view((1,) * (logits.ndim - constraint.ndim) + constraint.shape)
         return logits.masked_fill(~constraint, NEG_INF)
 
     def expected_probs(self,
@@ -776,10 +822,12 @@ class Transition(Neural):
         mod = self._modulate(context=context, temperature=temperature, timestep=timestep, **kwargs)
         logp = nnF.log_softmax(mod, dim=-1)
 
-        while logp.ndim < 4:
+        expected_ndim = 4 if self.max_duration is None else 5
+        while logp.ndim < expected_ndim:
             logp = logp.unsqueeze(0)
+
         if T is not None and logp.shape[1] == 1:
-            logp = logp.expand(-1, T, -1, -1)
+            logp = logp.expand(-1, T, *logp.shape[2:])
         return logp
 
     def sample(self,
@@ -909,11 +957,6 @@ class Emission(Neural):
         super()._reset_buffers()
 
     def _tensor_shape(self, tensor: torch.Tensor) -> torch.Tensor:
-        """
-        Ensures tensor is in canonical shape [B, T, K, F] for emissions.
-        - 2D tensors [K, F] -> [1, 1, K, F]
-        - 3D tensors [B, K, F] -> [B, 1, K, F]
-        """
         tensor = super()._tensor_shape(tensor)
         if tensor.ndim == 2:  # [K, F]
             tensor = tensor.unsqueeze(0).unsqueeze(0)  # [1, 1, K, F]

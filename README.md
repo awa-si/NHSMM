@@ -153,7 +153,7 @@ The same pattern applies to **IoT signals, health data, robotics telemetry, or c
 
 ## 🔍 Conceptual Flow Diagram
 
-```
+```text
 ┌─────────────────────────────┐
 │       External Input        │  ← covariates, features, embeddings
 └─────────────┬───────────────┘
@@ -184,6 +184,34 @@ The same pattern applies to **IoT signals, health data, robotics telemetry, or c
 │          Backprop           │
 └─────────────────────────────┘
 ```
+
+
+This diagram illustrates the **end-to-end probabilistic and neural data flow** within the **State Aware Engine (SAE)**, powered by **Neural Hidden Semi-Markov Models (NHSMM)**.
+
+**External Input**  
+Represents all exogenous information driving the model, including raw observations, engineered features, temporal covariates, embeddings, or outputs of upstream neural encoders. These inputs provide **context** that modulates latent state behavior over time.
+
+**Neural Initial State Module (π)**  
+Computes a **context-conditioned prior distribution** over initial latent states. This allows the model to adapt its starting regime based on observed conditions, rather than assuming a stationary or uniform prior.
+
+**Neural Transition Module (A)**  
+Produces **state-to-state transition probabilities** that are dynamically **gated and temperature-scaled** by context. This enables smooth or sharp regime switches, supports non-stationary dynamics, and allows transitions to evolve as external conditions change.
+
+**Neural Duration Module (D)**  
+Models **explicit state dwell-times** via learnable duration distributions, optionally modulated by context. The bidirectional interaction with the transition module enforces **semi-Markov consistency**, ensuring that state persistence and switching behavior are jointly learned rather than implicitly absorbed into transitions.
+
+**Emission Module**  
+Defines the **observation likelihood** conditioned on the current latent state and context. Supports continuous or discrete outputs (e.g., Gaussian, Student-t, Multinomial), enabling flexible modeling of heterogeneous data modalities.
+
+**Latent State Inference & Learning**  
+The HSMM inference layer (forward–backward, Viterbi) integrates emissions, transitions, and durations to infer latent state posteriors and most probable state paths. Gradients from the sequence likelihood are propagated **end-to-end** through all neural modules via backpropagation, enabling joint optimization of probabilistic structure and neural parameters.
+
+**Backpropagation Loop**  
+Closes the loop by updating all neural components using gradient-based optimization, allowing SAE to learn **context-aware temporal structure**, **state persistence**, and **regime dynamics** directly from data.
+
+---
+
+**In essence**, the diagram captures how SAE combines **explicit probabilistic state semantics** with **neural adaptability**, yielding a model that is both **interpretable** and **expressive** for real-world, non-stationary sequential data.
 
 ---
 

@@ -8,12 +8,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as nnF
 
-from nhsmm.constants import (
-    DEBUG, DTYPE, EPS, logger, MAX_LOGITS, NEG_INF, HSMMConfig
-)
+from nhsmm.constants import DEBUG, DTYPE, EPS, logger, MAX_LOGITS, NEG_INF
+from nhsmm import Convergence, DefaultEncoder, DefaultDistribution, HSMMConfig
 from nhsmm.distributions import Initial, Duration, Transition, Emission
 from nhsmm.context import ContextEncoder, ContextRouter, SequenceSet
-from nhsmm import Convergence, DefaultEncoder, DefaultDistribution
 
 
 class HSMM(nn.Module):
@@ -23,8 +21,6 @@ class HSMM(nn.Module):
         super().__init__()
 
         self.config = config
-        self._params: Dict[str, Any] = {}
-
         if self.config.seed is not None:
             torch.manual_seed(self.config.seed)
             if torch.cuda.is_available():
@@ -35,10 +31,10 @@ class HSMM(nn.Module):
         self.n_features = self.config.n_features
         self.dist: Optional[DefaultDistribution] = None
 
-        self._init_enc(encoder=encoder)
+        self.init_enc(encoder=encoder)
         self.to(device=self.device, dtype=DTYPE)
 
-    def _init_enc(self, encoder: Optional[nn.Module] = None) -> None:
+    def init_enc(self, encoder: Optional[nn.Module] = None) -> None:
 
         self.context_dim = self.config.context_dim
         self.hidden_dim = self.config.hidden_dim
@@ -79,9 +75,11 @@ class HSMM(nn.Module):
         finally:
             self.encoder.train()
 
-    def _init_dist(self, context: Optional[torch.Tensor] = None, dist: Optional[DefaultDistribution] = None) -> None:
+    def init_dist(self,
+        context: Optional[torch.Tensor] = None,
+        dist: Optional[DefaultDistribution] = None) -> None:
 
-        if dist is not None and isinstance(dist, DefaultDistribution):
+        if dist is not None:
             self.dist = dist
 
         elif self.dist is None:
@@ -105,6 +103,7 @@ class HSMM(nn.Module):
                     hidden_dim=self.hidden_dim,
                     context_dim=self.context_dim,
                     transition_type=self.config.transition_type,
+                    max_duration=self.config.max_duration, # if None, standard HMM
                     init_mode=self.config.init_mode,
                 ),
                 emission=Emission(
@@ -121,7 +120,8 @@ class HSMM(nn.Module):
         self.dist.to(device=self.device, dtype=DTYPE)
 
         try:
-            self._params.update(self.dist.initialize(context))
+            params = self.dist.initialize(context)
+            # self._params.update(params)
         except Exception as err:
             raise RuntimeError(f"Failed to initialize HSMM PDFs: {err}") from err
 
@@ -190,11 +190,10 @@ class HSMM(nn.Module):
             log_probs=log_probs
         )
 
-    def _forward(self,
+    def forward(self,
         X: SequenceSet,
         context: Optional[Union[torch.Tensor, ContextRouter]] = None,
-        temperature: Optional[float] = None,
-        timestep: Optional[int] = None) -> torch.Tensor:
+        temperature: Optional[float] = None, timestep: Optional[int] = None) -> torch.Tensor:
 
         router = ContextRouter.from_tensor(X, context=context) if not isinstance(context, ContextRouter) else context
         Dmax = self.dist.duration.max_duration
@@ -212,52 +211,69 @@ class HSMM(nn.Module):
         )  # [B,T,K,K]
 
         # --- Cumulative emission sums ---
-        cumsum_emit = torch.zeros((B, T + 1, K), device=device)
-        cumsum_emit[:, 1:, :] = torch.cumsum(router.log_probs, dim=1)
+        cumsum_emit = torch.cat(
+            [torch.zeros((B, 1, K), device=device), torch.cumsum(router.log_probs, dim=1)], dim=1
+        )  # [B, T+1, K]
 
         # Indices for duration sums
         d_range = torch.arange(1, Dmax + 1, device=device)
         t_range = torch.arange(T, device=device).view(T, 1)
         start_idx = (t_range - d_range + 1).clamp(min=0).view(1, T, 1, Dmax)
         end_idx = (t_range + 1).expand(T, Dmax).view(1, T, 1, Dmax)
+
         k_idx = torch.arange(K, device=device).view(1, 1, K, 1)
         b_idx = torch.arange(B, device=device).view(B, 1, 1, 1)
         start_idx = start_idx.expand(B, T, K, Dmax)
         end_idx = end_idx.expand(B, T, K, Dmax)
         k_idx = k_idx.expand(B, T, K, Dmax)
         b_idx = b_idx.expand(B, T, K, Dmax)
-        emit_sums = cumsum_emit[b_idx, end_idx, k_idx] - cumsum_emit[b_idx, start_idx, k_idx]
+        emit_sums = cumsum_emit[b_idx, end_idx, k_idx] - cumsum_emit[b_idx, start_idx, k_idx]  # [B,T,K,Dmax]
 
-        # --- Initialize alpha ---
+        # --- Initialize alpha tensor ---
         alpha = torch.full((B, T, K, Dmax), NEG_INF, device=device)
         alpha[:, 0, :, 0] = initial_logits.squeeze(1) + duration_logits[:, 0, :, 0] + emit_sums[:, 0, :, 0]
 
-        duration_mask = torch.arange(Dmax, device=device).view(1, 1, 1, Dmax) <= torch.arange(T, device=device).view(1, T, 1, 1)
+        # duration indices [1,1,1,Dmax]
+        d_idx = torch.arange(1, Dmax + 1, device=device).view(1, 1, 1, Dmax)
+        # time indices [1,T,1,1]
+        t_idx = torch.arange(T, device=device, dtype=torch.long).view(1, T, 1, 1)
+        # valid durations for each timestep: D <= t+1
+        duration_mask = d_idx <= (t_idx + 1)  # [1, T, 1, Dmax]
+        # expand to [B, T, K, Dmax] and combine with sequence mask
+        duration_mask = duration_mask.expand(B, T, K, Dmax) & router.mask.unsqueeze(-1)
 
         for t in range(1, T):
             max_d = min(Dmax, t + 1)
             idx_prev = (t - d_range[:max_d]).clamp(min=0)
 
             alpha_prev = alpha[:, idx_prev, :, :max_d]
-            alpha_prev = torch.logsumexp(alpha_prev, dim=-1)
+            if self.dist.transition.max_duration is None:
+                # standard HMM transitions: [B, T, K, K]
+                alpha_prev = torch.logsumexp(alpha_prev, dim=-1)
+                alpha_trans = torch.logsumexp(alpha_prev.unsqueeze(-1) + transition_logits[:, t], dim=2)
+            else:
+                # duration-dependent transitions: [B, T, K, D, K]
+                alpha_prev = alpha_prev  # shape already [B, max_d, K, D]
+                trans_t = transition_logits[:, t, :, :max_d, :]  # [B, K, D, K]
+                alpha_trans = torch.logsumexp(alpha_prev.unsqueeze(-1) + trans_t.unsqueeze(1), dim=(2,3))
 
-            alpha_trans = torch.logsumexp(
-                alpha_prev.unsqueeze(3) + transition_logits[:, t, :, :].unsqueeze(1),
-                dim=2
-            )
-            alpha_trans = alpha_trans.permute(0, 2, 1)
-
+            # --- Permute and add duration + emission logits ---
+            alpha_trans = alpha_trans.permute(0, 2, 1)  # [B, K, max_d]
             alpha_t = alpha_trans + duration_logits[:, t, :, :max_d] + emit_sums[:, t, :, :max_d]
 
+            # --- Allocate full alpha for current timestep ---
             full_alpha = torch.full((B, K, Dmax), NEG_INF, device=device)
             full_alpha[..., :max_d] = alpha_t
-            alpha[:, t] = full_alpha * duration_mask[:, t:t+1, :, :]
+
+            # --- Update alpha for current timestep and enforce duration mask ---
+            alpha[:, t] = full_alpha
+            alpha[:, t] = alpha[:, t].masked_fill(~duration_mask[:, t], NEG_INF)
 
         length_mask = torch.arange(T, device=device).unsqueeze(0) < X.lengths.unsqueeze(1)
         alpha = alpha.masked_fill(~length_mask.unsqueeze(-1).unsqueeze(-1), NEG_INF)
 
         mask_exp = router.mask.bool().unsqueeze(-1).expand(B, T, K, Dmax)
-        alpha = alpha * mask_exp
+        alpha = alpha.masked_fill(~mask_exp, NEG_INF)
         return alpha
 
     def fit(self,
@@ -300,7 +316,7 @@ class HSMM(nn.Module):
 
                 seq_set = self._prepare(X, context=context)
                 temperature = max(0.5, 1.0 - it / max_iter)
-                alpha = self._forward(seq_set, temperature=temperature)  # [B, T, K, D]
+                alpha = self.forward(seq_set, temperature=temperature)  # [B, T, K, D]
                 lengths = seq_set.lengths
 
                 log_likelihoods = alpha.new_full((len(seq_set.sequences),), NEG_INF)
@@ -352,8 +368,7 @@ class HSMM(nn.Module):
 
         router = context if isinstance(context, ContextRouter) else ContextRouter.from_tensor(X, theta=context)
         B, T_max, _ = router.log_probs.shape
-
-        durations_full = torch.arange(1, Dmax + 1)
+        durations_full = torch.arange(1, Dmax + 1, device=router.log_probs.device)
 
         for b in range(B):
             L = int(router.mask[b].sum())
@@ -369,12 +384,12 @@ class HSMM(nn.Module):
                 dur_logits = dur_logits * (1.0 - duration_weight)
 
             emit_log = router.log_probs[b, :L]
-            cumsum_emit = emit_log.new_zeros((L + 1, K))
+            cumsum_emit = torch.zeros((L + 1, K), device=emit_log.device)
             cumsum_emit[1:] = torch.cumsum(emit_log, dim=0)
 
-            V = emit_log.new_full((L, K), NEG_INF)
-            back_ptr = emit_log.new_full((L, K), -1, dtype=torch.long)
-            best_dur = emit_log.new_zeros((L, K), dtype=torch.long)
+            V = torch.full((L, K), NEG_INF, device=emit_log.device)
+            back_ptr = torch.full((L, K), -1, dtype=torch.long, device=emit_log.device)
+            best_dur = torch.zeros((L, K), dtype=torch.long, device=emit_log.device)
 
             for t in range(L):
                 max_d = min(Dmax, t + 1)
@@ -387,14 +402,14 @@ class HSMM(nn.Module):
                 if t == 0:
                     scores = init_logits[:, None] + scores_dur
                     V[t], idx = scores.max(dim=1)
-                    idx = idx.clamp(max=max_d - 1)
                     best_dur[t] = durations[idx]
                     continue
 
                 prev_t = torch.clamp(starts - 1, min=0)
-                prev_V = V[prev_t].T.unsqueeze(2)
-                trans = trans_logits[t].unsqueeze(1)
-                prev_scores = prev_V + trans
+                if self.dist.transition.max_duration is None:
+                    prev_scores = V[prev_t].T.unsqueeze(2) + trans_logits[t].unsqueeze(1)
+                else:
+                    prev_scores = V[prev_t].T.unsqueeze(2) + trans_logits[t, :, :max_d, :]
 
                 mask_start0 = (starts == 0)
                 if mask_start0.any():
@@ -406,16 +421,11 @@ class HSMM(nn.Module):
 
                 V[t], dur_idx = scores.max(dim=1)
                 best_dur[t] = durations[dur_idx]
-                back_ptr[t] = torch.where(
-                    best_dur[t] == 1,
-                    back_ptr.new_full((K,), -1),
-                    prev_arg[dur_idx, torch.arange(K)]
-                )
+                back_ptr[t] = prev_arg[dur_idx, torch.arange(K)]
 
             t = L - 1
             state = int(V[t].argmax())
             segments = []
-
             while t >= 0:
                 d = int(best_dur[t, state])
                 start = max(0, t - d + 1)
@@ -432,7 +442,6 @@ class HSMM(nn.Module):
             ])
 
             predicted.append(path[:L])
-
         return predicted
 
     def score(self,
@@ -479,7 +488,7 @@ class HSMM(nn.Module):
                 raise TypeError(f"Unsupported context type: {type(context)}")
 
         seq_set = self._prepare(sequences, context=context_list)
-        alpha = self._forward(seq_set)  # [B, T, K, D]
+        alpha = self.forward(seq_set)  # [B, T, K, D]
 
         lengths = seq_set.lengths
         log_likelihoods = alpha.new_full((B,), NEG_INF)
@@ -520,13 +529,6 @@ class HSMM(nn.Module):
                 self._convergence.converged_flags[run_idx] = False
 
     def _snapshot_best_params(self, context: Optional[torch.Tensor] = None):
-        # self._params.update({
-            # "initial_dist": self.dist.initial.forward(context=context, return_dist=True),
-            # "duration_dist": self.dist.duration.forward(context=context, return_dist=True),
-            # "transition_dist": self.dist.transition.forward(context=context, return_dist=True),
-            # "emission_dist": self.dist.emission.forward(context=context, return_dist=True),
-        # })
-
         self._best_state = {
             name: getattr(self.dist, name).state_dict()
             for name in ["initial", "duration", "transition", "emission"]

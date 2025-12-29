@@ -29,19 +29,18 @@ from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_
 from scipy.optimize import linear_sum_assignment
 import matplotlib.pyplot as plt
 
-from nhsmm.constants import DEBUG, DTYPE, EPS, logger, HSMMConfig
-from nhsmm.models import HSMM
+from nhsmm import HSMM, HSMMConfig, DefaultDistribution
+from nhsmm.constants import DEBUG, DTYPE, EPS, logger
 
 
 DEFAULT_RNG_SEED = 0
-DEFAULT_LABELS = ["range", "bull", "bear"]
-
+DEFAULT_LABELS = ("range", "bull", "bear")
 
 # -----------------------------
 # Synthetic OHLCV generator
 # -----------------------------
 def generate_ohlcv(
-    n_segments: int = 12,
+    n_segments: int = 10,
     seg_len_low: int = 15,
     seg_len_high: int = 40,
     rng_seed: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, Dict[int, str]]:
@@ -277,17 +276,17 @@ if __name__ == "__main__":
     config = HSMMConfig(
         n_states=n_states,
         n_features=n_features,
-        # max_duration=MAX_DURATION,
-        # emission_type="gaussian",
-        # seed=DEFAULT_RNG_SEED,
-        # modulate_var=True,
-        # min_covar=1e-6,
+        max_duration=MAX_DURATION,
+        emission_type="gaussian",
+        seed=DEFAULT_RNG_SEED,
+        modulate_var=True,
+        min_covar=1e-6,
     )
     # --- Optionally create a custom distribution (or leave None to use defaults) ---
     dist = None  # or pass a pre-built DefaultDistribution()
     # --- Initialize HSMM ---
     model = HSMM(config=config)
-    model._init_dist(dist=dist)
+    model.init_dist(dist=dist)
 
     # --- Training ---
     t0 = time.time()
@@ -296,7 +295,7 @@ if __name__ == "__main__":
     elapsed = time.time() - t0
 
     # --- Decode hidden states ---
-    print("\n=== Decoding (viterbi) ===")
+    print("\n=== Decoding ===")
     v_path = model.decode(X_torch, algorithm="viterbi")
 
     # --- Evaluate accuracy if labels available ---
@@ -323,6 +322,7 @@ if __name__ == "__main__":
 
     # --- State occupancy & transition diagnostics ---
     with torch.no_grad():
+
         # ---- Initial state distribution (t=0 only) ----
         log_init = model.dist.initial.log_matrix()  # [B,T,K]
         init_probs = torch.softmax(log_init[:, 0], dim=-1).mean(dim=0)  # only timestep 0
@@ -351,24 +351,33 @@ if __name__ == "__main__":
             for i, s in enumerate(row_sums):
                 print(f"  {i:02d} ({label_map[i]}): sum={s:.6f}")
         else:
-            print("  All durations rows sum to 1 ✅")
+            print(f"  All durations rows sum to {dur_probs.sum():.2f} ✅")
+
 
         # ---- Transition matrix ----
-        log_trans = model.dist.transition.log_matrix()  # [B,T,K,K]
-        log_trans_mean = log_trans.mean(dim=(0, 1))       # [K,K]
+        log_trans = model.dist.transition.log_matrix()  # [B,T,K,K] or [B,T,K,D,K]
+
+        # Handle duration dimension if present
+        if log_trans.ndim == 5:  # [B,T,K,D,K]
+            log_trans_mean = log_trans.mean(dim=(0, 1, 3))  # average over batch, time, duration → [K,K]
+        else:  # [B,T,K,K]
+            log_trans_mean = log_trans.mean(dim=(0, 1))     # average over batch and time → [K,K]
+
         trans_probs = torch.softmax(log_trans_mean, dim=-1).cpu().numpy()
 
         print("\n=== Transition Matrix (row = from, col = to) ===")
         for i, row in enumerate(trans_probs):
             row_fmt = " ".join(f"{v:8.4f}" for v in row)
             print(f"  {i:02d} ({label_map[i]:>6})  {row_fmt}")
+
         row_sums = trans_probs.sum(axis=1)
         if not np.allclose(row_sums, 1.0, atol=1e-6):
             print("\n[WARN] Transition rows not normalized:")
             for i, s in enumerate(row_sums):
                 print(f"  {i:02d} ({label_map[i]}): sum={s:.6f}")
         else:
-            print("  All transition rows sum to 1 ✅")
+            print(f"  All transition rows sum to 1.00 ✅")
+
 
     # --- Inferred state occupancy from Viterbi ---
     total_frames = len(v_path)
