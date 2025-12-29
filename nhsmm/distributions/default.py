@@ -140,12 +140,9 @@ class Neural(nn.Module, ABC):
             self._init_weights(self.context_net)
 
         self.log_temperature = nn.Parameter(torch.zeros(()))
+        self.logits = nn.Parameter(torch.zeros(*self._shape), requires_grad=True)
 
         self.register_buffer("_param_version", torch.tensor(0, dtype=torch.int64))
-
-        logits_init = torch.zeros(*self._shape)
-        self.logits = nn.Parameter(logits_init, requires_grad=True)
-
         self.register_buffer("_mod_logits_buffer", self.logits.clone())
         self.register_buffer("_logits_buffer", self.logits.clone())
 
@@ -189,15 +186,13 @@ class Neural(nn.Module, ABC):
             raise TypeError("_dist must be a distribution *class*")
         self._dist_factory = value
 
-    def _apply_temperature(self,
+    def _apply_temperature(
+        self,
         logits: torch.Tensor,
-        temperature: Optional[Union[float, torch.Tensor]] = None) -> torch.Tensor:
-        if temperature is None:
-            tau = self.log_temperature.exp()
-        else:
-            tau = torch.as_tensor(temperature, device=logits.device)
-
-        tau = tau.clamp_min(EPS)
+        temperature: Optional[Union[float, torch.Tensor]] = None
+    ) -> torch.Tensor:
+        tau = torch.as_tensor(temperature, device=logits.device) if temperature is not None else self.log_temperature.exp()
+        tau = tau.clamp_min(1e-6)
         return logits / tau
 
     def _prepare_context(self, context: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -214,49 +209,48 @@ class Neural(nn.Module, ABC):
         else:
             raise ValueError(f"Unsupported context ndim={context.ndim}")
 
-    def _apply_context(self,
+    def _apply_context(
+        self,
         base: torch.Tensor,
         context: Optional[torch.Tensor] = None,
-        timestep: Optional[int] = None, grad_scale: Optional[float] = None) -> torch.Tensor:
+        timestep: Optional[int] = None,
+        grad_scale: Optional[float] = None) -> torch.Tensor:
 
-        if context is None or context.numel() == 0 or self.context_net is None:
+        if context is None or self.context_net is None:
             return torch.zeros_like(base)
 
         ctx = self._prepare_context(context)
         S, B, T, H = (ctx.shape if ctx.ndim == 4 else (1, *ctx.shape[:2], ctx.shape[-1]))
 
+        # Select timestep if provided
         if timestep is not None:
-            if torch.is_tensor(timestep) and timestep.numel() > 1:
-                if timestep.numel() != B:
-                    raise IndexError("timestep vector length mismatch")
-                idx = torch.arange(B, device=ctx.device)
-                ctx = ctx[:, idx, timestep.view(-1), :]
-            else:
-                t = int(timestep) if not torch.is_tensor(timestep) else int(timestep.item())
-                ctx = ctx[:, :, t:t+1, :] if T > 1 else ctx
+            t_idx = int(timestep) if not torch.is_tensor(timestep) else int(timestep.item())
+            ctx = ctx[:, :, t_idx:t_idx+1, :] if T > 1 else ctx
 
+        # Optional projection
         if self._proj is not None and self.allow_projection:
-            if ctx.numel() == 0: return ctx  # skip projection
             ctx = self._proj(ctx.reshape(-1, ctx.shape[-1])).view(*ctx.shape[:-1], -1)
         elif self.context_dim is not None and ctx.shape[-1] != self.context_dim:
-            raise ValueError(
-                f"context_dim mismatch: got {ctx.shape[-1]}, expected {self.context_dim}. "
-                "Set allow_projection=True to apply linear projection."
-            )
+            raise ValueError(f"context_dim mismatch: got {ctx.shape[-1]}, expected {self.context_dim}")
 
+        # Deep context network
         delta = self.context_net(ctx.reshape(-1, ctx.shape[-1]))
-        delta = delta.view(*ctx.shape[:-1], *self._shape)  # (S,B,T,*shape) or (B,T,*shape)
+        delta = delta.view(*ctx.shape[:-1], *self._shape)
 
+        # Optional residual connection
+        delta = delta + base.unsqueeze(0) if delta.shape[:-len(self._shape)] == base.shape[:2] else delta
         delta = self.final_activation_fn(delta)
+
+        # Scale and clamp
         delta = delta * getattr(self, "delta_scale", 1.0)
         delta = torch.clamp(delta, -getattr(self, "max_delta", float("inf")), getattr(self, "max_delta", float("inf")))
+
         if grad_scale is not None:
             delta = delta * grad_scale
 
-        # Squeeze timestep dim if single
+        # Squeeze single timestep
         if timestep is not None and delta.shape[2] == 1:
-            delta = delta.squeeze(2)  # (S,B,*shape) or (B,*shape)
-
+            delta = delta.squeeze(2)
         return delta
 
     def _tensor_shape(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -288,7 +282,6 @@ class Neural(nn.Module, ABC):
         # if self.cache_enabled:
             # self._cache_set(key, mod, grad_safe=grad_safe)
         return mod.detach() if grad_safe else mod
-
 
     @abstractmethod
     def _init_params(self, *args, **kwargs) -> torch.Tensor:
@@ -526,8 +519,8 @@ class Initial(Neural):
             logits = logits.unsqueeze(0)
         # else [B,T,K], do nothing
 
-        if T is not None and logits.shape[1] == 1:
-            logits = logits.expand(-1, T, -1)
+        # if T is not None and logits.shape[1] == 1:
+            # logits = logits.expand(-1, T, -1)
         return logits
 
     def expected_probs(self,
@@ -630,16 +623,42 @@ class Duration(Neural):
     def log_matrix(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
-        timestep: Optional[int] = None, T: Optional[int] = None, **kwargs) -> torch.Tensor:
+        timestep: Optional[int] = None,
+        T: Optional[int] = None, **kwargs) -> torch.Tensor:
 
-        mod = self._modulate(context=context, temperature=temperature, timestep=timestep, **kwargs)
+        mod = self._modulate(
+            context=context,
+            temperature=temperature,
+            timestep=timestep,
+            **kwargs
+        )
+        # mod: [B, T, K, D]   (duration)
+        # or   [B, T, K, K]   (transition)
+
+        soft_dmax = kwargs.get("soft_dmax", None)
+
+        if soft_dmax is not None:
+            gate = torch.sigmoid(soft_dmax).clamp_min(EPS)
+
+            if gate.ndim == 1:
+                # [D] → global duration gate
+                mod = mod + gate.log().view(1, 1, 1, -1)
+
+            elif gate.ndim == 2:
+                # [K, D] → state-dependent duration gate
+                mod = mod + gate.log().view(1, 1, *gate.shape)
+
+            else:
+                raise ValueError("soft_dmax must have shape [D] or [K, D]")
+
         logp = nnF.log_softmax(mod, dim=-1)
 
         while logp.ndim < 4:
             logp = logp.unsqueeze(0)
 
         if T is not None and logp.shape[1] == 1:
-            logp = logp.expand(-1, T, -1, -1)
+            logp = logp.expand(-1, T, *logp.shape[2:])
+
         return logp
 
     def expected_probs(self,
@@ -806,20 +825,31 @@ class Transition(Neural):
         constraint = constraint.view((1,) * (logits.ndim - constraint.ndim) + constraint.shape)
         return logits.masked_fill(~constraint, NEG_INF)
 
-    def expected_probs(self,
-        context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        timestep: Optional[int] = None, **kwargs) -> torch.Tensor:
-        mod = self._modulate(context=context, temperature=temperature, timestep=timestep, **kwargs)
-        probs = F.softmax(mod, dim=-1)
-        return probs
-
     def log_matrix(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
         timestep: Optional[int] = None, T: Optional[int] = None, **kwargs) -> torch.Tensor:
 
-        mod = self._modulate(context=context, temperature=temperature, timestep=timestep, **kwargs)
+        mod = self._modulate(
+            context=context,
+            temperature=temperature,
+            timestep=timestep,
+            **kwargs
+        )
+        # mod shape:
+        #   duration=None      -> [B, T, K, K]
+        #   duration!=None     -> [B, T, K, D, K]
+
+        soft_dmax = kwargs.get("soft_dmax", None)
+
+        if soft_dmax is not None and self.max_duration is not None:
+            # soft_dmax: [K, D]
+            gate = torch.sigmoid(soft_dmax)  # [K, D]
+            gate = gate.clamp_min(EPS)
+
+            # Broadcast to [1, 1, K, D, 1]
+            mod = mod + gate.log().view(1, 1, *gate.shape, 1)
+
         logp = nnF.log_softmax(mod, dim=-1)
 
         expected_ndim = 4 if self.max_duration is None else 5
@@ -828,7 +858,16 @@ class Transition(Neural):
 
         if T is not None and logp.shape[1] == 1:
             logp = logp.expand(-1, T, *logp.shape[2:])
+
         return logp
+
+    def expected_probs(self,
+        context: Optional[torch.Tensor] = None,
+        temperature: Optional[float] = None,
+        timestep: Optional[int] = None, **kwargs) -> torch.Tensor:
+        mod = self._modulate(context=context, temperature=temperature, timestep=timestep, **kwargs)
+        probs = F.softmax(mod, dim=-1)
+        return probs
 
     def sample(self,
         context: Optional[torch.Tensor] = None,
@@ -1043,5 +1082,5 @@ class Emission(Neural):
         return logp
 
     def log_matrix(self, *args, **kwargs) -> torch.Tensor:
-        pass
+        raise NotImplementedError
 

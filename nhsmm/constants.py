@@ -61,8 +61,7 @@ class DefaultDistribution(nn.Module):
 
     def initialize(self,
         context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        jitter: float = 1e-5, **dist_kwargs) -> Dict[str, Any]:
+        temperature: Optional[float] = None, jitter: float = 1e-5, **dist_kwargs) -> Dict[str, Any]:
         return {
             "initial_dist": self.initial.initialize(context=context, temperature=temperature, jitter=jitter, **dist_kwargs),
             "duration_dist": self.duration.initialize(context=context, temperature=temperature, jitter=jitter, **dist_kwargs),

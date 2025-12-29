@@ -253,7 +253,7 @@ if __name__ == "__main__":
 
     INIT_MAX = 3
     MAX_ITER = 5
-    MAX_DURATION = 35
+    MAX_DURATION = 30
     SYMBOL = "BTC/USDT:USDT"
     DATA_DIR = "/opt/trader/user_data/data/bybit/futures_"
 
