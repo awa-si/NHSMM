@@ -8,8 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as nnF
 
-from nhsmm.constants import DEBUG, DTYPE, EPS, logger, MAX_LOGITS, NEG_INF
 from nhsmm import Convergence, DefaultEncoder, DefaultDistribution, HSMMConfig
+from nhsmm.config import DTYPE, EPS, logger, MAX_LOGITS, NEG_INF
 from nhsmm.distributions import Initial, Duration, Transition, Emission
 from nhsmm.context import ContextEncoder, ContextRouter, SequenceSet
 
@@ -230,40 +230,48 @@ class HSMM(nn.Module):
 
         # --- Cumulative emission sums ---
         cumsum_emit = torch.zeros((B, T + 1, K), device=device)
-        cumsum_emit[:, 1:] = torch.cumsum(router.log_probs, dim=1)
+        cumsum_emit[:, 1:] = torch.cumsum(router.log_probs, dim=1)  # [B, T+1, K]
 
-        # Indices for duration sums
-        d_range = torch.arange(1, Dmax + 1, device=device)
-        t_range = torch.arange(T, device=device).view(T, 1)
-        start_idx = (t_range - d_range + 1).clamp(min=0).view(1, T, 1, Dmax)
-        end_idx = (t_range + 1).expand(T, Dmax).view(1, T, 1, Dmax)
+        # Duration range
+        d_range = torch.arange(1, Dmax + 1, device=device)  # [Dmax]
+        # Create [T, Dmax] indices for start and end
+        t_range = torch.arange(T, device=device).unsqueeze(1)  # [T,1]
+        start_idx = (t_range - d_range + 1).clamp(min=0)      # [T,Dmax]
+        end_idx = t_range + 1                                 # [T,1] -> will broadcast
 
-        k_idx = torch.arange(K, device=device).view(1, 1, K, 1)
-        b_idx = torch.arange(B, device=device).view(B, 1, 1, 1)
-        start_idx = start_idx.expand(B, T, K, Dmax)
-        end_idx = end_idx.expand(B, T, K, Dmax)
-        k_idx = k_idx.expand(B, T, K, Dmax)
-        b_idx = b_idx.expand(B, T, K, Dmax)
-        emit_sums = cumsum_emit[b_idx, end_idx, k_idx] - cumsum_emit[b_idx, start_idx, k_idx]  # [B,T,K,Dmax]
+        # Expand to [B, T, K, Dmax] via broadcasting
+        start_idx = start_idx.unsqueeze(0).unsqueeze(2).expand(B, T, K, Dmax)  # [B,T,K,Dmax]
+        end_idx = end_idx.unsqueeze(0).unsqueeze(2).expand(B, T, K, Dmax)      # [B,T,K,Dmax]
+
+        # Expand cumsum_emit for gather: [B,T+1,K] -> [B,T+1,K,1]
+        cumsum_expand = cumsum_emit.unsqueeze(-1).expand(B, T+1, K, Dmax)
+        emit_sums = cumsum_expand.gather(1, end_idx) - cumsum_expand.gather(1, start_idx)  # [B,T,K,Dmax]
 
         # --- Initialize alpha tensor ---
         alpha = torch.full((B, T, K, Dmax), NEG_INF, device=device)
-        alpha[:, 0, :, 0] = initial_logits.squeeze(1) + duration_logits[:, 0, :, 0] + emit_sums[:, 0, :, 0]
 
-        # duration indices [1,1,1,Dmax]
-        d_idx = torch.arange(1, Dmax + 1, device=device).view(1, 1, 1, Dmax)
-        # time indices [1,T,1,1]
-        t_idx = torch.arange(T, device=device, dtype=torch.long).view(1, T, 1, 1)
-        # valid durations for each timestep: D <= t+1
-        duration_mask = d_idx <= (t_idx + 1)  # [1, T, 1, Dmax]
-        # expand to [B, T, K, Dmax] and combine with sequence mask
+        # Compute alpha[:, 0, :, :Dmax] in a vectorized way
+        max_d0 = min(Dmax, T)
+        alpha[:, 0, :, :max_d0] = (
+            initial_logits.squeeze(1).unsqueeze(-1)      # [B, K, 1]
+            + duration_logits[:, 0, :, :max_d0]         # [B, K, max_d0]
+            + emit_sums[:, 0, :, :max_d0]              # [B, K, max_d0]
+        )
+
+        # --- Duration mask ---
+        d_idx = torch.arange(1, Dmax + 1, device=device).view(1, 1, 1, Dmax)  # [1,1,1,Dmax]
+        t_idx = torch.arange(T, device=device).view(1, T, 1, 1)              # [1,T,1,1]
+        duration_mask = d_idx <= (t_idx + 1)                                  # [1,T,1,Dmax]
+
+        # Combine with router sequence mask and expand
         duration_mask = duration_mask.expand(B, T, K, Dmax) & router.mask.unsqueeze(-1)
 
         for t in range(1, T):
             max_d = min(Dmax, t + 1)
-            idx_prev = (t - d_range[:max_d]).clamp(min=0)
+            valid_d = d_idx[0,0,0,:max_d]  # [max_d]
+            idx_prev = (t - valid_d).clamp(min=0)  # [max_d]
 
-            alpha_prev = alpha[:, idx_prev, :, :max_d]
+            alpha_prev = alpha[:, idx_prev, :, :max_d]  # [B, max_d, K, max_d]
             if self.dist.transition.max_duration is None:
                 # standard HMM transitions: [B, T, K, K]
                 alpha_prev = torch.logsumexp(alpha_prev, dim=-1)
@@ -288,16 +296,13 @@ class HSMM(nn.Module):
 
         length_mask = torch.arange(T, device=device).unsqueeze(0) < X.lengths.unsqueeze(1)
         alpha = alpha.masked_fill(~length_mask.unsqueeze(-1).unsqueeze(-1), NEG_INF)
-
-        mask_exp = router.mask.bool().unsqueeze(-1).expand(B, T, K, Dmax)
-        alpha = alpha.masked_fill(~mask_exp, NEG_INF)
         return alpha
 
     def fit(self,
         X: torch.Tensor | list[torch.Tensor],
         n_init: int = 1, tol: float = 1e-4, max_iter: int = 20,
         context: Optional[torch.Tensor | list[torch.Tensor]] = None,
-        lr: float = 1e-2, verbose: bool = True, use_scheduler: bool = True):
+        loss_bias: float = 1e-4, lr: float = 1e-2, verbose: bool = True, use_scheduler: bool = True):
 
         self._convergence = Convergence(
             tol=tol,
@@ -343,8 +348,7 @@ class HSMM(nn.Module):
                     log_likelihoods[valid] = torch.logsumexp(last_alpha.flatten(1), dim=1)
 
                 ll = log_likelihoods.sum()
-                bias = 1e-4
-                loss = -ll + bias * nnF.relu(
+                loss = -ll + loss_bias * nnF.relu(
                     self.soft_dmax[:, 1:] - self.soft_dmax[:, :-1]
                 ).mean()
 
@@ -465,7 +469,6 @@ class HSMM(nn.Module):
         context: Optional[torch.Tensor | list[torch.Tensor]] = None,
         reduce: bool = False) -> torch.Tensor:
 
-        # --- Normalize X into list[Tensor[T,F]] ---
         if torch.is_tensor(X):
             if X.ndim == 2:
                 sequences = [X]
@@ -481,10 +484,8 @@ class HSMM(nn.Module):
             raise TypeError(f"Unsupported X type: {type(X)}")
 
         B = len(sequences)
-        if B == 0:
-            return torch.empty(0)
+        if B == 0: return torch.empty(0)
 
-        # --- Normalize context ---
         context_list: Optional[list[torch.Tensor]] = None
         if context is not None:
             if torch.is_tensor(context):
@@ -520,12 +521,10 @@ class HSMM(nn.Module):
             neginf=NEG_INF,
             posinf=MAX_LOGITS
         )
-
         return log_likelihoods.sum() if reduce else log_likelihoods
 
     def _reset_parameters(self, run_idx: int, context: Optional[torch.Tensor] = None, preserve_best: bool = True) -> None:
-        modules = ["initial", "transition", "duration", "emission"]
-        for name in modules:
+        for name in ["initial", "transition", "duration", "emission"]:
             module = getattr(self.dist, name)
             if preserve_best and getattr(self, "_best_state", None) and name in self._best_state:
                 module.load_state_dict(self._best_state[name])
@@ -556,16 +555,13 @@ class HSMM(nn.Module):
         if not hasattr(self, "_best_state"):
             raise RuntimeError("No best parameters have been snapshotted")
 
-        for name in ["initial", "transition", "duration", "emission"]:
-            getattr(self.dist, name).load_state_dict(self._best_state[name])
-
         if self.encoder is not None and "encoder" in self._best_state:
             self.encoder.load_state_dict(self._best_state["encoder"])
 
         for name in ["initial", "transition", "duration", "emission"]:
             module = getattr(self.dist, name)
-            module._reset_buffers()
-            module._invalidate_cache()
+            if self._best_state.get(name):
+                module.load_state_dict(self._best_state[name])
 
     def predict(self,
         X: torch.Tensor | list[torch.Tensor],

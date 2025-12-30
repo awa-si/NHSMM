@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as nnF
 
-from nhsmm.constants import DTYPE, EPS, logger
+from nhsmm.config import DTYPE, EPS, logger
 
 
 @dataclass

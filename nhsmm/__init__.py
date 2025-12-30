@@ -1,4 +1,4 @@
-from .constants import HSMMConfig, DefaultDistribution
+from .config import HSMMConfig, DefaultDistribution
 from .convergence import Convergence
 from .encoder import DefaultEncoder
 from .models import HSMM

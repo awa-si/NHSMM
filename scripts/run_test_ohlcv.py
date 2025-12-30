@@ -30,7 +30,7 @@ from scipy.optimize import linear_sum_assignment
 import matplotlib.pyplot as plt
 
 from nhsmm import HSMM, HSMMConfig, DefaultDistribution
-from nhsmm.constants import DEBUG, DTYPE, EPS, logger
+from nhsmm.config import DTYPE, EPS, logger
 
 
 DEFAULT_RNG_SEED = 0
@@ -180,71 +180,6 @@ def best_permutation_accuracy(
 
 
 # -----------------------------
-# Visual Diagnostics
-# -----------------------------
-def plot_hsmm_results(X: torch.Tensor, v_path: np.ndarray, model: HSMM, label_map: Dict[int, str]):
-    """
-    Plot HSMM decoded regimes, durations, and transition matrix.
-    
-    Args:
-        X: Observations [T, F]
-        v_path: Viterbi-decoded state path [T]
-        model: trained HSMM model
-        label_map: dict mapping state indices -> labels
-    """
-    T = X.shape[0]
-    n_states = len(label_map)
-
-    import matplotlib.pyplot as plt
-
-    # --- 1. Plot decoded regimes over a feature (e.g., close price) ---
-    plt.figure(figsize=(14, 4))
-    plt.plot(X[:, 3].cpu().numpy(), color="gray", lw=0.8, label="Close Price")
-    plt.scatter(np.arange(T), X[:, 3].cpu().numpy(), c=v_path, cmap="viridis", s=8)
-    plt.title("HSMM Viterbi Decoded Regimes")
-    plt.xlabel("Time")
-    plt.ylabel("Price")
-    plt.colorbar(label="State")
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
-    # --- 2. Plot duration distributions per state ---
-    with torch.no_grad():
-        log_D = model.duration_module.log_matrix()
-        if log_D.ndim > 2:
-            log_D = log_D.squeeze(0).squeeze(0)
-        D = torch.exp(log_D).cpu().numpy()  # [K, Dmax]
-
-    plt.figure(figsize=(12, 3))
-    for i, row in enumerate(D):
-        plt.plot(np.arange(1, len(row) + 1), row, lw=2, label=f"{label_map[i]} ({i})")
-    plt.title("Learned Duration Distributions per State")
-    plt.xlabel("Duration (frames)")
-    plt.ylabel("Probability")
-    plt.legend()
-    plt.tight_layout()
-    # plt.show()
-
-    # --- 3. Plot transition matrix heatmap ---
-    with torch.no_grad():
-        log_trans = model.transition_module.log_matrix()
-        if log_trans.ndim > 2:
-            log_trans = log_trans.mean(dim=(0, 1))  # [K, K]
-        trans = torch.softmax(log_trans, dim=-1).cpu().numpy()
-
-    plt.figure(figsize=(6, 5))
-    im = plt.imshow(trans, cmap="Blues", vmin=0, vmax=1)
-    plt.colorbar(im, label="Transition Probability")
-    plt.title("HSMM Transition Matrix")
-    plt.xlabel("To State")
-    plt.ylabel("From State")
-    plt.xticks(ticks=np.arange(n_states), labels=[label_map[i] for i in range(n_states)], rotation=45)
-    plt.yticks(ticks=np.arange(n_states), labels=[label_map[i] for i in range(n_states)])
-    plt.tight_layout()
-    # plt.show()
-
-# -----------------------------
 # Main execution
 # -----------------------------
 if __name__ == "__main__":
@@ -255,7 +190,7 @@ if __name__ == "__main__":
     MAX_ITER = 5
     MAX_DURATION = 30
     SYMBOL = "BTC/USDT:USDT"
-    DATA_DIR = "/opt/trader/user_data/data/bybit/futures_"
+    DATA_DIR = "/opt/trader/user_data/data/bybit/futures"
 
     # --- Load or generate data ---
     X, true_states, label_map = load_ohlcv_tensor(DATA_DIR, SYMBOL)
@@ -344,25 +279,14 @@ if __name__ == "__main__":
         for i, row in enumerate(dur_probs):
             mode_dur = int(np.argmax(row)) + 1
             mean_dur = float((np.arange(1, len(row)+1) * row).sum())
-            print(f"  {label_map[i]:<6} | mode={mode_dur}, mean={mean_dur:.2f}, total_prob={row.sum():.4f}")
-        row_sums = dur_probs.sum(axis=1)
-        if not np.allclose(row_sums, 1.0, atol=1e-6):
-            print("\n[WARN] Duration rows not normalized:")
-            for i, s in enumerate(row_sums):
-                print(f"  {i:02d} ({label_map[i]}): sum={s:.6f}")
-        else:
-            print(f"  All durations rows sum to {dur_probs.sum():.2f} ✅")
-
+            print(f"  {label_map[i]:<6} | mode={mode_dur}, mean={mean_dur:.2f}, total_prob={row.sum():.2f}")
 
         # ---- Transition matrix ----
         log_trans = model.dist.transition.log_matrix()  # [B,T,K,K] or [B,T,K,D,K]
-
-        # Handle duration dimension if present
         if log_trans.ndim == 5:  # [B,T,K,D,K]
             log_trans_mean = log_trans.mean(dim=(0, 1, 3))  # average over batch, time, duration → [K,K]
         else:  # [B,T,K,K]
             log_trans_mean = log_trans.mean(dim=(0, 1))     # average over batch and time → [K,K]
-
         trans_probs = torch.softmax(log_trans_mean, dim=-1).cpu().numpy()
 
         print("\n=== Transition Matrix (row = from, col = to) ===")
@@ -386,10 +310,5 @@ if __name__ == "__main__":
     for s, c in zip(unique, counts):
         pct = c / total_frames * 100
         print(f"  {label_map[s]:<6}: {c} frames ({pct:.2f}%)")
+    print("\n")
 
-    if DEBUG:
-        try:
-            print("\n=== Visual Diagnostics ===")
-            plot_hsmm_results(X_torch, v_path, model, label_map)
-        except ImportError:
-            print("matplotlib not installed — skipping plots")

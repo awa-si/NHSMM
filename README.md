@@ -124,11 +124,11 @@ This installs NHSMM in editable mode, allowing you to modify the source code and
 
 ```
 nhsmm/
+├── config.py
 ├── context.py
-├── constants.py
 ├── convergence.py
-├── encoder.py
 ├── data.py
+├── encoder.py
 ├── models/
 │   ├── base.py
 │   └── __init__.py

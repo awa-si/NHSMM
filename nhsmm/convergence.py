@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from threading import Lock
 from typing import List, Optional, Protocol
 
-from nhsmm.constants import DTYPE, EPS, logger
+from nhsmm.config import DTYPE, EPS, logger
 
 
 class CallbackFn(Protocol):
@@ -23,7 +23,6 @@ class CallbackFn(Protocol):
 
 
 class Convergence:
-    """Monitor convergence of multiple inits with optional callbacks."""
 
     def __init__(
         self,

@@ -5,10 +5,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as nnF
 
+from nhsmm.config import logger
+
 
 class DefaultEncoder(nn.Module):
     """
-    CNN + LSTM encoder for sequences.
+    Default CNN + LSTM encoder for sequences.
     Returns per-timestep features and pooled canonical context.
     """
 

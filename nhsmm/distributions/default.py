@@ -14,7 +14,7 @@ from torch.distributions import (
     Distribution, MultivariateNormal, Independent, StudentT
 )
 
-from nhsmm.constants import DEBUG, EPS, logger, MAX_LOGITS, NEG_INF
+from nhsmm.config import EPS, logger, MAX_LOGITS, NEG_INF
 
 
 class Categorical(Distribution):
@@ -92,8 +92,8 @@ class Neural(nn.Module, ABC):
         context_dim: Optional[int] = None,
         hidden_dim: Optional[int] = None,
         allow_projection: bool = True,
-        learnable_scale: bool = True,
         max_delta: float = 0.5,
+        alpha: float = 1.0,
 
         cache_enabled: bool = False,
         cache_limit: int = 32,
@@ -101,12 +101,13 @@ class Neural(nn.Module, ABC):
         super().__init__()
         self._cache: OrderedDict[str, torch.Tensor] = OrderedDict()
 
+        self.target_dim = target_dim
         self.context_dim = context_dim
-        self.target_dim = int(target_dim)
         self.allow_projection = allow_projection
         self.cache_enabled = cache_enabled
         self.cache_limit = cache_limit
         self.max_delta = max_delta
+        self.alpha = alpha
 
         self.activation_fn = self._get_activation(activation)
         self.final_activation_fn = self._get_activation(final_activation)
@@ -118,11 +119,6 @@ class Neural(nn.Module, ABC):
             self._proj = nn.Linear(context_dim, context_dim, bias=True)
             nn.init.xavier_uniform_(self._proj.weight)
             nn.init.zeros_(self._proj.bias)
-
-        if learnable_scale:
-            self.delta_scale = nn.Parameter(torch.tensor(0.1))
-        else:
-            self.register_buffer("delta_scale", torch.tensor(0.1))
 
         prod_shape = int(math.prod(self._shape))
         if prod_shape != self.target_dim:
@@ -139,6 +135,7 @@ class Neural(nn.Module, ABC):
             )
             self._init_weights(self.context_net)
 
+        self.delta_scale = nn.Parameter(torch.tensor(0.1))
         self.log_temperature = nn.Parameter(torch.zeros(()))
         self.logits = nn.Parameter(torch.zeros(*self._shape), requires_grad=True)
 
@@ -186,11 +183,17 @@ class Neural(nn.Module, ABC):
             raise TypeError("_dist must be a distribution *class*")
         self._dist_factory = value
 
-    def _apply_temperature(
-        self,
+    def _tensor_shape(self, tensor: torch.Tensor) -> torch.Tensor:
+        k = len(self._shape)
+        if tensor.ndim < k:
+            raise ValueError(f"Tensor ndim={tensor.ndim} < required trailing dims={k}")
+        if tensor.shape[-k:] != self._shape:
+            tensor = tensor.view(*tensor.shape[:-k], *self._shape)
+        return tensor
+
+    def _apply_temperature(self,
         logits: torch.Tensor,
-        temperature: Optional[Union[float, torch.Tensor]] = None
-    ) -> torch.Tensor:
+        temperature: Optional[Union[float, torch.Tensor]] = None) -> torch.Tensor:
         tau = torch.as_tensor(temperature, device=logits.device) if temperature is not None else self.log_temperature.exp()
         tau = tau.clamp_min(1e-6)
         return logits / tau
@@ -198,6 +201,8 @@ class Neural(nn.Module, ABC):
     def _prepare_context(self, context: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if context is None:
             return None
+        if self.context_dim is not None and context.shape[-1] != self.context_dim:
+            raise ValueError(f"Unsupported context ndim={context.ndim}")
         if context.ndim == 1:  # (H,)
             return context.view(1, 1, -1)
         elif context.ndim == 2:  # (B,H)
@@ -235,43 +240,31 @@ class Neural(nn.Module, ABC):
 
         # Deep context network
         delta = self.context_net(ctx.reshape(-1, ctx.shape[-1]))
+
+        expected = int(torch.prod(torch.tensor(self._shape)))
+        if delta.shape[-1] != expected:
+            raise RuntimeError("context_net output mismatch")
+
         delta = delta.view(*ctx.shape[:-1], *self._shape)
-
-        # Optional residual connection
-        delta = delta + base.unsqueeze(0) if delta.shape[:-len(self._shape)] == base.shape[:2] else delta
         delta = self.final_activation_fn(delta)
-
-        # Scale and clamp
-        delta = delta * getattr(self, "delta_scale", 1.0)
-        delta = torch.clamp(delta, -getattr(self, "max_delta", float("inf")), getattr(self, "max_delta", float("inf")))
+        delta = torch.clamp(delta * self.delta_scale, -self.max_delta, self.max_delta)
 
         if grad_scale is not None:
             delta = delta * grad_scale
 
-        # Squeeze single timestep
         if timestep is not None and delta.shape[2] == 1:
             delta = delta.squeeze(2)
         return delta
 
-    def _tensor_shape(self, tensor: torch.Tensor) -> torch.Tensor:
-        k = len(self._shape)
-        if tensor.ndim < k:
-            raise ValueError(f"Tensor ndim={tensor.ndim} < required trailing dims={k}")
-        if tensor.shape[-k:] != self._shape:
-            tensor = tensor.view(*tensor.shape[:-k], *self._shape)
-        return tensor
-
     def _modulate(self,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
-        timestep: Optional[int] = None,
-        grad_safe: bool = False, **kwargs) -> torch.Tensor:
+        timestep: Optional[int] = None, **kwargs) -> torch.Tensor:
 
-        # key = f"{self._context_hash(context)}-T{timestep}-Temp{float(temperature) if temperature is not None else 'None'}"
-        # if self.cache_enabled:
-            # cached = self._cache_get(key)
-            # if cached is not None:
-                # return cached.detach() if grad_safe else cached
+        key = f"{self._context_hash(context)}-T{timestep}-Temp{float(temperature) if temperature is not None else 'None'}"
+        if self.cache_enabled:
+            cached = self._cache_get(key)
+            if cached is not None: return cached
 
         base = self._tensor_shape(self.base)
         delta = self._apply_context(base, context, timestep)
@@ -279,9 +272,8 @@ class Neural(nn.Module, ABC):
         mod = self._apply_temperature(mod, temperature)
         mod = self._validate_base(mod)
 
-        # if self.cache_enabled:
-            # self._cache_set(key, mod, grad_safe=grad_safe)
-        return mod.detach() if grad_safe else mod
+        if self.cache_enabled: self._cache_set(key, mod)
+        return mod
 
     @abstractmethod
     def _init_params(self, *args, **kwargs) -> torch.Tensor:
@@ -405,8 +397,8 @@ class Neural(nn.Module, ABC):
         sample = context.detach().float().flatten()[::max(1, context.numel() // 1024)]
         return f"{hashlib.sha256(sample.cpu().numpy().tobytes()).hexdigest()[:12]}-v{int(self._param_version.item())}"
 
-    def _cache_set(self, key: str, value: torch.Tensor, grad_safe: bool = False) -> None:
-        self._cache[key] = value.detach() if grad_safe else value
+    def _cache_set(self, key: str, value: torch.Tensor) -> None:
+        self._cache[key] = value
         self._cache.move_to_end(key)
         while len(self._cache) > self.cache_limit:
             self._cache.popitem(last=False)
@@ -444,8 +436,6 @@ class Initial(Neural):
         context_dim: Optional[int] = None,
     ):
         self._shape = (n_states,)
-        self.n_states = n_states
-        self.init_mode = init_mode
 
         super().__init__(
             target_dim=n_states,
@@ -455,15 +445,15 @@ class Initial(Neural):
             final_activation="tanh",
             activation="tanh",
         )
-        init_logits = self._init_params(mode=init_mode)
-        self.logits = nn.Parameter(init_logits)
-        self._reset_buffers()
-        self._invalidate_cache()
+
+        self.n_states = n_states
+        self.init_mode = init_mode
+        self._init_params(mode=init_mode)
 
     def _init_params(self,
         mode: Optional[str] = None,
         context: Optional[torch.Tensor] = None,
-        jitter: float = 1e-5, dirichlet_alpha: Optional[float] = 1.0) -> torch.Tensor:
+        jitter: float = 1e-5) -> torch.Tensor:
 
         mode = mode or self.init_mode
 
@@ -475,7 +465,7 @@ class Initial(Neural):
         elif mode == "normal":
             logits = torch.randn(self._shape) * 0.1
         elif mode == "dirichlet":
-            probs = torch.distributions.Dirichlet(torch.full((self.n_states,), dirichlet_alpha)).sample()
+            probs = torch.distributions.Dirichlet(torch.full((self.n_states,), self.alpha)).sample()
             logits = torch.log(probs.clamp_min(EPS))
         else:
             raise ValueError(f"Unknown init_mode '{mode}'")
@@ -488,6 +478,8 @@ class Initial(Neural):
         if jitter > 0.0:
             logits = logits + torch.randn_like(logits) * jitter
 
+        self._reset_buffers()
+        self._invalidate_cache()
         return logits
 
     def initialize(self,
@@ -523,18 +515,6 @@ class Initial(Neural):
             # logits = logits.expand(-1, T, -1)
         return logits
 
-    def expected_probs(self,
-        context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        timestep: Optional[int] = None,
-        T: Optional[int] = None, **kwargs) -> torch.Tensor:
-
-        probs = F.softmax(self._modulate(context=context, temperature=temperature, timestep=timestep, **kwargs), dim=-1)
-        probs = probs.unsqueeze(0) if probs.ndim == 1 else probs.unsqueeze(1) if probs.ndim == 2 else probs
-        if T is not None and probs.shape[1] == 1:
-            probs = probs.expand(-1, T, -1)
-        return probs
-
 
 class Duration(Neural):
     _dist_factory = Categorical
@@ -558,19 +538,17 @@ class Duration(Neural):
             hidden_dim=hidden_dim,
             activation="tanh",
         )
-        self.init_mode = init_mode
-        self.n_states = int(n_states)
-        self.max_duration = int(max_duration)
 
-        init_logits = self._init_params(init_mode)
-        self.logits = nn.Parameter(init_logits)
-        self._reset_buffers()
-        self._invalidate_cache()
+        self.max_duration = max_duration
+        self.init_mode = init_mode
+        self.n_states = n_states
+
+        self._init_params(mode=init_mode)
 
     def _init_params(self,
         mode: Optional[str] = None,
         context: Optional[torch.Tensor] = None,
-        jitter: float = 1e-5, dirichlet_alpha: Optional[float] = 1.0) -> torch.Tensor:
+        jitter: float = 1e-5) -> torch.Tensor:
 
         mode = mode or self.init_mode
 
@@ -588,7 +566,7 @@ class Duration(Neural):
         elif mode == "dirichlet":
             logits_list = []
             for i in range(self.n_states):
-                probs = torch.distributions.Dirichlet(torch.full((self.max_duration,), dirichlet_alpha)).sample()
+                probs = torch.distributions.Dirichlet(torch.full((self.max_duration,), self.alpha)).sample()
                 logits_list.append(torch.log(probs.clamp_min(EPS)))
             logits = torch.stack(logits_list, dim=0)
         else:
@@ -601,6 +579,8 @@ class Duration(Neural):
         if jitter > 0.0:
             logits = logits + torch.randn_like(logits) * jitter
 
+        self._reset_buffers()
+        self._invalidate_cache()
         return logits
 
     def initialize(self,
@@ -661,22 +641,6 @@ class Duration(Neural):
 
         return logp
 
-    def expected_probs(self,
-        context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        timestep: Optional[int] = None, **kwargs) -> torch.Tensor:
-        mod = self._modulate(context=context, temperature=temperature, timestep=timestep, **kwargs)
-        probs = nnF.softmax(mod, dim=-1)
-        return probs
-
-    def sample(self,
-        context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        timestep: Optional[int] = None, **dist_kwargs) -> torch.Tensor:
-        dist = self._get_dist(context, temperature, timestep, **dist_kwargs)
-        s = dist.sample()
-        return F.one_hot(s.long(), num_classes=self.max_duration)
-
 
 class Transition(Neural):
     _dist_factory = Categorical
@@ -713,16 +677,12 @@ class Transition(Neural):
 
         self.init_mode = init_mode
         self.transition_type = transition_type
-        init_logits = self._init_params(init_mode)
-        self.logits = nn.Parameter(init_logits)
-
-        self._reset_buffers()
-        self._invalidate_cache()
+        # self._init_params(mode=init_mode)
 
     def _init_params(self,
         mode: Optional[str] = None,
         context: Optional[torch.Tensor] = None,
-        jitter: float = 1e-5, dirichlet_alpha: float = 1.0) -> torch.Tensor:
+        jitter: float = 1e-5) -> torch.Tensor:
 
         K = self.n_states
         mode = mode or self.init_mode
@@ -752,7 +712,7 @@ class Transition(Neural):
             if D == 1:
                 logits_list = []
                 for k in range(K):
-                    probs = torch.distributions.Dirichlet(torch.full((K,), dirichlet_alpha)).sample()
+                    probs = torch.distributions.Dirichlet(torch.full((K,), self.alpha)).sample()
                     logits_list.append(torch.log(probs.clamp_min(EPS)))
                 logits = torch.stack(logits_list, dim=0)
             else:
@@ -760,23 +720,23 @@ class Transition(Neural):
                 for k in range(K):
                     probs_list = []
                     for d in range(D):
-                        probs = torch.distributions.Dirichlet(torch.full((K,), dirichlet_alpha)).sample()
+                        probs = torch.distributions.Dirichlet(torch.full((K,), self.alpha)).sample()
                         probs_list.append(torch.log(probs.clamp_min(EPS)))
                     logits_list.append(torch.stack(probs_list, dim=0))
                 logits = torch.stack(logits_list, dim=0)  # shape (K, D, K)
         else:
             raise ValueError(f"Unknown init_mode '{mode}'")
 
-        # Apply context modulation if available
         if context is not None and self.context_net is not None:
             ctx_delta = self.context_net(context.mean(dim=0))
             # ensure ctx_delta can broadcast to logits shape
             logits = logits + ctx_delta.view(*([1]*(logits.ndim - ctx_delta.ndim)), *ctx_delta.shape)
 
-        # Add jitter for stochasticity
         if jitter > 0.0:
             logits = logits + torch.randn_like(logits) * jitter
 
+        self._reset_buffers()
+        self._invalidate_cache()
         return logits
 
     def initialize(
@@ -861,22 +821,6 @@ class Transition(Neural):
 
         return logp
 
-    def expected_probs(self,
-        context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        timestep: Optional[int] = None, **kwargs) -> torch.Tensor:
-        mod = self._modulate(context=context, temperature=temperature, timestep=timestep, **kwargs)
-        probs = F.softmax(mod, dim=-1)
-        return probs
-
-    def sample(self,
-        context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        timestep: Optional[int] = None, **dist_kwargs) -> torch.Tensor:
-        dist = self._get_dist(context, temperature, timestep, **dist_kwargs)
-        s = dist.sample()
-        return nnF.one_hot(s.long(), num_classes=self.n_states)
-
 
 class Emission(Neural):
 
@@ -920,8 +864,6 @@ class Emission(Neural):
         else:
             self.scale_param = nn.Parameter(torch.full((self.n_states, self.n_features), 0.1))
             self.loc = nn.Parameter(torch.randn(self.n_states, self.n_features) * 0.1)
-
-        self._invalidate_cache()
 
     @property
     def base(self):
