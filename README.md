@@ -10,7 +10,11 @@
 > ⚠️ **NHSMM is currently in alpha** and provided as a **proof-of-concept**.  
 > The library **is actively evolving** for production readiness, and the public API **may change** before the first stable `1.0.0` release.
 
-This guide provides a **self-contained overview** of **NHSMM**, a **modular PyTorch library** forming the foundation of the **State Aware Engine (SAE)**. It is tailored for **developers, data scientists, and system integrators**, enabling rapid understanding, deployment, and extension across **diverse sequential data domains**.
+This guide provides a **self-contained overview** of **NHSMM**, a **modular PyTorch library** forming the foundation of the **State Aware Engine ([SAE](https://github.com/awa-si/SAE))**, along with **`nhsmm-interfaces`**, which defines the **domain- and application-level contracts** for integrating NHSMM across diverse systems.
+
+Together, **NHSMM** and **[nhsmm-interfaces](https://github.com/awa-si/nhsmm-interfaces)** are tailored for **developers, data scientists, and system integrators**, enabling **rapid understanding, deployment, and extension** of **context-aware sequential models** across diverse domains such as **finance, IoT, robotics, health, and cybersecurity**.
+
+---
 
 ### 🌟 Highlights
 
@@ -37,9 +41,9 @@ This design makes NHSMM particularly suitable for **real-world, time-sensitive a
 
 ---
 
-## 🌐 NHSMM & the State Aware Engine (SAE)
+## 🌐 NHSMM & the State Aware Engine ([SAE](https://github.com/awa-si/SAE))
 
-**NHSMM** powers the **State Aware Engine (SAE)** — a **cross-domain platform** for uncovering **hidden regimes** and **temporal patterns** in sequential data across **finance, IoT, health, cybersecurity, robotics**, and related applications.  
+**NHSMM** powers the **State Aware Engine ([SAE](https://github.com/awa-si/SAE))** — a **cross-domain platform** for uncovering **hidden regimes** and **temporal patterns** in sequential data across **finance, IoT, health, cybersecurity, robotics**, and related applications.  
 
 The framework is designed for dual usage:
 
@@ -66,7 +70,7 @@ The framework is designed for dual usage:
 * **Neural Context Encoders** — optional CNN, LSTM, or hybrid encoders to inject **time-varying covariates** into emission, duration, and transition probabilities.  
 * **GPU-Ready Implementation** — fully batched operations for **fast training and inference** on modern accelerators (CUDA-ready).  
 * **Multi-Domain Usage** — flexible for **finance (market regime detection), IoT (predictive maintenance), robotics (behavior monitoring), wearable health (activity and state detection), cybersecurity (anomaly detection)**, and other sequential applications.  
-* **Extensible Architecture** — modular foundation for SAE adapters, API integration, multi-domain extensions, and **future research projects** in sequence modeling.  
+* **Extensible Architecture** — modular foundation for [SAE](https://github.com/awa-si/SAE) interfaces, API integration, multi-domain extensions, and **future research projects** in sequence modeling.  
 * **Robust Initialization & Adaptivity** — supports **spread or random initialization**, learning rate adaptation, and state-wise parameter modulation for stable convergence across domains.  
 * **Hybrid Update Modes** — allows **neural gradient-based updates**, optionally combined with alternative schemes for best performance.  
 
@@ -96,12 +100,12 @@ The framework is designed for dual usage:
 
 NHSMM can be installed quickly via **PyPI** for standard usage or built from source for **development and customization**.
 
-### 🔹 Install from PyPI
+### 🔹 Install from PyPI (Not recommended due early stage)
 
 The easiest way to install NHSMM is through PyPI:
 
 ```bash
-pip install nhsmm
+pip install nhsmm;
 ```
 
 This provides the latest stable release with all core dependencies, suitable for research or production environments.
@@ -112,8 +116,9 @@ To contribute, customize, or use the latest development version:
 
 ```bash
 git clone https://github.com/awa-si/NHSMM.git
-cd NHSMM
-pip install -e .
+cd NHSMM;
+pip install -e .;
+
 ```
 
 This installs NHSMM in editable mode, allowing you to modify the source code and immediately test changes without reinstalling. Ideal for experimenting with new models, encoders, or distributions.
@@ -144,7 +149,7 @@ nhsmm/
 ## 🧠 Usage Example — Market Regime Detection (HSMM)
 
 Please see:
-[State Occupancy & Duration/Transition Diagnostics](docs/test.md)
+[State Occupancy & Duration/Transition Diagnostics](docs/test_ohlcv.md)
 
 This example demonstrates **Hidden Semi-Markov regime detection** on OHLCV-style time-series data using **NHSMM**.  
 The same pattern applies to **IoT signals, health data, robotics telemetry, or cybersecurity logs**.
@@ -224,11 +229,11 @@ For planned features and research directions, see the project roadmap in the Git
 
 ```bash
 # Fork or clone the repository
-git clone https://github.com/awa-si/NHSMM.git
-cd nhsmm
+git clone https://github.com/awa-si/NHSMM.git;
+cd NHSMM;
 
 # Install in development mode with optional dev dependencies
-pip install -e ".[dev]"
+pip install -e ".[dev]";
 
 # Run tests
 pytest -v

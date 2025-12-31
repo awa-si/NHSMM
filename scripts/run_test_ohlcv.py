@@ -24,8 +24,8 @@ from typing import Optional, Dict, Tuple
 import torch
 import torch.nn.functional as nnF
 
-from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from scipy.optimize import linear_sum_assignment
 import matplotlib.pyplot as plt
 
@@ -190,7 +190,7 @@ if __name__ == "__main__":
     MAX_ITER = 5
     MAX_DURATION = 30
     SYMBOL = "BTC/USDT:USDT"
-    DATA_DIR = "/opt/trader/user_data/data/bybit/futures"
+    DATA_DIR = "/opt/trader/user_data/data/bybit/futures_"
 
     # --- Load or generate data ---
     X, true_states, label_map = load_ohlcv_tensor(DATA_DIR, SYMBOL)
