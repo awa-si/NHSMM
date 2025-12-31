@@ -2,7 +2,8 @@
 # NHSMM — Neural Hidden Semi-Markov Models
 
 - *Repository: [NHSMM on GitHub](https://github.com/awa-si/NHSMM)*
-- *Documentation: [Wiki on GitHub](https://github.com/awa-si/NHSMM/wiki)*
+- *Interfaces: [NHSMM Interfaces on GitHub](https://github.com/awa-si/nhsmm-interfaces)*
+- *Documentation: [NHSMM Wiki on GitHub](https://github.com/awa-si/NHSMM/wiki)*
 - *Article on Medium: [Unlocking Hidden Patterns in Time – Meet NHSMM ](https://medium.com/@awa-si/unlocking-hidden-patterns-in-time-meet-nhsmm-the-neural-hidden-semi-markov-model-cd3f1e2428c2)*
 
 ---
