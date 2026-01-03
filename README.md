@@ -1,7 +1,7 @@
 # NHSMM — Neural Hidden Semi-Markov Models
 
 * **Repository:** [NHSMM on GitHub](https://github.com/awa-si/NHSMM)
-* **Interfaces:** [NHSMM Interfaces on GitHub](https://github.com/awa-si/nhsmm-interfaces)
+* **Interfaces:** [NHSMM-INTERFACES on GitHub](https://github.com/awa-si/nhsmm-interfaces)
 * **Documentation:** [NHSMM Wiki](https://github.com/awa-si/NHSMM/wiki)
 * **Article:** [Unlocking Hidden Patterns in Time – Meet NHSMM](https://medium.com/@awa-si/unlocking-hidden-patterns-in-time-meet-nhsmm-the-neural-hidden-semi-markov-model-cd3f1e2428c2)
 
@@ -10,7 +10,7 @@
 > ⚠️ **Alpha stage** — NHSMM is a **proof-of-concept** and actively evolving. Public APIs may change before stable `1.0.0`.
 
 **NHSMM** is a **modular PyTorch library** for **context-aware sequential modeling**, forming the foundation of the **State Aware Engine ([SAE](https://github.com/awa-si/SAE))**.
-**`nhsmm-interfaces`** defines domain-level contracts for integrating NHSMM in diverse systems.
+**[NHSMM-INTERFACES](https://github.com/awa-si/nhsmm-interfaces)** defines domain-level contracts for integrating NHSMM in diverse systems.
 
 Designed for **developers, data scientists, and system integrators**, NHSMM enables rapid understanding, deployment, and extension of **latent state models** for domains such as **finance, IoT, robotics, health, and cybersecurity**.
 

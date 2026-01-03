@@ -13,10 +13,6 @@ If you find **NHSMM** useful in your work or research, you can support its conti
   Funds recurring, in-depth technical writing, research notes, and domain-specific deep dives  
   (Trading, IoT, Health), as well as early access to experimental ideas.
 
-- **Open Collective**  
-  Provides transparent, auditable funding for sustainable open-source development,  
-  documentation, infrastructure costs, and long-term research initiatives.
-
 - **Medium**  
   Supports public-facing technical articles, educational content, and knowledge sharing.
 
