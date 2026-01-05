@@ -80,6 +80,28 @@ class Categorical(Distribution):
         return self._logits.argmax(dim=self.dim)
 
 
+class IndependentStudentT(Distribution):
+    arg_constraints = StudentT.arg_constraints
+    has_rsample = False
+    
+    def __init__(self, loc, scale, df, validate_args=None):
+        super().__init__(validate_args=validate_args)
+        self.studentt = StudentT(loc=loc, scale=scale, df=df, validate_args=validate_args)
+        self.dist = Independent(self.studentt, 1)
+    
+    def __getattribute__(self, name):
+        # Avoid infinite recursion
+        if name in ['studentt', 'dist', 'arg_constraints', 'has_rsample']:
+            return super().__getattribute__(name)
+        return getattr(self.dist, name)
+    
+    def expand(self, batch_shape, _instance=None):
+        new = self._get_checked_instance(IndependentStudentT, _instance)
+        new.studentt = self.studentt.expand(batch_shape)
+        new.dist = self.dist.expand(batch_shape)
+        return new
+
+
 class Neural(nn.Module, ABC):
 
     _dist_factory: type[Distribution] = None
@@ -332,7 +354,7 @@ class Neural(nn.Module, ABC):
         mod_flat = mod.reshape(-1, n_states)
         x_flat = x_tensor.reshape(-1, 1)
 
-        logp = F.log_softmax(mod_flat, dim=-1).gather(-1, x_flat).squeeze(-1)
+        logp = nnF.log_softmax(mod_flat, dim=-1).gather(-1, x_flat).squeeze(-1)
         return logp.view(*x_tensor.shape)
 
     def sample(self,
@@ -345,7 +367,7 @@ class Neural(nn.Module, ABC):
         s = dist.sample()
 
         if s.dtype in [torch.int64, torch.long] or s.ndim == 0:
-            s = F.one_hot(s, num_classes=n_states)
+            s = nnF.one_hot(s, num_classes=n_states)
         if s.shape[-1] != n_states:
             s = s.view(*s.shape[:-1], n_states)
         return s
@@ -360,7 +382,7 @@ class Neural(nn.Module, ABC):
         s = dist.rsample() if getattr(dist, "has_rsample", False) else dist.sample()
 
         if s.dtype in [torch.int64, torch.long] or s.ndim == 0:
-            s = F.one_hot(s, num_classes=n_states)
+            s = nnF.one_hot(s, num_classes=n_states)
         if s.shape[-1] != n_states:
             s = s.view(*s.shape[:-1], n_states)
         return s
@@ -370,7 +392,7 @@ class Neural(nn.Module, ABC):
         temperature: Optional[float] = None,
         timestep: Optional[int] = None, **kwargs) -> torch.Tensor:
         mod_logits = self._modulate(context=context, temperature=temperature, timestep=timestep, **kwargs)
-        return F.softmax(mod_logits, dim=-1)
+        return nnF.softmax(mod_logits, dim=-1)
 
     def mode(self,
         context: Optional[torch.Tensor] = None,
@@ -382,7 +404,7 @@ class Neural(nn.Module, ABC):
             return dist.mode
         if hasattr(dist, "probs"):
             return dist.probs.argmax(-1)
-        return torch.argmax(F.softmax(dist.logits, dim=-1), dim=-1)
+        return torch.argmax(nnF.softmax(dist.logits, dim=-1), dim=-1)
 
     def _validate_base(self, base: torch.Tensor) -> torch.Tensor:
         base = torch.clamp(base, -MAX_LOGITS, MAX_LOGITS)
@@ -394,8 +416,23 @@ class Neural(nn.Module, ABC):
     def _context_hash(self, context: Optional[torch.Tensor]) -> str:
         if context is None:
             return f"none-v{int(self._param_version.item())}"
-        sample = context.detach().float().flatten()[::max(1, context.numel() // 1024)]
-        return f"{hashlib.sha256(sample.cpu().numpy().tobytes()).hexdigest()[:12]}-v{int(self._param_version.item())}"
+        
+        with torch.no_grad():
+            flat = context.detach().flatten().float()
+            n_samples = min(1024, flat.numel())
+            
+            # Deterministic sampling using fixed stride
+            if flat.numel() > n_samples:
+                stride = max(1, flat.numel() // n_samples)
+                sample = flat[::stride][:n_samples]
+            else:
+                sample = flat
+            
+            import struct
+            bytes_data = struct.pack(f'{sample.numel()}f', *sample.cpu().numpy())
+            hash_val = hashlib.sha256(bytes_data).hexdigest()[:16]
+
+        return f"{hash_val}-v{int(self._param_version.item())}"
 
     def _cache_set(self, key: str, value: torch.Tensor) -> None:
         self._cache[key] = value
@@ -464,9 +501,6 @@ class Initial(Neural):
             logits = torch.log(w / w.sum())
         elif mode == "normal":
             logits = torch.randn(self._shape) * 0.1
-        elif mode == "dirichlet":
-            probs = torch.distributions.Dirichlet(torch.full((self.n_states,), self.alpha)).sample()
-            logits = torch.log(probs.clamp_min(EPS))
         else:
             raise ValueError(f"Unknown init_mode '{mode}'")
 
@@ -488,8 +522,8 @@ class Initial(Neural):
         temperature: Optional[float] = None,
         jitter: float = 1e-5, **dist_kwargs) -> Distribution:
 
-        logits = self._init_params(mode=mode, context=context, jitter=jitter)
-        self.logits = nn.Parameter(logits)
+        init_logits = self._init_params(mode=mode, context=context, jitter=jitter)
+        self.logits = nn.Parameter(init_logits, requires_grad=True)
         return self._get_dist(context=context, temperature=temperature, timestep=None, **dist_kwargs)
 
     def _apply_constraints(self, logits: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -563,12 +597,6 @@ class Duration(Neural):
             logits = torch.randn(*self._shape) * 0.1
             decay = torch.arange(self.max_duration) * 0.05
             logits = logits - decay.unsqueeze(0)
-        elif mode == "dirichlet":
-            logits_list = []
-            for i in range(self.n_states):
-                probs = torch.distributions.Dirichlet(torch.full((self.max_duration,), self.alpha)).sample()
-                logits_list.append(torch.log(probs.clamp_min(EPS)))
-            logits = torch.stack(logits_list, dim=0)
         else:
             raise ValueError(f"Unknown init_mode '{mode}'")
 
@@ -590,7 +618,7 @@ class Duration(Neural):
         jitter: float = 1e-5, **dist_kwargs) -> Distribution:
 
         init_logits = self._init_params(mode)
-        self.logits = nn.Parameter(init_logits)
+        self.logits = nn.Parameter(init_logits, requires_grad=True)
         return self._get_dist(context=context, temperature=temperature, timestep=None, **dist_kwargs)
 
     def _apply_constraints(self, logits: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -606,12 +634,7 @@ class Duration(Neural):
         timestep: Optional[int] = None,
         T: Optional[int] = None, **kwargs) -> torch.Tensor:
 
-        mod = self._modulate(
-            context=context,
-            temperature=temperature,
-            timestep=timestep,
-            **kwargs
-        )
+        mod = self._modulate(context=context, temperature=temperature, timestep=timestep, **kwargs)
         # mod: [B, T, K, D]   (duration)
         # or   [B, T, K, K]   (transition)
 
@@ -708,28 +731,11 @@ class Transition(Neural):
             if D > 1:
                 decay = torch.arange(D) * 0.05  # decay over duration
                 logits = logits - decay.view(1, D, 1)
-        elif mode == "dirichlet":
-            if D == 1:
-                logits_list = []
-                for k in range(K):
-                    probs = torch.distributions.Dirichlet(torch.full((K,), self.alpha)).sample()
-                    logits_list.append(torch.log(probs.clamp_min(EPS)))
-                logits = torch.stack(logits_list, dim=0)
-            else:
-                logits_list = []
-                for k in range(K):
-                    probs_list = []
-                    for d in range(D):
-                        probs = torch.distributions.Dirichlet(torch.full((K,), self.alpha)).sample()
-                        probs_list.append(torch.log(probs.clamp_min(EPS)))
-                    logits_list.append(torch.stack(probs_list, dim=0))
-                logits = torch.stack(logits_list, dim=0)  # shape (K, D, K)
         else:
             raise ValueError(f"Unknown init_mode '{mode}'")
 
         if context is not None and self.context_net is not None:
             ctx_delta = self.context_net(context.mean(dim=0))
-            # ensure ctx_delta can broadcast to logits shape
             logits = logits + ctx_delta.view(*([1]*(logits.ndim - ctx_delta.ndim)), *ctx_delta.shape)
 
         if jitter > 0.0:
@@ -747,7 +753,7 @@ class Transition(Neural):
         jitter: float = 1e-5, **dist_kwargs) -> Distribution:
 
         init_logits = self._init_params(mode)
-        self.logits = nn.Parameter(init_logits)
+        self.logits = nn.Parameter(init_logits, requires_grad=True)
         return self._get_dist(context=context, temperature=temperature, timestep=None, **dist_kwargs)
 
     def _apply_constraints(self, logits: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -790,12 +796,7 @@ class Transition(Neural):
         temperature: Optional[float] = None,
         timestep: Optional[int] = None, T: Optional[int] = None, **kwargs) -> torch.Tensor:
 
-        mod = self._modulate(
-            context=context,
-            temperature=temperature,
-            timestep=timestep,
-            **kwargs
-        )
+        mod = self._modulate(context=context, temperature=temperature, timestep=timestep, **kwargs)
         # mod shape:
         #   duration=None      -> [B, T, K, K]
         #   duration!=None     -> [B, T, K, D, K]
@@ -847,23 +848,23 @@ class Emission(Neural):
         self.n_states = n_states
         self.n_features = n_features
         self.emission_type = emission_type
-        self.min_covar = min_covar
         self.init_mode = init_mode
+        self.min_covar = min_covar
 
         if emission_type == "gaussian":
             self._dist_factory = MultivariateNormal
         elif emission_type == "studentt":
             self.dof = nn.Parameter(torch.full((n_states,), 5.0))
-            self._dist_factory = lambda **kwargs: Independent(StudentT(**kwargs), 1)
+            self._dist_factory = IndependentStudentT
         else:
             raise ValueError(f"Unsupported emission_type: {emission_type}")
 
         if self.emission_type == "gaussian":
-            self.log_var = nn.Parameter(torch.full((self.n_states, self.n_features), -1.0))
             self.mu = nn.Parameter(torch.randn(self.n_states, self.n_features) * 0.1)
+            self.log_var = nn.Parameter(torch.full((self.n_states, self.n_features), -1.0))
         else:
-            self.scale_param = nn.Parameter(torch.full((self.n_states, self.n_features), 0.1))
             self.loc = nn.Parameter(torch.randn(self.n_states, self.n_features) * 0.1)
+            self.scale_param = nn.Parameter(torch.full((self.n_states, self.n_features), 0.1))
 
     @property
     def base(self):
@@ -899,19 +900,18 @@ class Emission(Neural):
 
             if self.emission_type == "studentt":
                 df_delta = self.context_net(ctx)
-                df = F.softplus(self.dof + df_delta) + 2.0
+                df = nnF.softplus(self.dof + df_delta) + 2.0
                 self.dof.copy_(df)
 
-        # Variance initialization (feature-wise spread)
         mean_spread = init_mean.std(dim=0, keepdim=True).clamp_min(self.min_covar)
         init_var = mean_spread**2 + torch.rand(self.n_states, self.n_features) * jitter
 
         if self.emission_type == "gaussian":
-            self.mu.copy_(init_mean)
-            self.log_var.copy_(torch.log(init_var))
+            self.mu = nn.Parameter(init_mean, requires_grad=True)
+            self.log_var = nn.Parameter(torch.log(init_var), requires_grad=True)
         else:
-            self.loc.copy_(init_mean)
-            self.scale_param.copy_(init_var.sqrt())
+            self.loc = nn.Parameter(init_mean, requires_grad=True)
+            self.scale_param = nn.Parameter(init_var.sqrt(), requires_grad=True)
 
         self._reset_buffers()
         self._invalidate_cache()
@@ -921,7 +921,7 @@ class Emission(Neural):
     def initialize(self,
         mode: Optional[str] = "spread",
         context: Optional[torch.Tensor] = None,
-        temperature: Optional[torch.Tensor] = None,
+        temperature: Optional[float] = None,
         jitter: float = 1e-5, **dist_kwargs) -> Distribution:
         base = self._init_params(mode, context, jitter)
         return self._dist(**self._dist_params(base, **dist_kwargs))
@@ -974,7 +974,12 @@ class Emission(Neural):
             var = nnF.softplus(self.log_var).clamp_min(self.min_covar)  # [K, F]
             cov = torch.diag_embed(var)                                                  # [K, F, F]
             cov = cov[None, None, :, :, :].expand(B, T, K, n_feat, n_feat)              # [B, T, K, F, F]
-            return {"loc": loc, "covariance_matrix": cov, **dist_kwargs}
+            return {
+                "loc": loc,
+                "covariance_matrix": cov,
+                # "scale_tril": torch.diag_embed(var.sqrt()),
+                **dist_kwargs
+            }
 
         elif self.emission_type == "studentt":
             scale = nnF.softplus(self.scale_param).clamp_min(self.min_covar)  # [K, F]
@@ -994,7 +999,11 @@ class Emission(Neural):
         dist = self._get_dist(context=context, temperature=temperature, **dist_kwargs)
         if return_dist: return dist
         if self.emission_type == "gaussian":
-            return self._tensor_shape(dist.mean), self._tensor_shape(dist.covariance_matrix)
+            if hasattr(dist, 'covariance_matrix'):
+                cov = dist.covariance_matrix
+            elif hasattr(dist, 'scale_tril'):
+                cov = dist.scale_tril @ dist.scale_tril.transpose(-1, -2)
+            return self._tensor_shape(dist.mean), self._tensor_shape(cov)
         return self._tensor_shape(dist.loc), self._tensor_shape(dist.scale)
 
     def log_prob(self,
@@ -1024,5 +1033,5 @@ class Emission(Neural):
         return logp
 
     def log_matrix(self, *args, **kwargs) -> torch.Tensor:
-        raise NotImplementedError
+        raise NotImplementedError("Emission distributions don't have a log_matrix representation")
 

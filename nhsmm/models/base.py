@@ -251,9 +251,10 @@ class HSMM(nn.Module):
             timestep=timestep,
             T=T,
         )
-        initial_logits = self.dist.initial.log_matrix(context=router.canonical, **kwargs)       # [B,1,K]        
-        duration_logits = self.dist.duration.log_matrix(context=router.context, **kwargs)       # [B,T,K,Dmax]
-        transition_logits = self.dist.transition.log_matrix(context=router.context, **kwargs)   # [B,T,K,K]
+        with torch.autocast(device_type=device.type):
+            initial_logits = self.dist.initial.log_matrix(context=router.canonical, **kwargs)       # [B,1,K]        
+            duration_logits = self.dist.duration.log_matrix(context=router.context, **kwargs)       # [B,T,K,Dmax]
+            transition_logits = self.dist.transition.log_matrix(context=router.context, **kwargs)   # [B,T,K,K]
 
         # --- Cumulative emission sums ---
         cumsum_emit = torch.zeros((B, T + 1, K), device=device)
@@ -426,17 +427,18 @@ class HSMM(nn.Module):
                 predicted.append(router.log_probs.new_empty(0, dtype=torch.long))
                 continue
 
-            initial_logits = self.dist.initial.log_matrix(
-                context=router.canonical[b:b + 1], T=L
-            )[0, 0]
-            duration_logits = self.dist.duration.log_matrix(
-                context=router.context[b:b + 1, :L], T=L,
-                soft_dmax=self.soft_dmax
-            )[0]
-            transition_logits = self.dist.transition.log_matrix(
-                context=router.context[b:b + 1, :L], T=L,
-                soft_dmax=self.soft_dmax
-            )[0]
+            with torch.autocast(device_type=router.log_probs.device.type):
+                initial_logits = self.dist.initial.log_matrix(
+                    context=router.canonical[b:b + 1], T=L
+                )[0, 0]
+                duration_logits = self.dist.duration.log_matrix(
+                    context=router.context[b:b + 1, :L], T=L,
+                    soft_dmax=self.soft_dmax
+                )[0]
+                transition_logits = self.dist.transition.log_matrix(
+                    context=router.context[b:b + 1, :L], T=L,
+                    soft_dmax=self.soft_dmax
+                )[0]
 
             emit_log = router.log_probs[b, :L]
             cumsum_emit = torch.zeros((L + 1, K), device=emit_log.device)

@@ -18,8 +18,8 @@ You are an expert technical writer for this project.
   - `tests/` – Unit, Integration, and Playwright tests
 
 ## Commands you can use
-Build docs: `npm run docs:build` (checks for broken links)
-Lint markdown: `npx markdownlint docs/` (validates your work)
+Build docs: `python -m build` (checks for broken links)
+Lint markdown: `python -m docs/` (validates your work)
 
 ## Documentation practices
 Be concise, specific, and value dense
@@ -28,4 +28,4 @@ Write so that a new developer to this codebase can understand your writing, don�
 ## Boundaries
 - ✅ **Always do:** Write new files to `docs/`, follow the style examples, run markdownlint
 - ⚠️ **Ask first:** Before modifying existing documents in a major way
-- 🚫 **Never do:** Modify code in `src/`, edit config files, commit secrets
+- 🚫 **Never do:** Modify code in `nhsmm/`, edit config files, commit secrets
