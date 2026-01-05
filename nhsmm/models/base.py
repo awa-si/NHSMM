@@ -1,5 +1,3 @@
-# nhsmm/models/base.py
-
 from __future__ import annotations
 from typing import Optional, List, Tuple, Any, Literal, Dict, Union
 from abc import ABC, abstractmethod
@@ -8,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as nnF
 
-from nhsmm import Convergence, DefaultEncoder, DefaultDistribution, HSMMConfig
+from nhsmm import Convergence, DefaultDistribution, DefaultEncoder, HSMMConfig
 from nhsmm.distributions import Initial, Duration, Transition, Emission
 from nhsmm.context import ContextEncoder, ContextRouter, SequenceSet
 from nhsmm.config import DTYPE, EPS, logger, MAX_LOGITS, NEG_INF
@@ -18,20 +16,17 @@ class HSMM(nn.Module):
 
     def __init__(self, config: HSMMConfig, encoder: Optional[nn.Module] = None):
         super().__init__()
-
+        self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.config = config
         if self.config.seed is not None:
             torch.manual_seed(self.config.seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(self.config.seed)
 
-        self.debug = self.config.debug
-        self.n_states = self.config.n_states
-        self.n_features = self.config.n_features
-        self.soft_dmax = nn.Parameter(torch.ones(self.n_states, self.config.max_duration)) # shape [K, Dmax], initialized to 1
+        self.debug = config.debug
         self.dist: Optional[DefaultDistribution] = None
+        self.soft_dmax = nn.Parameter(torch.ones(config.n_states, config.max_duration))
 
         self.init_enc(encoder=encoder)
         self.to(device=self.device, dtype=DTYPE)
@@ -41,9 +36,9 @@ class HSMM(nn.Module):
         self.hidden_dim = self.config.hidden_dim
 
         if encoder is None:
-            hidden_dim = max(32, min(64, self.n_features * 2))
+            hidden_dim = max(32, min(64, self.config.n_features * 2))
             encoder = DefaultEncoder(
-                n_features=self.n_features,
+                n_features=self.config.n_features,
                 cnn_channels=self.config.cnn_channels,
                 hidden_dim=hidden_dim,
             )
@@ -53,10 +48,10 @@ class HSMM(nn.Module):
             n_heads=self.config.n_heads,
             dropout=self.config.dropout,
         ).to(device=self.device, dtype=DTYPE)
-        self.encoder.eval()
 
         try:
-            dummy = torch.zeros(1, 16, self.n_features)
+            self.encoder.eval()
+            dummy = torch.zeros(1, 16, self.config.n_features)
             try:
                 _, ctx, _ = self.encoder(dummy, return_context=True, return_sequence=True)
                 inferred_dim = ctx.shape[-1]
@@ -85,21 +80,21 @@ class HSMM(nn.Module):
         elif self.dist is None:
             self.dist = DefaultDistribution(
                 initial=Initial(
-                    n_states=self.n_states,
+                    n_states=self.config.n_states,
                     hidden_dim=self.hidden_dim,
                     context_dim=self.context_dim,
                     init_mode=self.config.init_mode,
                 ),
                 duration=Duration(
-                    n_states=self.n_states,
+                    n_states=self.config.n_states,
                     hidden_dim=self.hidden_dim,
                     context_dim=self.context_dim,
                     max_duration=self.config.max_duration,
                     init_mode=self.config.init_mode,
                 ),
                 transition=Transition(
-                    n_states=self.n_states,
-                    n_features=self.n_features,
+                    n_states=self.config.n_states,
+                    n_features=self.config.n_features,
                     hidden_dim=self.hidden_dim,
                     context_dim=self.context_dim,
                     transition_type=self.config.transition_type,
@@ -107,8 +102,8 @@ class HSMM(nn.Module):
                     init_mode=self.config.init_mode,
                 ),
                 emission=Emission(
-                    n_states=self.n_states,
-                    n_features=self.n_features,
+                    n_states=self.config.n_states,
+                    n_features=self.config.n_features,
                     hidden_dim=self.hidden_dim,
                     context_dim=self.context_dim,
                     min_covar=self.config.min_covar,
@@ -117,11 +112,10 @@ class HSMM(nn.Module):
                 )
             )
 
-        self.dist.to(device=self.device, dtype=DTYPE)
 
         try:
-            params = self.dist.initialize(context)
-            # self._params.update(params)
+            self.dist.to(device=self.device, dtype=DTYPE)
+            self.dist.initialize(context)
         except Exception as err:
             raise RuntimeError(f"Failed to initialize HSMM PDFs: {err}") from err
 
@@ -147,7 +141,7 @@ class HSMM(nn.Module):
 
         B, T, F = X.shape
 
-        if F != self.n_features:
+        if F != self.config.n_features:
             raise ValueError(f"Feature dimension mismatch: expected {self.n_features}, got {F}")
 
         if mask is None:
@@ -217,7 +211,7 @@ class HSMM(nn.Module):
             canonical = context_tensor[:, :1]
 
         # ---------- emissions ----------
-        K = self.n_states
+        K = self.config.n_states
 
         if T == 0:
             log_probs = X.new_empty(B, 0, K)
@@ -413,7 +407,7 @@ class HSMM(nn.Module):
         X: SequenceSet,
         context: Optional[Union[torch.Tensor, ContextRouter]] = None) -> list[torch.Tensor]:
 
-        K = self.n_states
+        K = self.config.n_states
         Dmax = self.dist.duration.max_duration
 
         router = context if isinstance(context, ContextRouter) else ContextRouter.from_tensor(X, theta=context)
