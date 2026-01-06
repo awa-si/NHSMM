@@ -1,8 +1,6 @@
 from __future__ import annotations
 from typing import Optional, Union, Literal, Tuple, Dict, Any
-from collections import OrderedDict
 from abc import ABC, abstractmethod
-import hashlib
 import math
 
 import torch
@@ -171,7 +169,6 @@ class Neural(nn.Module, ABC):
         self.allow_projection = allow_projection
 
         self.activation_fn = self._get_activation(activation)
-        self._cache: OrderedDict[str, torch.Tensor] = OrderedDict()
         self.final_activation_fn = self._get_activation(final_activation)
 
         self._proj: Optional[nn.Linear] = None
@@ -320,6 +317,7 @@ class Neural(nn.Module, ABC):
 
         base = self._tensor_shape(self.base)
         delta = self._apply_context(base, context, timestep)
+
         mod = self._apply_constraints(base + delta, mask=kwargs.get("mask", None))
         mod = self._apply_temperature(mod, temperature)
         mod = self._validate_base(mod)
@@ -335,10 +333,6 @@ class Neural(nn.Module, ABC):
 
     @abstractmethod
     def _apply_constraints(self, *args, **kwargs) -> torch.Tensor:
-        pass
-
-    @abstractmethod
-    def log_matrix(self, *args, **kwargs) -> torch.Tensor:
         pass
 
     def _dist_params(self, logits: torch.Tensor, **dist_kwargs) -> Dict[str, torch.Tensor]:
@@ -454,7 +448,6 @@ class Initial(Neural):
         context_dim: Optional[int] = None,
     ):
         self._shape = (n_states,)
-
         super().__init__(
             target_dim=n_states,
             hidden_dim=hidden_dim,
@@ -463,7 +456,6 @@ class Initial(Neural):
             final_activation="tanh",
             activation="tanh",
         )
-
         self.n_states = n_states
         self.init_mode = init_mode
         self._init_params(mode=init_mode)
@@ -530,6 +522,7 @@ class Initial(Neural):
 
 
 class Duration(Neural):
+
     _dist_factory = Categorical
 
     def __init__(
@@ -640,6 +633,7 @@ class Duration(Neural):
 
 
 class Transition(Neural):
+
     _dist_factory = Categorical
 
     def __init__(
@@ -680,9 +674,10 @@ class Transition(Neural):
         context: Optional[torch.Tensor] = None,
         jitter: float = 1e-5) -> torch.Tensor:
 
-        K = self.n_states
         mode = mode or self.init_mode
         D = self.max_duration
+        K = self.n_states
+
         shape = (K, D, K) if D > 1 else (K, K)
 
         if mode == "uniform":
@@ -713,10 +708,10 @@ class Transition(Neural):
 
         if jitter > 0.0:
             logits = logits + torch.randn_like(logits) * jitter
+
         return logits
 
-    def initialize(
-        self,
+    def initialize(self,
         mode: Optional[str] = None,
         context: Optional[torch.Tensor] = None,
         temperature: Optional[float] = None,
@@ -767,10 +762,6 @@ class Transition(Neural):
         timestep: Optional[int] = None, T: Optional[int] = None, **kwargs) -> torch.Tensor:
 
         mod = self._modulate(context=context, temperature=temperature, timestep=timestep, **kwargs)
-        # mod shape:
-        #   duration=None      -> [B, T, K, K]
-        #   duration!=None     -> [B, T, K, D, K]
-
         soft_dmax = kwargs.get("soft_dmax", None)
 
         if soft_dmax is not None and self.max_duration is not None:
@@ -936,14 +927,12 @@ class Emission(Neural):
                 # "scale_tril": torch.diag_embed(var.sqrt()),
                 **dist_kwargs
             }
-
         elif self.emission_type == "studentt":
             scale = nnF.softplus(self.scale_param).clamp_min(self.min_covar)  # [K, F]
             df = nnF.softplus(self.dof) + 2.0                                 # [K]
             scale = scale[None, None, :, :].expand(B, T, K, n_feat)                            # [B, T, K, F]
             df = df[None, None, :, None].expand(B, T, K, n_feat)                                # [B, T, K, F]
             return {"loc": loc, "scale": scale, "df": df, **dist_kwargs}
-
         else:
             raise ValueError(f"Unsupported emission_type: {self.emission_type}")
 
@@ -954,6 +943,7 @@ class Emission(Neural):
 
         dist = self._get_dist(context=context, temperature=temperature, **dist_kwargs)
         if return_dist: return dist
+
         if self.emission_type == "gaussian":
             if hasattr(dist, 'covariance_matrix'):
                 cov = dist.covariance_matrix
@@ -988,6 +978,4 @@ class Emission(Neural):
         if logp.ndim == 4: logp = logp.sum(-1)              # [B, T, K]
         return logp
 
-    def log_matrix(self, *args, **kwargs) -> torch.Tensor:
-        raise NotImplementedError("Emission distributions don't have a log_matrix representation")
 

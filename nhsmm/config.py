@@ -29,7 +29,7 @@ NEG_INF: float = torch.finfo(DTYPE).min
 
 
 @dataclass
-class HSMMConfig:
+class ModelConfig:
     n_states: int
     n_features: int
     n_heads: int = 4
@@ -49,7 +49,7 @@ class HSMMConfig:
     debug: bool = False
 
 
-class DefaultDistribution(nn.Module):
+class DistributionSet(nn.Module):
     """
     Convenience container for all HSMM distributions.
     Provides a unified initialization interface.

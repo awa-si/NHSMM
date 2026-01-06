@@ -4,7 +4,7 @@ NHSMM Example: Market Regime Detection on OHLCV Data
 
 This script demonstrates:
 1. Synthetic or real OHLCV data generation/loading.
-2. Contextual HSMM initialization with neural encoder.
+2. Contextual NHSMM initialization with neural encoder.
 3. EM-style training for regime detection.
 4. Viterbi decoding and evaluation.
 5. Diagnostic inspection of durations, transitions, and occupancy.
@@ -29,7 +29,7 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 from scipy.optimize import linear_sum_assignment
 import matplotlib.pyplot as plt
 
-from nhsmm import HSMM, HSMMConfig, DefaultDistribution
+from nhsmm import NHSMM, ModelConfig, DistributionSet
 from nhsmm.config import DTYPE, EPS, logger
 
 
@@ -207,8 +207,8 @@ if __name__ == "__main__":
     X_scaled = scaler.fit_transform(X)
     X_torch = torch.tensor(X_scaled, dtype=DTYPE)
 
-    # --- Create HSMM configuration ---
-    config = HSMMConfig(
+    # --- Create NHSMM configuration ---
+    config = ModelConfig(
         n_states=n_states,
         n_features=n_features,
         max_duration=MAX_DURATION,
@@ -217,21 +217,21 @@ if __name__ == "__main__":
         modulate_var=True,
         min_covar=1e-6,
     )
+    # --- Initialize NHSMM ---
+    model = NHSMM(config=config)
     # --- Optionally create a custom distribution (or leave None to use defaults) ---
-    dist = None  # or pass a pre-built DefaultDistribution()
-    # --- Initialize HSMM ---
-    model = HSMM(config=config)
-    model.init_dist(dist=dist)
+    dist = None  # or pass a pre-built DistributionSet()
+    model.initialize_distributions(dist=dist)
 
     # --- Training ---
     t0 = time.time()
     print("\n=== Model Training ===")
-    model.fit(X_torch, n_init=INIT_MAX, tol=1e-5, max_iter=MAX_ITER, verbose=True)
+    model.optimize(X_torch, n_init=INIT_MAX, tol=1e-5, max_iter=MAX_ITER, verbose=True)
     elapsed = time.time() - t0
 
     # --- Decode hidden states ---
     print("\n=== Decoding ===")
-    v_path = model.decode(X_torch, algorithm="viterbi")
+    v_path = model.decode(X_torch, mode="viterbi")
 
     # --- Evaluate accuracy if labels available ---
     if true_states is not None:
@@ -247,7 +247,7 @@ if __name__ == "__main__":
         f1 = f1_score(true_states, mapped_pred, average="macro", zero_division=0)
         prec = precision_score(true_states, mapped_pred, average="macro", zero_division=0)
         rec = recall_score(true_states, mapped_pred, average="macro", zero_division=0)
-        ll = model.score(X_torch).item()
+        ll = model.log_likelihood(X_torch).item()
 
         print("\nMetrics:")
         print(f" F1: {f1:.4f} | Precision: {prec:.4f} | Recall: {rec:.4f}")

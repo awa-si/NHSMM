@@ -1,12 +1,12 @@
-from .config import HSMMConfig, DefaultDistribution
+from .config import ModelConfig, DistributionSet
 from .convergence import Convergence
 from .encoder import DefaultEncoder
-from .models import HSMM
+from .models import NHSMM
 
 __all__ = [
-    'DefaultDistribution',
+    'ModelConfig',
+    'DistributionSet',
     'DefaultEncoder',
     'Convergence',
-    'HSMMConfig',
-    'HSMM',
+    'NHSMM',
 ]

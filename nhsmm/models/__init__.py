@@ -1,5 +1,5 @@
-from .base import HSMM
+from .base import NHSMM
 
 __all__ = [
-    'HSMM',
+    'NHSMM',
 ]
