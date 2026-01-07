@@ -23,20 +23,20 @@ if not logger.hasHandlers():
 # Constants
 # --------------------------
 EPS: float = 1e-12
-MAX_LOGITS: float = 1e5
 DTYPE = torch.float32
+MAX_LOGITS: float = 1e5
 NEG_INF: float = torch.finfo(DTYPE).min
-
 
 @dataclass
 class ModelConfig:
     n_states: int
     n_features: int
-    n_heads: int = 4
-    dropout: float = 0.0
+    n_heads: int = 3
+    cnn_kernel: int = 3
+    cnn_channels: int = 5
+    dropout: float = 0.05
     max_duration: int = 35
     min_covar: float = 1e-6
-    cnn_channels: int = 5
     temperature: float = 1.0
     modulate_var: bool = False
     hidden_dim: Optional[int] = None

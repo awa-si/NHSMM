@@ -177,6 +177,9 @@ class Neural(nn.Module, ABC):
             nn.init.xavier_uniform_(self._proj.weight)
             nn.init.zeros_(self._proj.bias)
 
+        if not hasattr(self, "_shape"):
+            raise TypeError(f"{self.__class__.__name__} must define self._shape before super().__init__")
+
         prod_shape = hasattr(self, '_shape') and int(math.prod(self._shape))
         if prod_shape != self.target_dim:
             raise ValueError(f"target_dim ({self.target_dim}) != prod(_shape) ({prod_shape})")
@@ -602,30 +605,21 @@ class Duration(Neural):
         T: Optional[int] = None, **kwargs) -> torch.Tensor:
 
         mod = self._modulate(context=context, temperature=temperature, timestep=timestep, **kwargs)
-        # mod: [B, T, K, D]   (duration)
-        # or   [B, T, K, K]   (transition)
-
         soft_dmax = kwargs.get("soft_dmax", None)
 
         if soft_dmax is not None:
             gate = torch.sigmoid(soft_dmax).clamp_min(EPS)
-
             if gate.ndim == 1:
                 # [D] → global duration gate
                 mod = mod + gate.log().view(1, 1, 1, -1)
-
             elif gate.ndim == 2:
                 # [K, D] → state-dependent duration gate
                 mod = mod + gate.log().view(1, 1, *gate.shape)
-
             else:
                 raise ValueError("soft_dmax must have shape [D] or [K, D]")
 
         logp = nnF.log_softmax(mod, dim=-1)
-
-        while logp.ndim < 4:
-            logp = logp.unsqueeze(0)
-
+        while logp.ndim < 4: logp = logp.unsqueeze(0)
         if T is not None and logp.shape[1] == 1:
             logp = logp.expand(-1, T, *logp.shape[2:])
 
@@ -725,36 +719,64 @@ class Transition(Neural):
         n = self.n_states
         D = getattr(self, "max_duration", None)
         device = logits.device
+        dtype = torch.bool
 
+        # Soft bias parameter for encouraging preferred transitions
+        SOFT_BIAS = 2.0  # logit boost for preferred transitions
+
+        # --- Build constraint mask ---
         if self.transition_type == "ergodic":
-            constraint = None  # no restriction
+            # unconstrained
+            if D is None:
+                constraint = torch.ones(n, n, device=device, dtype=dtype)
+            else:
+                constraint = torch.ones(n, D, n, device=device, dtype=dtype)
+
         elif self.transition_type == "semi":
             if D is None:
-                constraint = torch.eye(n, device=device, dtype=torch.bool)  # [K,K]
+                constraint = torch.eye(n, device=device, dtype=dtype)
+                for i in range(n - 1):
+                    constraint[i, i + 1] = True
             else:
-                constraint = torch.zeros(n, D, n, device=device, dtype=torch.bool)
+                constraint = torch.zeros(n, D, n, device=device, dtype=dtype)
                 for k in range(n):
-                    constraint[k, :, k] = True  # allow self-transitions across all durations
+                    constraint[k, :, k] = True
+                    if k < n - 1:
+                        constraint[k, :, k + 1] = True
+
         elif self.transition_type == "left-to-right":
             if D is None:
-                constraint = torch.tril(torch.ones(n, n, device=device, dtype=torch.bool), diagonal=0)
+                constraint = torch.tril(torch.ones(n, n, device=device, dtype=dtype), diagonal=0)
             else:
-                constraint = torch.zeros(n, D, n, device=device, dtype=torch.bool)
+                constraint = torch.zeros(n, D, n, device=device, dtype=dtype)
                 for k in range(n):
-                    for to_state in range(k+1):
-                        constraint[k, :, to_state] = True
+                    constraint[k, :, k] = True
+                    for to_state in range(k + 1, n):
+                        if to_state <= k + 2:
+                            constraint[k, :, to_state] = True
         else:
             raise ValueError(f"Unsupported transition_type: {self.transition_type}")
 
+        # --- Apply external mask if provided ---
         if mask is not None:
-            mask = mask.to(device=device, dtype=torch.bool)
+            mask = mask.to(device=device, dtype=dtype)
             while mask.ndim < logits.ndim:
                 mask = mask.unsqueeze(0)
-            constraint = mask if constraint is None else (constraint & mask)
+            constraint = constraint & mask if constraint is not None else mask
 
-        if constraint is None: return logits
+        # --- Apply soft bias instead of hard masking ---
+        if constraint is None:
+            return logits
+
         constraint = constraint.view((1,) * (logits.ndim - constraint.ndim) + constraint.shape)
-        return logits.masked_fill(~constraint, NEG_INF)
+
+        # Boost preferred transitions
+        soft_logits = logits + (constraint.float() * SOFT_BIAS)
+
+        # Optionally hard mask invalid transitions if needed
+        soft_logits = soft_logits.masked_fill(~constraint, NEG_INF)
+
+        return soft_logits
 
     def log_matrix(self,
         context: Optional[torch.Tensor] = None,
@@ -858,13 +880,12 @@ class Emission(Neural):
                 delta = delta.view(self.n_states, self.n_features)
             init_mean = init_mean + delta
 
-            if self.emission_type == "studentt":
-                df_delta = self.context_net(ctx)
-                df = nnF.softplus(self.dof + df_delta) + 2.0
-                self.dof.copy_(df)
+            if self.emission_type == "studentt" and context is not None:
+                with torch.no_grad():
+                    self.dof.data.clamp_(min=2.1)
 
-        mean_spread = init_mean.std(dim=0, keepdim=True).clamp_min(self.min_covar)
-        init_var = mean_spread**2 + torch.rand(self.n_states, self.n_features) * jitter
+        init_var = torch.full((self.n_states, self.n_features), 1.0, device=init_mean.device)
+        init_var += torch.rand_like(init_var) * jitter
 
         if self.emission_type == "gaussian":
             self.mu = nn.Parameter(init_mean, requires_grad=True)
@@ -909,6 +930,8 @@ class Emission(Neural):
         grad_scale: Optional[float] = None) -> torch.Tensor:
 
         delta = super()._apply_context(base, context=context, timestep=timestep, grad_scale=grad_scale)
+        delta = delta - delta.mean(dim=-2, keepdim=True)
+
         if grad_scale is not None: delta = delta * grad_scale
         return delta
 
@@ -916,22 +939,25 @@ class Emission(Neural):
         if loc.ndim == 2:  # [K, F] -> [1, 1, K, F]
             loc = loc.unsqueeze(0).unsqueeze(0)
 
+        loc = loc - loc.mean(dim=2, keepdim=True)
         B, T, K, n_feat = loc.shape
+
         if self.emission_type == "gaussian":
             var = nnF.softplus(self.log_var).clamp_min(self.min_covar)  # [K, F]
-            cov = torch.diag_embed(var)                                                  # [K, F, F]
-            cov = cov[None, None, :, :, :].expand(B, T, K, n_feat, n_feat)              # [B, T, K, F, F]
+            scale = torch.diag_embed(var.sqrt())      # [K,F,F]
+            scale = scale[None, None, :, :, :]        # [1,1,K,F,F]
+            scale = scale.expand(B, T, K, n_feat, n_feat)
             return {
                 "loc": loc,
-                "covariance_matrix": cov,
-                # "scale_tril": torch.diag_embed(var.sqrt()),
+                "scale_tril": scale,
                 **dist_kwargs
             }
         elif self.emission_type == "studentt":
             scale = nnF.softplus(self.scale_param).clamp_min(self.min_covar)  # [K, F]
             df = nnF.softplus(self.dof) + 2.0                                 # [K]
             scale = scale[None, None, :, :].expand(B, T, K, n_feat)                            # [B, T, K, F]
-            df = df[None, None, :, None].expand(B, T, K, n_feat)                                # [B, T, K, F]
+            df = df[None, None, :, None]  # [1,1,K,1]
+            df = df.expand(B, T, K, 1)
             return {"loc": loc, "scale": scale, "df": df, **dist_kwargs}
         else:
             raise ValueError(f"Unsupported emission_type: {self.emission_type}")
@@ -963,7 +989,7 @@ class Emission(Neural):
         B, T, F = x.shape
         K = self.n_states
 
-        dist = self._get_dist(context=context, temperature=temperature, **dist_kwargs)
+        dist = self._get_dist(context=context, temperature=None, **dist_kwargs)
         if F != self.n_features:
             raise ValueError(f"Feature mismatch: input F={F}, expected {self.n_features}")
 
@@ -976,6 +1002,7 @@ class Emission(Neural):
 
         logp = dist.log_prob(x_exp)          # [B, T, K] or [B, T, K, F]
         if logp.ndim == 4: logp = logp.sum(-1)              # [B, T, K]
-        return logp
 
+        assert torch.isfinite(logp).all(), "NaN/Inf in emission log-prob"
+        return logp
 

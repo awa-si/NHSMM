@@ -17,25 +17,25 @@ class DefaultEncoder(nn.Module):
     def __init__(
         self,
         n_features: int,
-        kernel_size: int = 3,
+        cnn_kernel: int = 3,
         hidden_dim: int = 32,
         cnn_channels: int = 16,
         bidirectional: bool = True,
         return_sequence: bool = True,
         use_packed: bool = True,
-        dropout: float = 0.1,
+        dropout: float = 0.05,
     ):
         super().__init__()
         self.n_features = n_features
         self.hidden_dim = hidden_dim
         self.cnn_channels = cnn_channels
-        self.kernel_size = kernel_size
-        self.padding = kernel_size // 2
+        self.cnn_kernel = cnn_kernel
+        self.padding = cnn_kernel // 2
         self.bidirectional = bidirectional
         self.return_sequence = return_sequence
         self.use_packed = use_packed
 
-        self.conv = nn.Conv1d(n_features, cnn_channels, kernel_size, padding=self.padding)
+        self.conv = nn.Conv1d(n_features, cnn_channels, cnn_kernel, padding=self.padding)
         nn.init.kaiming_normal_(self.conv.weight, nonlinearity="relu")
         if self.conv.bias is not None:
             nn.init.zeros_(self.conv.bias)

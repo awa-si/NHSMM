@@ -281,6 +281,7 @@ if __name__ == "__main__":
             mean_dur = float((np.arange(1, len(row)+1) * row).sum())
             print(f"  {label_map[i]:<6} | mode={mode_dur}, mean={mean_dur:.2f}, total_prob={row.sum():.2f}")
 
+
         # ---- Transition matrix ----
         log_trans = model.dist.transition.log_matrix()  # [B,T,K,K] or [B,T,K,D,K]
         if log_trans.ndim == 5:  # [B,T,K,D,K]
