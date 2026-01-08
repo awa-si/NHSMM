@@ -7,10 +7,71 @@ import torch.nn as nn
 import torch.nn.functional as nnF
 from torch.nn.utils.rnn import pad_sequence
 
-from nhsmm import Convergence, DistributionSet, DefaultEncoder, ModelConfig
-from nhsmm.distributions import Initial, Duration, Transition, Emission
+from nhsmm import Convergence, DefaultEncoder
 from nhsmm.context import ContextEncoder, ContextRouter, SequenceSet
-from nhsmm.config import DTYPE, EPS, logger, MAX_LOGITS, NEG_INF
+from nhsmm.distributions import Initial, Duration, Transition, Emission
+from nhsmm.config import DTYPE, EPS, logger, MIN_LOGITS, MAX_LOGITS, NEG_INF, ModelConfig
+
+
+class DistributionSet(nn.Module):
+    """
+    Convenience container for all HSMM distributions.
+    Provides a unified initialization interface.
+    """
+
+    def __init__(
+        self,
+        config: Optional[ModelConfig] = None,
+        initial: Optional[nn.Module] = Initial,
+        duration: Optional[nn.Module] = Duration,
+        transition: Optional[nn.Module] = Transition,
+        emission: Optional[nn.Module] = Emission,
+    ):
+        super().__init__()
+        self.config = config
+        self.initial=Initial(
+            hidden_dim=self.config.hidden_dim,
+            context_dim=self.config.context_dim,
+            n_states=self.config.n_states,
+            init_mode=self.config.initial_init_mode,
+            activation=self.config.activation,
+        )
+        self.duration=Duration(
+            hidden_dim=self.config.hidden_dim,
+            context_dim=self.config.context_dim,
+            n_states=self.config.n_states,
+            max_duration=self.config.max_duration,
+            init_mode=self.config.duration_init_mode,
+            activation=self.config.activation,
+        )
+        self.transition=Transition(
+            hidden_dim=self.config.hidden_dim,
+            context_dim=self.config.context_dim,
+            n_states=self.config.n_states,
+            n_features=self.config.n_features,
+            transition_type=self.config.transition_type,
+            init_mode=self.config.transition_init_mode,
+            max_duration=self.config.max_duration, # if None, standard HMM
+            activation=self.config.activation,
+        )
+        self.emission=Emission(
+            hidden_dim=self.config.hidden_dim,
+            context_dim=self.config.context_dim,
+            n_states=self.config.n_states,
+            min_covar=self.config.min_covar,
+            n_features=self.config.n_features,
+            emission_type=self.config.emission_type,
+            init_mode=self.config.emission_init_mode,
+            activation=self.config.activation,
+        )
+
+    def initialize(self, context: Optional[torch.Tensor] = None, jitter: float = 1e-5) -> Dict[str, Any]:
+        return {
+            "initial": self.initial.initialize(context=context, jitter=jitter),
+            "duration": self.duration.initialize(context=context, jitter=jitter),
+            "transition": self.transition.initialize(context=context, jitter=jitter),
+            "emission": self.emission.initialize(context=context, jitter=jitter),
+        }
 
 
 class NHSMM(nn.Module):
@@ -26,6 +87,9 @@ class NHSMM(nn.Module):
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(self.config.seed)
 
+        self.context_dim = self.config.context_dim
+        self.hidden_dim = self.config.hidden_dim
+
         self.debug: bool = config.debug
         self.dist: Optional[DistributionSet] = None
         self.duration_logits_bias = nn.Parameter(torch.ones(config.n_states, config.max_duration))
@@ -34,8 +98,6 @@ class NHSMM(nn.Module):
         self.to(device=self.device, dtype=DTYPE)
 
     def initialize_encoder(self, encoder: Optional[nn.Module] = None) -> None:
-        self.context_dim = self.config.context_dim
-        self.hidden_dim = self.config.hidden_dim
 
         if encoder is None:
             hidden_dim = max(32, min(64, self.config.n_features * 2))
@@ -74,51 +136,22 @@ class NHSMM(nn.Module):
         finally:
             self.encoder.train()
 
+        self.config.context_dim = self.context_dim
+        self.config.hidden_dim = self.hidden_dim
+
     def initialize_distributions(self,
-        context: Optional[torch.Tensor] = None,
+        context: Optional[torch.Tensor] = None, jitter: float = 1e-5,
         dist: Optional[DistributionSet] = None) -> None:
 
         if dist is not None:
-            self.dist = dist
+            self.dist = dist(config=self.config)
 
         elif self.dist is None:
-            self.dist = DistributionSet(
-                initial=Initial(
-                    n_states=self.config.n_states,
-                    hidden_dim=self.hidden_dim,
-                    context_dim=self.context_dim,
-                    init_mode=self.config.init_mode,
-                ),
-                duration=Duration(
-                    n_states=self.config.n_states,
-                    hidden_dim=self.hidden_dim,
-                    context_dim=self.context_dim,
-                    max_duration=self.config.max_duration,
-                    init_mode=self.config.init_mode,
-                ),
-                transition=Transition(
-                    n_states=self.config.n_states,
-                    n_features=self.config.n_features,
-                    hidden_dim=self.hidden_dim,
-                    context_dim=self.context_dim,
-                    transition_type=self.config.transition_type,
-                    max_duration=self.config.max_duration, # if None, standard HMM
-                    init_mode=self.config.init_mode,
-                ),
-                emission=Emission(
-                    n_states=self.config.n_states,
-                    n_features=self.config.n_features,
-                    hidden_dim=self.hidden_dim,
-                    context_dim=self.context_dim,
-                    min_covar=self.config.min_covar,
-                    emission_type=self.config.emission_type,
-                    init_mode=self.config.init_mode,
-                )
-            )
+            self.dist = DistributionSet(config=self.config)
 
         try:
             self.dist.to(device=self.device, dtype=DTYPE)
-            self.dist.initialize(context)
+            self.dist.initialize(context, jitter)
         except Exception as err:
             raise RuntimeError(f"Failed to initialize NHSMM PDFs: {err}") from err
 
@@ -204,7 +237,7 @@ class NHSMM(nn.Module):
         # Expand cumsum_emit for gather: [B,T+1,K] -> [B,T+1,K,1]
         cumsum_expand = cumsum_emit.unsqueeze(-1).expand(B, T+1, K, Dmax)
         emit_sums = cumsum_expand.gather(1, end_idx) - cumsum_expand.gather(1, start_idx)  # [B,T,K,Dmax]
-        emit_sums = emit_sums.clamp(min=NEG_INF, max=MAX_LOGITS)
+        emit_sums = emit_sums.clamp(min=MIN_LOGITS, max=MAX_LOGITS)
 
         # --- Initialize alpha tensor ---
         alpha = torch.full((B, T, K, Dmax), NEG_INF, device=device)
@@ -256,116 +289,6 @@ class NHSMM(nn.Module):
         length_mask = torch.arange(T, device=device).unsqueeze(0) < X.lengths.unsqueeze(1)
         alpha = alpha.masked_fill(~length_mask.unsqueeze(-1).unsqueeze(-1), NEG_INF)
         return alpha
-
-    def _compute_loss(self,
-        X: torch.Tensor, context: torch.Tensor = None,
-        loss_bias: float = 1e-3, it: int = 0, max_iter: int = 20,
-        t_min: float = 0.5, t_max: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
-
-        k = 10 / max_iter
-        temperature = t_min + (t_max - t_min) / (1 + math.exp(k * (it - max_iter / 2)))
-
-        seq_set = self._build_sequence_set(X, context=context)
-        alpha = self.forward(seq_set, temperature=temperature)  # [B, T, K, D]
-        lengths = seq_set.lengths
-
-        log_likelihoods = alpha.new_full((len(seq_set.sequences),), NEG_INF)
-        valid = lengths > 0
-        if valid.any():
-            last_alpha = alpha[valid, lengths[valid] - 1]  # [N_valid, K, D]
-            log_likelihoods[valid] = torch.logsumexp(last_alpha.flatten(1), dim=1)
-
-        ll = log_likelihoods.sum()
-
-        # --- Duration bias regularization ---
-        loss = -ll
-        loss += loss_bias * nnF.relu(
-            self.duration_logits_bias[:, 1:] - self.duration_logits_bias[:, :-1]
-        ).mean()
-
-        return ll, loss
-
-    def optimize(self,
-        X: Union[torch.Tensor, List[torch.Tensor]],
-        context: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-        n_init: int = 1,
-        tol: float = 1e-4,
-        max_iter: int = 20,
-        loss_bias: float = 1e-3,
-        lr: float = 1e-2,
-        verbose: bool = True,
-        use_scheduler: bool = True):
-
-        if self.dist is None:
-            raise RuntimeError("Distributions not initialized")
-
-        # convert X and context to padded tensors
-        X, context = self._ensure_tensor(X), self._ensure_tensor(context)
-
-        self._convergence = Convergence(
-            tol=tol,
-            patience=1,
-            rel_tol=tol,
-            n_init=n_init,
-            max_iter=max_iter,
-            verbose=verbose,
-        )
-
-        best_score = -float("inf")
-        for run_idx in range(n_init):
-            prev_ll = self._initialize_run_state(run_idx, context=context)
-            if verbose:
-                print(f"\n=== Run {run_idx + 1}/{n_init} ===")
-
-            params = [
-                p
-                for name in ["initial", "transition", "duration", "emission"]
-                for p in getattr(self.dist, name).parameters()
-                if p.requires_grad
-            ] + [self.duration_logits_bias]
-
-            self._optimizer = torch.optim.Adam(params, lr=lr)
-            scheduler = (
-                torch.optim.lr_scheduler.ReduceLROnPlateau(
-                    self._optimizer, mode="max", factor=0.5, patience=5
-                )
-                if use_scheduler else None
-            )
-
-            for it in range(max_iter):
-                self._optimizer.zero_grad()
-                ll, loss = self._compute_loss(
-                    X, context=context, loss_bias=loss_bias, it=it, max_iter=max_iter
-                )
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(params, max_norm=5.0)
-                self._optimizer.step()
-
-                ll_val = ll.item()
-                self._convergence.update(ll_val, it, run_idx)
-
-                if scheduler is not None:
-                    scheduler.step(ll_val)
-
-                if verbose:
-                    delta = ll_val - prev_ll if prev_ll is not None else float("nan")
-                    print(f"[Iter {it:03d}] LL={ll_val:.6f} Δ={delta:.3e}")
-
-                if self._convergence.converged_flags[run_idx]:
-                    if verbose:
-                        print(f"[Run {run_idx + 1}] Converged at iteration {it}.")
-                    break
-
-                prev_ll = ll_val
-
-            if ll_val > best_score:
-                best_score = ll_val
-                self._snapshot_best_params()
-
-        if n_init > 1:
-            self._restore_best_params()
-
-        return self
 
     def _viterbi(self,
         X: SequenceSet,
@@ -464,7 +387,6 @@ class NHSMM(nn.Module):
         context: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
         reduce: bool = False) -> torch.Tensor:
 
-        # --- Ensure tensors and mask ---
         X, context = self._ensure_tensor(X), self._ensure_tensor(context)
         B, T, F = X.shape
 
@@ -483,63 +405,18 @@ class NHSMM(nn.Module):
             last_alpha = alpha[valid, lengths[valid]-1]        # [N_valid, K, D]
             log_likelihoods[valid] = torch.logsumexp(last_alpha.flatten(1), dim=1)
 
-        # --- Safety against NaN / Inf ---
         log_likelihoods = torch.nan_to_num(
             log_likelihoods,
             nan=NEG_INF,
-            neginf=NEG_INF,
-            posinf=MAX_LOGITS
+            neginf=NEG_INF
         )
-
         return log_likelihoods.sum() if reduce else log_likelihoods
-
-    def _initialize_run_state(self, run_idx: int, context: Optional[torch.Tensor] = None) -> None:
-        for name in ["initial", "transition", "duration", "emission"]:
-            module = getattr(self.dist, name)
-            if getattr(self, "_best_state", None) and name in self._best_state:
-                module.load_state_dict(self._best_state[name])
-            else:
-                module.initialize(context=context)
-
-        if self.encoder is not None:
-            if getattr(self, "_best_state", None) and "encoder" in self._best_state:
-                self.encoder.load_state_dict(self._best_state["encoder"])
-            else:
-                self.encoder.reset()
-
-        if getattr(self, "_convergence", None):
-            if len(self._convergence.converged_flags) <= run_idx:
-                self._convergence.converged_flags.extend([False] * (run_idx + 1 - len(self._convergence.converged_flags)))
-            else:
-                self._convergence.converged_flags[run_idx] = False
-
-    def _snapshot_best_params(self, context: Optional[torch.Tensor] = None):
-        self._best_state = {
-            name: getattr(self.dist, name).state_dict()
-            for name in ["initial", "duration", "transition", "emission"]
-        }
-        if self.encoder is not None:
-            self._best_state["encoder"] = self.encoder.state_dict()
-
-    def _restore_best_params(self):
-        if not hasattr(self, "_best_state"):
-            raise RuntimeError("No best parameters have been snapshotted")
-
-        if self.encoder is not None and "encoder" in self._best_state:
-            self.encoder.load_state_dict(self._best_state["encoder"])
-
-        for name in ["initial", "transition", "duration", "emission"]:
-            module = getattr(self.dist, name)
-            if self._best_state.get(name):
-                module.load_state_dict(self._best_state[name])
 
     def predict(self,
         X: Union[torch.Tensor, List[torch.Tensor]],
         context: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-        mode: Literal["viterbi", "log_likelihood"] = "viterbi",
-        verbose: bool = True) -> torch.Tensor | list[torch.Tensor]:
+        mode: Literal["viterbi", "log_likelihood"] = "viterbi", verbose: bool = True) -> torch.Tensor | list[torch.Tensor]:
 
-        # --- Ensure X and context are padded tensors ---
         X, context = self._ensure_tensor(X), self._ensure_tensor(context)
         B, T, F = X.shape
 
@@ -547,12 +424,11 @@ class NHSMM(nn.Module):
             return [torch.empty(0, dtype=torch.long, device=X.device) for _ in range(B)]
 
         if verbose:
-            print(f"[Predict] Sequences: {B}, max_len: {T}")
+            logger.info(f"[Predict] Sequences: {B}, max_len: {T}")
 
         seq_set = self._build_sequence_set(X, context=context)
         router = ContextRouter.from_tensor(seq_set, context=context)
 
-        # --- Viterbi decoding ---
         if mode == "viterbi":
             results = [torch.empty(0, dtype=torch.long, device=X.device) for _ in range(B)]
             nonzero_idx = torch.nonzero(seq_set.lengths, as_tuple=False).squeeze(-1)
@@ -574,19 +450,18 @@ class NHSMM(nn.Module):
     def decode(self,
         X: Union[torch.Tensor, List[torch.Tensor]],
         context: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
-        mode: Literal["viterbi"] = "viterbi",
-        first_only: bool = True, verbose: bool = True) -> Union[torch.Tensor, list[torch.Tensor]]:
+        mode: Literal["viterbi"] = "viterbi", first_only: bool = True, verbose: bool = True) -> Union[torch.Tensor, list[torch.Tensor]]:
 
         B = X.shape[0] if X.ndim == 3 else 1
         if verbose:
-            logger.debug(f"[decode] mode={mode}, batch_size={B}")
+            logger.info(f"[decode] mode={mode}, batch_size={B}")
 
         preds = self.predict(X, mode=mode, context=context, verbose=verbose)
         return preds[0] if first_only and B == 1 else preds
 
     def _ensure_tensor(self,
         X: Union[torch.Tensor, List[torch.Tensor], None],
-        pad_value: float = 0.0, return_mask: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.BoolTensor], None]:
+        return_mask: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.BoolTensor], None]:
 
         if X is None:
             return (None, None) if return_mask else None
@@ -609,7 +484,7 @@ class NHSMM(nn.Module):
 
             X_tensors = [torch.as_tensor(x, device=device) for x in X]
             lengths = [x.shape[0] for x in X_tensors]
-            X_padded = pad_sequence(X_tensors, batch_first=True, padding_value=pad_value)
+            X_padded = pad_sequence(X_tensors, batch_first=True, padding_value=self.config.pad_value)
             mask = torch.zeros(X_padded.shape[:2], dtype=torch.bool, device=device)
             for i, L in enumerate(lengths):
                 mask[i, :L] = 1
@@ -618,4 +493,173 @@ class NHSMM(nn.Module):
         raise TypeError(f"Unsupported type: {type(X)}")
 
 
+    # Default training
+    def _initialize_run_state(self, run_idx: int, context: Optional[torch.Tensor] = None) -> None:
+        """
+        Initialize distributions and encoder for a new run.
+        Warm-starts from previous best parameters if available.
+        Resets convergence flags for this initialization.
+        """
+        # Warm start distributions
+        for name in ("initial", "transition", "duration", "emission"):
+            module = getattr(self.dist, name)
+            if hasattr(self, "_best_state") and name in self._best_state:
+                module.load_state_dict(self._best_state[name])
+            else:
+                module.initialize(context=context)
+
+        # Warm start encoder
+        if self.encoder is not None:
+            if hasattr(self, "_best_state") and "encoder" in self._best_state:
+                self.encoder.load_state_dict(self._best_state["encoder"])
+            else:
+                self.encoder.reset()
+
+        # Reset convergence flag for this run
+        if hasattr(self, "_convergence"):
+            if run_idx >= len(self._convergence.converged_flags):
+                # Extend the flag array if needed
+                self._convergence.converged_flags = torch.cat([
+                    self._convergence.converged_flags,
+                    torch.zeros(run_idx + 1 - len(self._convergence.converged_flags), dtype=torch.bool)
+                ])
+            else:
+                self._convergence.converged_flags[run_idx] = False
+
+    def _snapshot_best_params(self):
+        """Save current model parameters for warm-starting and restoring best run."""
+        self._best_state = {
+            name: getattr(self.dist, name).state_dict()
+            for name in ("initial", "duration", "transition", "emission")
+        }
+        if self.encoder is not None:
+            self._best_state["encoder"] = self.encoder.state_dict()
+
+    def _restore_best_params(self):
+        """Restore parameters from the best run."""
+        if not hasattr(self, "_best_state"):
+            raise RuntimeError("No best parameters snapshot available.")
+
+        if self.encoder is not None and "encoder" in self._best_state:
+            self.encoder.load_state_dict(self._best_state["encoder"])
+
+        for name in ("initial", "transition", "duration", "emission"):
+            module = getattr(self.dist, name)
+            if name in self._best_state:
+                module.load_state_dict(self._best_state[name])
+
+    def _compute_loss(self,
+        X: torch.Tensor, context: torch.Tensor = None,
+        loss_bias: float = 1e-3, it: int = 0, max_iter: int = 20,
+        t_min: float = 0.3, t_max: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
+
+        seq_set = self._build_sequence_set(X, context=context)
+        temperature = t_min + (t_max - t_min) / (1 + math.exp((10 / max_iter) * (it - max_iter / 2)))
+        alpha = self.forward(seq_set, temperature=temperature)  # [B, T, K, D]
+        lengths = seq_set.lengths
+
+        log_likelihoods = alpha.new_full((len(seq_set.sequences),), NEG_INF)
+        valid = lengths > 0
+        if valid.any():
+            last_alpha = alpha[valid, lengths[valid] - 1]  # [N_valid, K, D]
+            log_likelihoods[valid] = torch.logsumexp(last_alpha.flatten(1), dim=1)
+
+        ll = log_likelihoods.sum()
+
+        # --- Duration bias regularization ---
+        loss = -ll
+        loss += loss_bias * nnF.relu(
+            self.duration_logits_bias[:, 1:] - self.duration_logits_bias[:, :-1]
+        ).mean()
+
+        return ll, loss
+
+    def optimize(self,
+        X: Union[torch.Tensor, List[torch.Tensor]],
+        context: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
+        cfg: Optional[ModelConfig] = None):
+        """
+        Optimize NHSMM parameters using the provided configuration.
+
+        Args:
+            X: Input sequences (tensor or list of tensors)
+            context: Optional context features
+            cfg: ModelConfig object controlling learning and convergence
+        """
+        if self.dist is None:
+            raise RuntimeError("Distributions not initialized.")
+
+        cfg = cfg or self.config
+        X, context = self._ensure_tensor(X), self._ensure_tensor(context)
+
+        # Initialize convergence monitor
+        self._convergence = Convergence(
+            tol=cfg.tol,
+            rel_tol=cfg.tol,
+            n_init=cfg.n_init,
+            max_iter=cfg.max_iter,
+            mode=cfg.convergence_mode,
+            plateau_tol=cfg.plateau_tol,
+            early_stop=cfg.convergence_stop,
+            plateau_window=cfg.plateau_window,
+            patience=max(1, cfg.plateau_window // 2),
+            verbose=cfg.verbose,
+        )
+
+        best_score = -float("inf")
+        for run_idx in range(cfg.n_init):
+            self._initialize_run_state(run_idx, context=context)
+
+            if cfg.verbose:
+                logger.info(f"\n=== Run {run_idx + 1}/{cfg.n_init} ===")
+
+            params = [
+                p
+                for name in ("initial", "transition", "duration", "emission")
+                for p in getattr(self.dist, name).parameters()
+                if p.requires_grad
+            ] + [self.duration_logits_bias]
+
+            self._optimizer = torch.optim.Adam(params, lr=cfg.lr)
+            if cfg.use_scheduler:
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    self._optimizer,
+                    mode="max",
+                    factor=0.5,
+                    patience=max(2, cfg.plateau_window // 2),
+                )
+                self._convergence.attach_scheduler(scheduler)
+
+            prev_ll = None
+            for it in range(cfg.max_iter):
+                self._optimizer.zero_grad()
+                ll, loss = self._compute_loss(
+                    X, context=context, loss_bias=cfg.loss_bias, it=it, max_iter=cfg.max_iter
+                )
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(params, 5.0)
+                self._optimizer.step()
+
+                ll_val = float(ll.item())
+                converged = self._convergence.update(ll_val, it, run_idx)
+
+                if cfg.verbose:
+                    delta = ll_val - prev_ll if prev_ll is not None else float("nan")
+                    logger.info(f"[Iter {it:03d}] LL={ll_val:.6f} Δ={delta:.3e}")
+
+                if converged:
+                    if cfg.verbose:
+                        logger.info(f"[Run {run_idx + 1}] Converged at iteration {it}.")
+                    break
+
+                prev_ll = ll_val
+
+            if ll_val > best_score:
+                best_score = ll_val
+                self._snapshot_best_params()
+
+        if cfg.n_init > 1:
+            self._restore_best_params()
+
+        return self
 

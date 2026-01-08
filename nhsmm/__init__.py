@@ -1,7 +1,7 @@
-from .config import ModelConfig, DistributionSet
-from .convergence import Convergence
+from .config import ModelConfig
 from .encoder import DefaultEncoder
-from .models import NHSMM
+from .convergence import Convergence
+from .models import NHSMM, DistributionSet
 
 __all__ = [
     'ModelConfig',

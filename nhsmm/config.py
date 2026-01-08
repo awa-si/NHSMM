@@ -7,9 +7,7 @@ import logging
 import torch
 import torch.nn as nn
 
-# --------------------------
-# Logging configuration
-# --------------------------
+
 logger = logging.getLogger("NHSMM")
 if not logger.hasHandlers():
     logger.setLevel(logging.INFO)
@@ -19,16 +17,19 @@ if not logger.hasHandlers():
     ch.setFormatter(formatter)
     logger.addHandler(ch)
 
-# --------------------------
-# Constants
-# --------------------------
+
 EPS: float = 1e-12
 DTYPE = torch.float32
-MAX_LOGITS: float = 1e5
 NEG_INF: float = torch.finfo(DTYPE).min
+MIN_LOGITS: float = NEG_INF
+MAX_LOGITS: float = 1e5
+
 
 @dataclass
 class ModelConfig:
+    # -----------------------------
+    # Model architecture
+    # -----------------------------
     n_states: int
     n_features: int
     n_heads: int = 3
@@ -36,60 +37,48 @@ class ModelConfig:
     cnn_channels: int = 5
     dropout: float = 0.05
     max_duration: int = 35
+    pad_value: float = 0.0
     min_covar: float = 1e-6
     temperature: float = 1.0
     modulate_var: bool = False
     hidden_dim: Optional[int] = None
+
+    # -----------------------------
+    # Encoder
+    # -----------------------------
     context_dim: Optional[int] = None
     pool: Literal["mean", "last", "max", "attn", "mha"] = "mean"
+
+    # -----------------------------
+    # HMM / Distribution
+    # -----------------------------
+    emission_init_mode: Literal["randome", "spread"] = "spread"
+    initial_init_mode: Literal["normal", "biased", "uniform"] = "normal"
+    duration_init_mode: Literal["normal", "biased", "uniform"] = "normal"
+    transition_init_mode: Literal["normal", "biased", "uniform"] = "normal"
     transition_type: Literal["ergodic", "semi", "left-to-right"] = "ergodic"
-    init_mode: Literal["normal", "biased", "dirichlet", "uniform"] = "normal"
+    activation: Literal["leaky_relu", "identity", "softplus", "gelu", "relu", "tanh"] = "tanh"
     emission_type: Literal["gaussian", "studentt"] = "gaussian"
+
+    # -----------------------------
+    # General
+    # -----------------------------
     seed: Optional[int] = None
     debug: bool = False
 
+    # -----------------------------
+    # Optimization / Training
+    # -----------------------------
+    convergence_mode: Literal["delta", "plateau"] = "plateau"
+    n_init: int = 3
+    lr: float = 1e-2
+    tol: float = 1e-4
+    max_iter: int = 5
+    loss_bias: float = 1e-3
+    plateau_window: int = 6
+    plateau_tol: float = 1e-4
+    use_scheduler: bool = True
+    convergence_stop: bool = True
+    verbose: bool = True
 
-class DistributionSet(nn.Module):
-    """
-    Convenience container for all HSMM distributions.
-    Provides a unified initialization interface.
-    """
 
-    def __init__(
-        self,
-        initial: Optional[nn.Module] = None,
-        duration: Optional[nn.Module] = None,
-        transition: Optional[nn.Module] = None,
-        emission: Optional[nn.Module] = None,
-    ):
-        super().__init__()
-        self.initial = initial
-        self.duration = duration
-        self.transition = transition
-        self.emission = emission
-
-    def initialize(
-        self,
-        context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        jitter: float = 1e-5,
-        **dist_kwargs
-    ) -> Dict[str, Any]:
-        """
-        Initialize all component distributions with optional context and jitter.
-        Returns a dictionary of distribution parameters.
-        """
-        return {
-            "initial_dist": self.initial.initialize(
-                context=context, temperature=temperature, jitter=jitter, **dist_kwargs
-            ),
-            "duration_dist": self.duration.initialize(
-                context=context, temperature=temperature, jitter=jitter, **dist_kwargs
-            ),
-            "transition_dist": self.transition.initialize(
-                context=context, temperature=temperature, jitter=jitter, **dist_kwargs
-            ),
-            "emission_dist": self.emission.initialize(
-                context=context, temperature=temperature, jitter=jitter, **dist_kwargs
-            ),
-        }

@@ -29,16 +29,12 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 from scipy.optimize import linear_sum_assignment
 import matplotlib.pyplot as plt
 
-from nhsmm import NHSMM, ModelConfig, DistributionSet
-from nhsmm.config import DTYPE, EPS, logger
-
+from nhsmm import NHSMM, DistributionSet
+from nhsmm.config import DTYPE, EPS, logger, ModelConfig
 
 DEFAULT_RNG_SEED = 0
 DEFAULT_LABELS = ("range", "bull", "bear")
 
-# -----------------------------
-# Synthetic OHLCV generator
-# -----------------------------
 def generate_ohlcv(
     n_segments: int = 10,
     seg_len_low: int = 15,
@@ -76,10 +72,6 @@ def generate_ohlcv(
     label_map = {i: lbl for i, lbl in enumerate(DEFAULT_LABELS)}
     return states_arr, X_np, label_map
 
-
-# -----------------------------
-# Load OHLCV tensor from feather / IPC
-# -----------------------------
 def generate_pseudo_states(X: np.ndarray, bull_thresh: float = 0.001, bear_thresh: float = -0.001, window: int = 5):
     """
     Generate heuristic pseudo-states from OHLCV data.
@@ -146,10 +138,6 @@ def load_ohlcv_tensor(
 
     return X, true_states, label_map
 
-
-# -----------------------------
-# Accuracy / permutation metrics
-# -----------------------------
 def best_permutation_accuracy(
     true: np.ndarray | list,
     pred: torch.Tensor,
@@ -178,10 +166,6 @@ def best_permutation_accuracy(
 
     return acc, mapped_pred, mapping, readable
 
-
-# -----------------------------
-# Main execution
-# -----------------------------
 if __name__ == "__main__":
     torch.manual_seed(DEFAULT_RNG_SEED)
     np.random.seed(DEFAULT_RNG_SEED)
@@ -221,17 +205,18 @@ if __name__ == "__main__":
     model = NHSMM(config=config)
     # --- Optionally create a custom distribution (or leave None to use defaults) ---
     dist = None  # or pass a pre-built DistributionSet()
-    model.initialize_distributions(dist=dist)
+    # X_torch64 = torch.randn(X_torch.shape[0], X_torch.shape[1], 64)
+    model.initialize_distributions(context=None, dist=dist)
 
     # --- Training ---
     t0 = time.time()
     print("\n=== Model Training ===")
-    model.optimize(X_torch, n_init=INIT_MAX, tol=1e-5, max_iter=MAX_ITER, verbose=True)
+    model.optimize(X_torch, cfg=ModelConfig)
     elapsed = time.time() - t0
 
     # --- Decode hidden states ---
     print("\n=== Decoding ===")
-    v_path = model.decode(X_torch, mode="viterbi")
+    v_path = model.decode(X_torch, mode="viterbi", verbose=True)
 
     # --- Evaluate accuracy if labels available ---
     if true_states is not None:
