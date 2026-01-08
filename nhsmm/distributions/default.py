@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Optional, Union, Literal, Tuple, Dict, Any
+from typing import Optional, Union, Literal, Tuple, Dict, Any, Type
 from abc import ABC, abstractmethod
 import math
 
@@ -14,23 +14,22 @@ from nhsmm.config import EPS, logger, MIN_LOGITS, MAX_LOGITS, NEG_INF
 
 
 class Categorical(Distribution):
-
+    
     has_rsample = True
     arg_constraints = {
         "logits": torch.distributions.constraints.real,
         "probs": torch.distributions.constraints.simplex,
     }
 
-    def __init__(self, logits=None, probs=None, validate_args=False, dim=-1):
+    def __init__(self, logits: Optional[torch.Tensor] = None, probs: Optional[torch.Tensor] = None, dim=-1, validate_args=False):
         super().__init__(validate_args=validate_args)
         if (logits is None) == (probs is None):
             raise ValueError("Specify exactly one of logits or probs.")
 
         self.dim = dim
-
         if logits is not None:
             self._logits = logits
-            self._log_probs = nnF.log_softmax(logits, dim=self.dim)
+            self._log_probs = nnF.log_softmax(logits, dim=dim)
             self._probs = self._log_probs.exp()
         else:
             self._probs = probs / probs.sum(dim=dim, keepdim=True).clamp_min(EPS)
@@ -39,33 +38,40 @@ class Categorical(Distribution):
 
     @property
     def logits(self): return self._logits
+
     @property
     def probs(self): return self._probs
+
     @property
     def log_probs(self): return self._log_probs
+
     @property
     def mean(self): return self._probs
+
     @property
     def batch_shape(self): return self._logits.shape[:-1]
+
     @property
     def event_shape(self): return torch.Size()
 
     def sample(self, sample_shape=torch.Size()):
-        # Flatten batch for multinomial
-        batch_flat = self._probs.reshape(-1, self._probs.shape[-1])
+        shape = sample_shape + self.batch_shape
+        flat_probs = self._probs.reshape(-1, self._probs.shape[-1])
         n_samples = int(torch.prod(torch.tensor(sample_shape, dtype=torch.int64)))
-        idx = torch.multinomial(batch_flat, n_samples, replacement=True)
-        return idx.view(*sample_shape, *self.batch_shape).long()
+        idx = torch.multinomial(flat_probs, n_samples, replacement=True)
+        return idx.reshape(*shape).long()
 
     def rsample(self, sample_shape=torch.Size(), temperature: Optional[float] = None, hard: bool = False):
         tau = 1.0 if temperature is None else temperature
-        logits_exp = self._logits.unsqueeze(0).expand(*sample_shape, *self.batch_shape, self._logits.shape[-1])
-        return nnF.gumbel_softmax(logits_exp, tau=tau, hard=hard, dim=-1)
+        logits_exp = self._logits
+        if sample_shape:
+            logits_exp = logits_exp.expand(*sample_shape, *self.batch_shape, self._logits.shape[-1])
+        return F.gumbel_softmax(logits_exp, tau=tau, hard=hard, dim=-1)
 
     def log_prob(self, value: torch.Tensor):
         value = value.long()
-        gather_dim = self.dim if self.dim >= 0 else self._log_probs.ndim + self.dim
-        return self._log_probs.gather(gather_dim, value.unsqueeze(gather_dim)).squeeze(gather_dim)
+        dim = self.dim if self.dim >= 0 else self._log_probs.ndim + self.dim
+        return self._log_probs.gather(dim, value.unsqueeze(dim)).squeeze(dim)
 
     def entropy(self):
         p = self._probs.clamp_min(EPS)
@@ -76,21 +82,19 @@ class Categorical(Distribution):
 
 
 class IndependentStudentT(Distribution):
-
     has_rsample = True
     arg_constraints = {
         "loc": torch.distributions.constraints.real,
+        "df": torch.distributions.constraints.positive,
         "scale": torch.distributions.constraints.positive,
-        "df": torch.distributions.constraints.positive
     }
 
     def __init__(self, loc, scale, df, event_dim=1, validate_args=None):
         super().__init__(validate_args=validate_args)
-
-        self.event_dim = event_dim  # number of dimensions to treat as event
-        self.scale = scale
         self.loc = loc
+        self.scale = scale
         self.df = df
+        self.event_dim = event_dim  # number of trailing dims treated as event
 
     @property
     def batch_shape(self):
@@ -106,7 +110,7 @@ class IndependentStudentT(Distribution):
 
     @property
     def variance(self):
-        return self.scale ** 2 * self.df / (self.df - 2)
+        return self.scale**2 * self.df / (self.df - 2)
 
     @property
     def stddev(self):
@@ -116,8 +120,7 @@ class IndependentStudentT(Distribution):
         shape = sample_shape + torch.broadcast_shapes(self.loc.shape, self.scale.shape, self.df.shape)
         z = torch.randn(shape, device=self.loc.device, dtype=self.loc.dtype)
         v = torch.distributions.Chi2(self.df).rsample(shape)
-        y = self.loc + self.scale * z / torch.sqrt(v / self.df)
-        return y
+        return self.loc + self.scale * z / torch.sqrt(v / self.df)
 
     def sample(self, sample_shape=torch.Size()):
         with torch.no_grad():
@@ -126,16 +129,16 @@ class IndependentStudentT(Distribution):
     def log_prob(self, value):
         t = (value - self.loc) / self.scale
         df = self.df
-        log_unnormalized = -(df + 1) / 2 * torch.log1p(t ** 2 / df)
-        log_normalization = torch.lgamma((df + 1)/2) - torch.lgamma(df/2)
-        log_normalization -= 0.5 * torch.log(df * torch.pi) + torch.log(self.scale)
-        return log_unnormalized + log_normalization
+        log_unnormalized = -(df + 1) / 2 * torch.log1p(t**2 / df)
+        log_norm = torch.lgamma((df + 1)/2) - torch.lgamma(df/2) \
+                   - 0.5 * torch.log(df * torch.pi) - torch.log(self.scale)
+        return log_unnormalized + log_norm
 
     def entropy(self):
         df = self.df
-        return 0.5 * (df + 1) * (torch.digamma((df + 1)/2) - torch.digamma(df/2)) + \
-               torch.lgamma(df/2) - torch.lgamma((df+1)/2) + \
-               0.5 * torch.log(df * torch.pi) + torch.log(self.scale)
+        return 0.5 * (df + 1) * (torch.digamma((df + 1)/2) - torch.digamma(df/2)) \
+               + torch.lgamma(df/2) - torch.lgamma((df + 1)/2) \
+               + 0.5 * torch.log(df * torch.pi) + torch.log(self.scale)
 
     def expand(self, batch_shape, _instance=None):
         new = self._get_checked_instance(IndependentStudentT, _instance)
@@ -148,63 +151,62 @@ class IndependentStudentT(Distribution):
 
 class Neural(nn.Module, ABC):
 
-    _dist_factory: type[Distribution] = None
+    _dist_factory: Type[Distribution] = None
 
     def __init__(
         self,
-        target_dim: int,
-        activation: str = "tanh",
-        final_activation: str = "tanh",
-        context_dim: Optional[int] = None,
-        hidden_dim: Optional[int] = None,
-        allow_projection: bool = True,
-        delta_scale: float = 0.1,
-        max_delta: float = 0.5,
-        alpha: float = 1.0):
+        target_dim:int,
+        activation:str="tanh",
+        final_activation:str="tanh",
+        context_dim:Optional[int]=None,
+        hidden_dim:Optional[int]=None,
+        allow_projection:bool=True,
+        delta_scale:float=0.1,
+        max_delta:float=0.5,
+        alpha:float=1.0,
+    ):
         super().__init__()
 
-        self.alpha = alpha
-        self.max_delta = max_delta
-        self.target_dim = target_dim
-        self.context_dim = context_dim
-        self.allow_projection = allow_projection
-
-        self.activation_fn = self._get_activation(activation)
-        self.final_activation_fn = self._get_activation(final_activation)
-
-        self._proj: Optional[nn.Linear] = None
-        if allow_projection and context_dim is not None:
-            self._proj = nn.Linear(context_dim, context_dim, bias=True)
-            nn.init.xavier_uniform_(self._proj.weight)
-            nn.init.zeros_(self._proj.bias)
-
         if self._dist_factory is None:
-            raise TypeError(f"{self.__class__.__name__} must define self._dist_factory before super().__init__")
-
+            raise TypeError(f"{type(self).__name__} must define _dist_factory")
         if not hasattr(self, "_shape"):
-            raise TypeError(f"{self.__class__.__name__} must define self._shape before super().__init__")
+            raise TypeError(f"{type(self).__name__} must define _shape")
 
-        prod_shape = int(math.prod(self._shape))
-        if prod_shape != self.target_dim:
-            raise ValueError(f"target_dim ({self.target_dim}) != prod(_shape) ({prod_shape})")
+        if int(math.prod(self._shape)) != target_dim:
+            raise ValueError("target_dim != prod(_shape)")
 
-        self.context_net: Optional[nn.Sequential] = None
-        hidden_dim = hidden_dim or max(16, target_dim // 2, context_dim or target_dim)
-        if context_dim is not None and hidden_dim is not None:
-            out_dim = int(math.prod(self._shape))
-            self.context_net = nn.Sequential(
+        self.alpha=alpha
+        self.max_delta=max_delta
+        self.target_dim=target_dim
+        self.context_dim=context_dim
+
+        self.activation_fn=self._get_activation(activation)
+        self.final_activation_fn=self._get_activation(final_activation)
+
+        self._proj=(
+            nn.Linear(context_dim, context_dim)
+            if allow_projection and context_dim is not None else None
+        )
+
+        hidden_dim=hidden_dim or max(16, target_dim // 2, context_dim or target_dim)
+        self.context_net=(
+            nn.Sequential(
                 nn.Linear(context_dim, hidden_dim),
                 nn.LayerNorm(hidden_dim),
-                self.activation_fn,
-                nn.Linear(hidden_dim, out_dim),
+                self._get_activation(activation),
+                nn.Linear(hidden_dim, target_dim),
             )
-            self._init_weights(self.context_net)
+            if context_dim is not None else None
+        )
 
-        self.delta_scale = nn.Parameter(torch.tensor(delta_scale))
-        self.log_temperature = nn.Parameter(torch.zeros(()))
-        self.logits = nn.Parameter(torch.zeros(*self._shape), requires_grad=True)
+        self._init_weights(self.context_net)
+        self._init_weights(self._proj)
 
-    def _get_activation(self, name: str) -> nn.Module:
+        self.delta_scale=nn.Parameter(torch.tensor(delta_scale))
+        self.log_temperature=nn.Parameter(torch.zeros(()))
+        self.logits=nn.Parameter(torch.zeros(*self._shape))
+
+    def _get_activation(self, mode: str = "tanh") -> nn.Module:
         return {
             "tanh": nn.Tanh(),
             "relu": nn.ReLU(),
@@ -212,7 +214,7 @@ class Neural(nn.Module, ABC):
             "softplus": nn.Softplus(),
             "identity": nn.Identity(),
             "leaky_relu": nn.LeakyReLU(0.01),
-        }.get(name.lower(), nn.Identity())
+        }.get(mode.lower(), nn.Identity())
 
     def _init_weights(self, module: nn.Module) -> None:
         for m in module.modules():
@@ -230,91 +232,98 @@ class Neural(nn.Module, ABC):
         if value.shape != self._shape:
             raise ValueError(f"base shape {value.shape} does not match expected {self._shape}")
         self.logits.copy_(self._validate_base(value))
-        self._invalidate_cache()
 
-    @property
-    def _dist(self) -> type:
-        if self._dist_factory is None:
-            raise TypeError(f"{self.__class__.__name__} must define `_dist_factory`.")
-        return self._dist_factory
+    def _dist_params(self, logits: torch.Tensor, **dist_kwargs) -> Dict[str, torch.Tensor]:
+        return {"logits": logits, **dist_kwargs}
 
-    @_dist.setter
-    def _dist(self, value: type) -> None:
-        if not isinstance(value, type):
-            raise TypeError("_dist must be a distribution *class*")
-        self._dist_factory = value
+    def _get_dist(self, context=None, temperature=None, timestep=None, **dist_kwargs):
+        mod = self._modulate(context, temperature, timestep)
+        dist = self._dist_factory(**self._dist_params(mod, **dist_kwargs))
+        return dist
 
     def _tensor_shape(self, tensor: torch.Tensor) -> torch.Tensor:
         k = len(self._shape)
         if tensor.ndim < k:
             raise ValueError(f"Tensor ndim={tensor.ndim} < required trailing dims={k}")
         if tensor.shape[-k:] != self._shape:
-            tensor = tensor.view(*tensor.shape[:-k], *self._shape)
+            tensor = tensor.reshape(*tensor.shape[:-k], *self._shape)
         return tensor
 
     def _apply_temperature(self,
-        logits: torch.Tensor,
-        temperature: Optional[float] = None) -> torch.Tensor:
-        tau = torch.as_tensor(temperature, device=logits.device) if temperature is not None else self.log_temperature.exp()
-        tau = tau.clamp_min(1e-6)
+        logits: torch.Tensor, temperature: Optional[float] = None) -> torch.Tensor:
+        if temperature is None:
+            tau = self.log_temperature.exp()
+        else:
+            tau = torch.as_tensor(temperature, device=logits.device, dtype=logits.dtype)
+
+        tau = tau.clamp_min(torch.finfo(logits.dtype).eps)
         return logits / tau
 
     def _prepare_context(self, context: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if context is None:
             return None
-        if self.context_dim is not None and context.shape[-1] != self.context_dim:
-            raise ValueError(f"Unsupported context ndim={context.ndim}")
-        if context.ndim == 1:  # (H,)
-            return context.view(1, 1, -1)
-        elif context.ndim == 2:  # (B,H)
-            return context.unsqueeze(1)  # (B,1,H)
-        elif context.ndim == 3:  # (B,T,H)
-            return context
-        elif context.ndim == 4:  # (S,B,T,H)
-            return context
-        else:
+
+        if context.ndim not in (1, 2, 3, 4):
             raise ValueError(f"Unsupported context ndim={context.ndim}")
 
-    def _apply_context(
-        self,
+        if self.context_dim is not None and context.shape[-1] != self.context_dim:
+            raise ValueError(
+                f"context_dim mismatch: got {context.shape[-1]}, expected {self.context_dim}"
+            )
+
+        if context.ndim == 1:      # (H,)
+            return context.reshape(1, 1, -1)
+        if context.ndim == 2:      # (B,H)
+            return context.unsqueeze(1)
+        return context             # (B,T,H) or (S,B,T,H)
+
+    def _validate_base(self, base: torch.Tensor) -> torch.Tensor:
+        base = torch.clamp(base, MIN_LOGITS, MAX_LOGITS)
+        if not torch.isfinite(base).all():
+            bad_idx = (~torch.isfinite(base)).nonzero(as_tuple=True)
+            raise ValueError(f"Non-finite base at {bad_idx}")
+        return base
+
+    def _apply_context(self,
         base: torch.Tensor,
         context: Optional[torch.Tensor] = None,
-        timestep: Optional[int] = None,
-        grad_scale: Optional[float] = None) -> torch.Tensor:
+        timestep: Optional[int] = None, grad_scale: Optional[float] = None) -> torch.Tensor:
 
         if context is None or self.context_net is None:
             return torch.zeros_like(base)
 
-        ctx = self._prepare_context(context)
-        S, B, T, H = (ctx.shape if ctx.ndim == 4 else (1, *ctx.shape[:2], ctx.shape[-1]))
-
-        # Select timestep if provided
+        ctx = self._prepare_context(context)  # shape: (S,B,T,H) | (B,T,H) | (B,1,H)
         if timestep is not None:
-            t_idx = int(timestep) if not torch.is_tensor(timestep) else int(timestep.item())
-            ctx = ctx[:, :, t_idx:t_idx+1, :] if T > 1 else ctx
+            if ctx.ndim == 4:  # (S,B,T,H)
+                ctx = ctx[:, :, timestep:timestep + 1, :]
+            elif ctx.ndim == 3:  # (B,T,H)
+                ctx = ctx[:, timestep:timestep + 1, :]
+            elif ctx.ndim == 2:  # (B,1,H) or (1,H)
+                ctx = ctx  # already singleton, no change
+            else:
+                raise RuntimeError(f"Unsupported context ndim={ctx.ndim}")
 
-        # Optional projection
-        if self._proj is not None and self.allow_projection:
-            ctx = self._proj(ctx.reshape(-1, ctx.shape[-1])).view(*ctx.shape[:-1], -1)
-        elif self.context_dim is not None and ctx.shape[-1] != self.context_dim:
+        # Validate last dim matches context_dim
+        if self.context_dim is not None and ctx.shape[-1] != self.context_dim:
             raise ValueError(f"context_dim mismatch: got {ctx.shape[-1]}, expected {self.context_dim}")
 
-        # Deep context network
-        delta = self.context_net(ctx.reshape(-1, ctx.shape[-1]))
+        # Flatten for MLP
+        flat_ctx = ctx.reshape(-1, ctx.shape[-1])
 
-        expected = int(torch.prod(torch.tensor(self._shape)))
-        if delta.shape[-1] != expected:
-            raise RuntimeError("context_net output mismatch")
+        if self._proj is not None:
+            flat_ctx = self._proj(flat_ctx)
 
-        delta = delta.view(*ctx.shape[:-1], *self._shape)
+        delta = self.context_net(flat_ctx)
+        delta = delta.reshape(*ctx.shape[:-1], *self._shape)
         delta = self.final_activation_fn(delta)
 
-        if grad_scale is not None: delta = delta * grad_scale
+        if grad_scale is not None:
+            delta = delta * grad_scale
 
-        delta = torch.clamp(delta * self.delta_scale, -self.max_delta, self.max_delta)
+        delta = (delta * self.delta_scale).clamp(-self.max_delta, self.max_delta)
+        if timestep is not None and delta.ndim > len(self._shape) and delta.shape[-len(self._shape) - 1] == 1:
+            delta = delta.squeeze(-len(self._shape) - 1)
 
-        if timestep is not None and delta.shape[2] == 1:
-            delta = delta.squeeze(2)
         return delta
 
     def _modulate(self,
@@ -342,79 +351,40 @@ class Neural(nn.Module, ABC):
     def _apply_constraints(self, *args, **kwargs) -> torch.Tensor:
         pass
 
-    def _dist_params(self, logits: torch.Tensor, **dist_kwargs) -> Dict[str, torch.Tensor]:
-        return {"logits": logits, **dist_kwargs}
-
-    def _get_dist(self, context=None, temperature=None, timestep=None, **dist_kwargs):
-        mod = self._modulate(context=context, temperature=temperature, timestep=timestep)
-        return self._dist(**self._dist_params(mod, **dist_kwargs))
-
     def forward(self,
         context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        return_dist: bool = False, **dist_kwargs) -> torch.Tensor:
+        temperature: Optional[float] = None, return_dist: bool = False, **kwargs) -> torch.Tensor:
 
-        mod_logits = self._modulate(context=context, temperature=temperature, timestep=None)
-        dist = self._dist(**self._dist_params(mod_logits, **dist_kwargs))
+        mod_logits = self._modulate(context=context, temperature=temperature, timestep=None, **kwargs)
+        dist = self._dist_factory(**self._dist_params(mod_logits))
         if return_dist: return dist
         return mod_logits
 
     def log_prob(self,
         x: torch.Tensor,
         context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        timestep: Optional[int] = None, **kwargs) -> torch.Tensor:
+        temperature: Optional[float] = None, timestep: Optional[int] = None, **kwargs) -> torch.Tensor:
 
-        x_tensor = x.long()
+        x = x.long()
         n_states = self._shape[-1]
 
-        mod = self._modulate(context=context, temperature=temperature, timestep=timestep, **kwargs)
-        if mod.shape[-1] != n_states:
-            raise ValueError(f"Last dim of modulated logits ({mod.shape[-1]}) != n_states ({n_states})")
+        logits = self._modulate(context=context, temperature=temperature, timestep=timestep, **kwargs)
 
-        # Normalize logits shape to (*x.shape, n_states)
-        while mod.ndim > x_tensor.ndim + 1:
-            mod = mod.squeeze(0)
-        while mod.ndim < x_tensor.ndim + 1:
-            mod = mod.unsqueeze(0)
+        if logits.shape[-1] != n_states:
+            raise ValueError(
+                f"Last dim of logits ({logits.shape[-1]}) != n_states ({n_states})"
+            )
 
-        mod = mod.expand(*x_tensor.shape, n_states)
+        # Ensure logits broadcast to x.shape + (n_states,)
+        try:
+            logits = logits.expand(*x.shape, n_states)
+        except RuntimeError as e:
+            raise ValueError(
+                f"Cannot broadcast logits shape {logits.shape} to {x.shape + (n_states,)}"
+            ) from e
 
-        mod_flat = mod.reshape(-1, n_states)
-        x_flat = x_tensor.reshape(-1, 1)
-
-        logp = nnF.log_softmax(mod_flat, dim=-1).gather(-1, x_flat).squeeze(-1)
-        return logp.view(*x_tensor.shape)
-
-    def sample(self,
-        context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        timestep: Optional[int] = None, **dist_kwargs) -> torch.Tensor:
-
-        n_states = self._shape[-1]
-        dist = self._get_dist(context=context, temperature=temperature, timestep=timestep, **dist_kwargs)
-        s = dist.sample()
-
-        if s.dtype in [torch.int64, torch.long] or s.ndim == 0:
-            s = nnF.one_hot(s, num_classes=n_states)
-        if s.shape[-1] != n_states:
-            s = s.view(*s.shape[:-1], n_states)
-        return s
-
-    def rsample(self,
-        context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        timestep: Optional[int] = None, **dist_kwargs) -> torch.Tensor:
-
-        n_states = self._shape[-1]
-        dist = self._get_dist(context, temperature, timestep, **dist_kwargs)
-        s = dist.rsample() if getattr(dist, "has_rsample", False) else dist.sample()
-
-        if s.dtype in [torch.int64, torch.long] or s.ndim == 0:
-            s = nnF.one_hot(s, num_classes=n_states)
-        if s.shape[-1] != n_states:
-            s = s.view(*s.shape[:-1], n_states)
-        return s
+        logp = nnF.log_softmax(logits, dim=-1)
+        return logp.gather(-1, x.unsqueeze(-1)).squeeze(-1)
 
     def expected_probs(self,
         context: Optional[torch.Tensor] = None,
@@ -422,25 +392,6 @@ class Neural(nn.Module, ABC):
         timestep: Optional[int] = None, **kwargs) -> torch.Tensor:
         mod_logits = self._modulate(context=context, temperature=temperature, timestep=timestep, **kwargs)
         return nnF.softmax(mod_logits, dim=-1)
-
-    def mode(self,
-        context: Optional[torch.Tensor] = None,
-        temperature: Optional[float] = None,
-        timestep: Optional[int] = None, **dist_kwargs):
-
-        dist = self._get_dist(context, temperature, timestep=timestep, **dist_kwargs)
-        if hasattr(dist, "mode"):
-            return dist.mode
-        if hasattr(dist, "probs"):
-            return dist.probs.argmax(-1)
-        return torch.argmax(nnF.softmax(dist.logits, dim=-1), dim=-1)
-
-    def _validate_base(self, base: torch.Tensor) -> torch.Tensor:
-        base = torch.clamp(base, MIN_LOGITS, MAX_LOGITS)
-        if not torch.isfinite(base).all():
-            bad_idx = (~torch.isfinite(base)).nonzero(as_tuple=True)
-            raise ValueError(f"Non-finite base at {bad_idx}")
-        return base
 
 
 class Initial(Neural):
@@ -495,12 +446,13 @@ class Initial(Neural):
 
         return logits
 
+    @torch.no_grad
     def initialize(self,
         mode: Optional[str] = None,
         context: Optional[torch.Tensor] = None, jitter: float = 1e-5) -> Distribution:
 
         init_logits = self._init_params(mode, context, jitter)
-        self.logits = nn.Parameter(init_logits, requires_grad=True)
+        self.logits.copy_(init_logits)
         return self._get_dist(context=context)
 
     def _apply_constraints(self, logits: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -575,6 +527,8 @@ class Duration(Neural):
 
         if context is not None and self.context_net is not None:
             ctx_delta = self.context_net(context.mean(dim=0))
+            if ctx_delta.shape != logits.shape:
+                ctx_delta = ctx_delta.view_as(logits)
             logits = logits + ctx_delta.view_as(logits)
 
         if jitter > 0.0:
@@ -582,12 +536,13 @@ class Duration(Neural):
 
         return logits
 
+    @torch.no_grad
     def initialize(self,
         mode: Optional[str] = None,
         context: Optional[torch.Tensor] = None, jitter: float = 1e-5) -> Distribution:
 
         init_logits = self._init_params(mode, context, jitter)
-        self.logits = nn.Parameter(init_logits, requires_grad=True)
+        self.logits.copy_(init_logits)
         return self._get_dist(context=context)
 
     def _apply_constraints(self, logits: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -597,6 +552,7 @@ class Duration(Neural):
 
         mask = mask.to(device=logits.device, dtype=torch.bool)
         mask = mask.view((1,) * (logits.ndim - 2) + mask.shape)
+        mask = mask.unsqueeze(0).expand_as(logits)
         return logits.masked_fill(~mask, MIN_LOGITS)
 
     def log_matrix(self,
@@ -663,7 +619,7 @@ class Transition(Neural):
         self.init_mode = init_mode
         self.max_duration = max_duration
         self.transition_type = transition_type
-        # self._init_params(mode=init_mode)
+        self._init_params(mode=init_mode)
 
     def _init_params(self,
         mode: Optional[str] = None,
@@ -707,12 +663,13 @@ class Transition(Neural):
 
         return logits
 
+    @torch.no_grad
     def initialize(self,
         mode: Optional[str] = None,
         context: Optional[torch.Tensor] = None, jitter: float = 1e-5) -> Distribution:
 
         init_logits = self._init_params(mode, context, jitter)
-        self.logits = nn.Parameter(init_logits, requires_grad=True)
+        self.logits.copy_(init_logits)
         return self._get_dist(context=context)
 
     def _apply_constraints(self, logits: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -903,25 +860,25 @@ class Emission(Neural):
         mode: Optional[str] = "spread",
         context: Optional[torch.Tensor] = None, jitter: float = 1e-5) -> Distribution:
         base = self._init_params(mode, context, jitter)
-        return self._dist(**self._dist_params(base))
-
-    def _tensor_shape(self, tensor: torch.Tensor) -> torch.Tensor:
-        tensor = super()._tensor_shape(tensor)
-        if tensor.ndim == 2:  # [K, F]
-            tensor = tensor.unsqueeze(0).unsqueeze(0)  # [1, 1, K, F]
-        elif tensor.ndim == 3:  # [B, K, F]
-            tensor = tensor.unsqueeze(1)  # [B, 1, K, F]
-        return tensor
+        return self._get_dist(context=context)
 
     def _apply_constraints(self,
         tensor: Optional[torch.Tensor],
         mask: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
 
-        if tensor is None: return None
-        if mask is not None:
-            tensor = tensor.clone()
-            tensor[~mask] = 0.0
-        return tensor
+        if tensor is None or mask is None:
+            return tensor
+
+        mask = mask.to(dtype=torch.bool, device=tensor.device)
+
+        # Broadcast mask to tensor shape
+        while mask.ndim < tensor.ndim:
+            mask = mask.unsqueeze(0)
+
+        constrained = tensor.clone()
+        constrained[~mask] = 0.0
+        return constrained
+
 
     def _apply_context(self,
         base: torch.Tensor,

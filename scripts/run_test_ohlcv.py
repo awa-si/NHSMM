@@ -32,8 +32,10 @@ import matplotlib.pyplot as plt
 from nhsmm import NHSMM, DistributionSet
 from nhsmm.config import DTYPE, EPS, logger, ModelConfig
 
+
 DEFAULT_RNG_SEED = 0
 DEFAULT_LABELS = ("range", "bull", "bear")
+
 
 def generate_ohlcv(
     n_segments: int = 10,
@@ -166,13 +168,11 @@ def best_permutation_accuracy(
 
     return acc, mapped_pred, mapping, readable
 
+
 if __name__ == "__main__":
     torch.manual_seed(DEFAULT_RNG_SEED)
     np.random.seed(DEFAULT_RNG_SEED)
 
-    INIT_MAX = 3
-    MAX_ITER = 5
-    MAX_DURATION = 30
     SYMBOL = "BTC/USDT:USDT"
     DATA_DIR = "/opt/trader/user_data/data/bybit/futures_"
 
@@ -181,26 +181,26 @@ if __name__ == "__main__":
     if X.numel() == 0:
         raise RuntimeError("No data available after load/generate — aborting.")
 
-    n_states = len(label_map)
-    n_features = X.shape[1]
-
-    logger.info(f"[Config] n_states={n_states}, n_features={n_features}, max_duration={MAX_DURATION}")
-
     # --- Feature scaling ---
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     X_torch = torch.tensor(X_scaled, dtype=DTYPE)
 
     # --- Create NHSMM configuration ---
+    n_states = len(label_map)
+    n_features = X.shape[1]
     config = ModelConfig(
+        n_init=3,
+        max_iter=3,
+        max_duration=40,
         n_states=n_states,
         n_features=n_features,
-        max_duration=MAX_DURATION,
         emission_type="gaussian",
         seed=DEFAULT_RNG_SEED,
-        modulate_var=True,
         min_covar=1e-6,
     )
+    logger.info(f"[Config] n_states={n_states}, n_features={n_features}, max_duration={config.max_duration}")
+
     # --- Initialize NHSMM ---
     model = NHSMM(config=config)
     # --- Optionally create a custom distribution (or leave None to use defaults) ---
